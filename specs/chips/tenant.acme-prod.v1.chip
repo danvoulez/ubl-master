@@ -1,0 +1,24 @@
+@type: ubl/tenant
+@ver: 1.0
+
+metadata:
+  id: "acme-prod"
+  tags: ["production", "high-priority"]
+  description: "ACME Production Tenant"
+  parents: ["b3:app-acme-cid-placeholder"]
+
+body:
+  name: "ACME Production"
+  app_id: "acme"
+  environment: "production"
+  limits:
+    max_users: 100
+    storage_gb: 1000
+    api_calls_per_hour: 10000
+  billing:
+    plan: "enterprise"
+    contact: "billing@acme.com"
+  created_at: "2025-02-15T09:30:00Z"
+
+policy:
+  check: "tenant.prod.security.v1"

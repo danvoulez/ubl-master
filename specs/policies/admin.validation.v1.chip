@@ -1,0 +1,45 @@
+@type: ubl/policy.admin
+@ver: 1.0
+
+metadata:
+  id: "admin.validation.v1"
+  tags: ["security", "rbac", "admin"]
+  description: "Validation rules for admin users"
+  parents: ["b3:app-acme-cid-placeholder"]
+
+body:
+  circuits:
+    - reasoning_bits:
+        - id: "email_verified"
+          name: "Email Must Be Verified"
+          condition:
+            ContextEquals: ["body.email_verified", true]
+          on_true: "Allow"
+          on_false: "Require"
+          requires_context: ["body.email_verified"]
+
+        - id: "admin_domain"
+          name: "Admin Email Domain"
+          condition:
+            Or:
+              - ContextEquals: ["body.email", "*@acme.com"]
+              - ContextEquals: ["body.email", "*@ubl.agency"]
+          on_true: "Allow"
+          on_false: "Deny"
+          requires_context: ["body.email"]
+
+        - id: "admin_role"
+          name: "Has Admin Role"
+          condition:
+            ContextEquals: ["body.role", "admin"]
+          on_true: "Allow"
+          on_false: "Deny"
+          requires_context: ["body.role"]
+
+      composition: "Sequential"
+      aggregator: "All"
+
+  scope:
+    chip_types: ["ubl/user"]
+    operations: ["create", "update"]
+    level: "app"

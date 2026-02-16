@@ -1,0 +1,21 @@
+"@type": ubl/user
+"@ver": 1.0
+
+metadata:
+  id: "alice"
+  tags: ["env:prod", "role:admin"]
+  description: "Alice - System Administrator"
+  parents: []
+
+body:
+  email: "alice@acme.com"
+  name: "Alice Cooper"
+  email_verified: true
+  preferences:
+    theme: "dark"
+    language: "en"
+  role: "admin"
+  created_at: "2025-02-15T10:00:00Z"
+
+policy:
+  check: "admin.validation.v1"

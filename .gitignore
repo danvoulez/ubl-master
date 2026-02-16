@@ -1,0 +1,35 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo
+Cargo.lock is tracked for binaries/services
+# But we DO track Cargo.lock since this workspace has binaries
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.windsurf/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Stray binary artifacts
+*.bin
+
+# Sled databases (local dev)
+sled_data/
+*.sled/
+
+# Test artifacts
+/tmp/

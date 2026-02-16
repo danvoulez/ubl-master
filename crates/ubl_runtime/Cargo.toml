@@ -1,0 +1,32 @@
+[package]
+name = "ubl_runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = { workspace = true }
+hex = "0.4"
+rand = "0.8"
+
+# Other crates in workspace
+ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
+ubl_receipt = { path = "../ubl_receipt" }
+ubl_chipstore = { path = "../ubl_chipstore" }
+rb_vm = { path = "../rb_vm" }
+
+# Property testing
+proptest = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+property-tests = ["proptest"]

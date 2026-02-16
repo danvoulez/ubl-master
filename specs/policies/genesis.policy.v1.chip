@@ -1,0 +1,51 @@
+@type: ubl/policy.genesis
+@ver: 1.0
+
+metadata:
+  id: "ubl.genesis.v1"
+  tags: ["system", "root", "genesis"]
+  description: "Genesis Policy - Root of all UBL policies"
+  parents: []
+
+body:
+  circuits:
+    - reasoning_bits:
+        - id: "type_validation"
+          name: "Valid Chip Type"
+          condition:
+            Or:
+              - TypeEquals: "ubl/app"
+              - TypeEquals: "ubl/tenant"
+              - TypeEquals: "ubl/user"
+              - TypeEquals: "ubl/policy"
+              - TypeEquals: "ubl/token"
+              - TypeEquals: "ubl/invite"
+              - TypeEquals: "ubl/ai.passport"
+              - TypeEquals: "ubl/wasm.module"
+          on_true: "Allow"
+          on_false: "Deny"
+          requires_context: ["chip.@type"]
+
+        - id: "has_logical_id"
+          name: "Has ID Field"
+          condition:
+            ContextHas: "chip.id"
+          on_true: "Allow"
+          on_false: "Deny"
+          requires_context: ["chip.id"]
+
+        - id: "size_limit"
+          name: "Body Size Limit"
+          condition:
+            BodySizeLte: 1048576
+          on_true: "Allow"
+          on_false: "Deny"
+          requires_context: []
+
+      composition: "Sequential"
+      aggregator: "All"
+
+  scope:
+    chip_types: ["*"]
+    operations: ["create", "update"]
+    level: "genesis"

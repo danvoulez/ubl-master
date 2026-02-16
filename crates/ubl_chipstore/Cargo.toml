@@ -1,0 +1,28 @@
+[package]
+name = "ubl_chipstore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+
+# Storage backends
+sled = "0.34"  # Local key-value store
+redis = { version = "0.25", features = ["tokio-comp"] }  # Redis backend
+chrono = { version = "0.4", features = ["serde"] }  # Date/time handling
+
+# Other crates in workspace
+ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
+ubl_receipt = { path = "../ubl_receipt" }
+
+# Property testing
+proptest = { workspace = true, optional = true }
+
+[features]
+default = []
+property-tests = ["proptest"]

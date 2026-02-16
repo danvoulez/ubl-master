@@ -1,0 +1,225 @@
+name: UBL Self-Maintaining Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['docs/**', 'README.md', '*.md']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['docs/**', 'README.md', '*.md']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  knock:
+    name: "🚪 KNOCK"
+    runs-on: ubuntu-latest
+    outputs:
+      affected: ${{ steps.detect.outputs.affected }}
+      breaking: ${{ steps.detect.outputs.breaking }}
+      scope: ${{ steps.detect.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Changes
+        id: detect
+        run: |
+          chmod +x scripts/detect_affected.sh
+          ./scripts/detect_affected.sh >> "$GITHUB_OUTPUT"
+
+      - name: Report Scope
+        run: |
+          echo "📊 Scope: ${{ steps.detect.outputs.scope }}"
+          echo "📦 Affected: ${{ steps.detect.outputs.affected }}"
+          echo "⚠️  Breaking: ${{ steps.detect.outputs.breaking }}"
+
+  wa:
+    name: "👻 WA"
+    needs: knock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-${{ steps.toolchain.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.toolchain.outputs.rustc_hash }}-
+            ${{ runner.os }}-
+
+      - name: Format Check
+        run: cargo fmt --all -- --check
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  tr:
+    name: "⚡ TR"
+    needs: wa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-${{ steps.toolchain.outputs.rustc_hash }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.toolchain.outputs.rustc_hash }}-
+
+      - name: Unit Tests
+        run: cargo test --workspace --lib
+
+      - name: Integration Tests
+        run: cargo test --workspace --test '*'
+
+      - name: Doc Tests
+        run: cargo test --workspace --doc
+
+      - name: Property Tests
+        run: cargo test --workspace --features property-tests
+        continue-on-error: true
+
+  execute:
+    name: "🔧 EXECUTE"
+    needs: tr
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Security Audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
+
+      - name: Semver Check
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo install cargo-semver-checks --locked || true
+          cargo semver-checks check-release --baseline-rev origin/main
+        continue-on-error: true
+
+  wf:
+    name: "✅ WF"
+    needs: [knock, wa, tr, execute]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Evaluate
+        id: decision
+        run: |
+          echo "============================================"
+          echo "  UBL PIPELINE — WRITE-FINISHED RECEIPT"
+          echo "============================================"
+          echo ""
+          echo "Scope:    ${{ needs.knock.outputs.scope }}"
+          echo "Affected: ${{ needs.knock.outputs.affected }}"
+          echo "Breaking: ${{ needs.knock.outputs.breaking }}"
+          echo ""
+          echo "Results:"
+          echo "  WA:      ${{ needs.wa.result }}"
+          echo "  TR:      ${{ needs.tr.result }}"
+          echo "  EXECUTE: ${{ needs.execute.result }}"
+          echo ""
+
+          if [[ "${{ needs.wa.result }}" == "success" && \
+                "${{ needs.tr.result }}" == "success" && \
+                "${{ needs.execute.result }}" == "success" ]]; then
+            echo "decision=ALLOW" >> "$GITHUB_ENV"
+            echo "🟢 DECISION: ALLOW"
+          else
+            echo "decision=DENY" >> "$GITHUB_ENV"
+            echo "🔴 DECISION: DENY"
+            exit 1
+          fi
+
+      - name: Generate Signed Receipt
+        if: always()
+        run: |
+          # Generate receipt
+          cat > wf_receipt.json <<EOF
+          {
+            "type": "ubl/ci_receipt",
+            "decision": "${{ env.decision }}",
+            "commit": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "scope": "${{ needs.knock.outputs.scope }}",
+            "stages": {
+              "wa": "${{ needs.wa.result }}",
+              "tr": "${{ needs.tr.result }}",
+              "execute": "${{ needs.execute.result }}"
+            },
+            "pipeline": "WA→TR→WF",
+            "runtime": "github-actions",
+            "autopoietic": true
+          }
+          EOF
+
+          # Sign with Ed25519 if ublx CLI available
+          if command -v ublx &> /dev/null; then
+            ublx sign wf_receipt.json --output wf_receipt.jws
+            echo "✅ Receipt cryptographically signed"
+          else
+            echo "⚠️  ublx CLI not available, skipping signature"
+            cp wf_receipt.json wf_receipt.jws
+          fi
+
+          echo "📋 Generated UBL Receipt:"
+          cat wf_receipt.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wf-receipt
+          path: wf_receipt.jws
+          retention-days: 30
+
+  publish:
+    name: "📦 Publish"
+    needs: wf
+    if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release:')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish Crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          chmod +x scripts/publish_ordered.sh
+          ./scripts/publish_ordered.sh

@@ -1,0 +1,26 @@
+@type: ubl/app
+@ver: 1.0
+
+metadata:
+  id: "acme"
+  tags: ["production", "enterprise"]
+  description: "ACME Corporation - Main Application"
+  parents: []
+
+body:
+  name: "ACME Corp"
+  domain: "acme.com"
+  contact_email: "admin@acme.com"
+  settings:
+    max_users: 1000
+    features:
+      - "user_management"
+      - "rbac"
+      - "audit_logging"
+    security:
+      require_2fa: true
+      password_policy: "strong"
+  created_at: "2025-02-15T09:00:00Z"
+
+policy:
+  check: "app.security.v1"

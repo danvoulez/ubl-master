@@ -1,0 +1,27 @@
+
+[package]
+name = "ubl_receipt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+rand = "0.8"
+bs58 = "0.5"
+lazy_static = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+cid = { version = "0.11", features = ["serde-codec", "std"] }
+hex = "0.4"
+blake3 = { workspace = true }
+ubl_ledger = { path = "../ubl_ledger" }
+
+# Property testing
+proptest = { workspace = true, optional = true }
+
+[features]
+default = []
+property-tests = ["proptest"]
