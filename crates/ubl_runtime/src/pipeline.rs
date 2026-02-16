@@ -695,7 +695,8 @@ impl UblPipeline {
         })
     }
 
-    /// Helper to publish receipt events to the event bus
+    /// Helper to publish receipt events to the event bus.
+    /// Uses `publish_stage_event` (no dedup) since multiple stages share a receipt CID.
     async fn publish_receipt_event(
         &self,
         receipt: &PipelineReceipt,
@@ -703,19 +704,35 @@ impl UblPipeline {
         decision: Option<String>,
         duration_ms: Option<i64>,
     ) {
-        let event = ReceiptEvent {
-            event_type: format!("ubl.receipt.{}", pipeline_stage),
-            receipt_cid: receipt.body_cid.clone(),
-            receipt_type: receipt.receipt_type.clone(),
-            decision,
-            duration_ms,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            pipeline_stage: pipeline_stage.to_string(),
-            metadata: receipt.body.clone(),
-        };
+        let mut event = ReceiptEvent::new(
+            &format!("ubl.receipt.{}", pipeline_stage),
+            &receipt.body_cid,
+            &receipt.receipt_type,
+            pipeline_stage,
+            receipt.body.clone(),
+        );
+        event.decision = decision;
+        event.duration_ms = duration_ms;
+
+        // Extract fuel_used and rb_count from receipt body if present
+        if let Some(vm) = receipt.body.get("vm_state") {
+            event.fuel_used = vm.get("fuel_used").and_then(|v| v.as_u64());
+        }
+        if let Some(trace) = receipt.body.get("policy_trace") {
+            if let Some(arr) = trace.as_array() {
+                event.rb_count = Some(arr.iter()
+                    .flat_map(|p| p.get("rb_results").and_then(|r| r.as_array()).map(|a| a.len() as u64))
+                    .sum());
+            }
+        }
+
+        // Collect artifact CIDs from the receipt
+        if let Some(cid) = receipt.body.get("body_cid").and_then(|v| v.as_str()) {
+            event.artifact_cids.push(cid.to_string());
+        }
 
         // Best effort - don't fail pipeline if event publishing fails
-        if let Err(e) = self.event_bus.publish_receipt(event).await {
+        if let Err(e) = self.event_bus.publish_stage_event(event).await {
             eprintln!("Failed to publish receipt event: {}", e);
         }
     }
