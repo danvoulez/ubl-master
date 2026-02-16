@@ -23,17 +23,17 @@
 - [x] **ARCHITECTURE.md rev 2**: Added §0 Protocol Stack (8-layer table), updated §1 evolution table, rewrote §2 crate map, removed BLOCKERs from §5.2/§5.3, rewrote §16 as Build History & Roadmap with Protocol Horizons, updated §17 tech debt
 - [x] **Policy documents**: `P0_genesis_policy.json`, `P1_policy_update.json`, `ROLLOUT_P0_to_P1.md`
 
-### Test Counts (current)
+### Test Counts (current — post PR-A/B/C)
 
 | Crate | Tests |
 |---|---|
 | `rb_vm` | 60 (33 exec + 8 disasm + 19 canon) |
-| `ubl_receipt` | 18 (was 11; +7 RuntimeInfo/BuildMeta/PF-01) |
-| `ubl_runtime` | 180 (was 156; +13 rate_limit, +11 policy_lock) |
+| `ubl_receipt` | 18 |
+| `ubl_runtime` | 250 (was 180; +10 idempotency, +7 canon rate_limit, +15 capability, +1 stage events, +7 error taxonomy, +14 manifest, +16 meta_chip) |
 | `ubl_ai_nrf1` | 85 (69 unit + 16 rho_vectors) |
 | `ubl_kms` | 13 |
-| `ubl_unc1` | 33 (add/sub/mul/div, to_dec, to_rat, from_f64_bits, compare, BND, units, serde) |
-| **Total** | **~389** |
+| `ubl_unc1` | 33 |
+| **Total** | **~459** |
 
 ---
 
@@ -66,6 +66,16 @@
 | H8 | **Rate limiting** | `rate_limit.rs` in `ubl_runtime`. Sliding-window per-key limiter. `GateRateLimiter` composite: per-DID (100/min), per-tenant (1000/min), per-IP (10/min). Check order: IP→tenant→DID. `prune()` for memory cleanup. 13 tests. |
 | H9 | **UNC-1 core ops** | Full `ubl_unc1` crate: `add/sub/mul/div` with INT→DEC→RAT→BND promotion, `to_dec` (6 rounding modes incl. banker’s), `to_rat` (continued fraction with denominator limit), `from_f64_bits` (IEEE-754 frontier → exact BND interval), `compare`, BND interval arithmetic, unit enforcement, serde roundtrips. 33 tests. |
 | H10 | **Policy lockfile** | `policy_lock.rs` in `ubl_runtime`. `PolicyLock` struct with YAML parse/serialize, `pin()`, `verify()` against loaded policies. Detects mismatches, missing, and extra policies. `LockVerification` with `Display`. 11 tests. |
+| PR-A P0.1 | **Rigid idempotency** | `idempotency.rs` — `IdempotencyStore` keyed by `(@type,@ver,@world,@id)`. Replay returns cached `receipt_cid`. Wired into `process_chip`. 10 tests. |
+| PR-A P0.2 | **Canon-aware rate limit** | `rate_limit.rs` — `CanonFingerprint` (BLAKE3 of NRF-1 bytes) + `CanonRateLimiter`. Cosmetic JSON variations hit same bucket. 7 new tests (20 total rate_limit). |
+| PR-A P0.3 | **Secure bootstrap (capability)** | `capability.rs` — `Capability` struct with action/audience/expiration/signature. `ubl/app` requires `cap.registry:init`, first `ubl/user` requires `cap.registry:init`. Wired into `check_onboarding_dependencies`. 15 tests. |
+| PR-A P0.4 | **Receipts-as-AuthZ** | `ubl/membership` requires `cap.membership:grant`, `ubl/revoke` requires `cap.revoke:execute`. Validates audience/scope/expiration. Wired into pipeline CHECK stage. |
+| PR-B P1.5 | **Canonical stage events** | `ReceiptEvent` extended with `input_cid`, `output_cid`, `binary_hash`, `build_meta`, `world`, `actor`, `latency_ms`. Enriched in `publish_receipt_event`. CID chain: WA→TR→WF. 1 integration test. |
+| PR-B P1.6 | **ETag/cache for read-only queries** | `GET /v1/chips/:cid` returns `ETag` = CID, `Cache-Control: public, max-age=31536000, immutable`. `If-None-Match` → 304 Not Modified. |
+| PR-B P1.7 | **Unified error taxonomy** | 4 new `ErrorCode` variants (`Unauthorized`/401, `NotFound`/404, `TooManyRequests`/429, `Unavailable`/503). `category()` → 8 categories (BadInput, Unauthorized, Forbidden, NotFound, Conflict, TooManyRequests, Internal, Unavailable). `mcp_code()` → JSON-RPC 2.0 error codes. 7 new tests (27 total error_response). |
+| PR-C P2.8 | **Manifest generator** | `manifest.rs` — `GateManifest` produces OpenAPI 3.1, MCP tool manifest, WebMCP manifest from registered chip types. Gate serves `/openapi.json`, `/mcp/manifest`, `/.well-known/webmcp.json`. 14 tests. |
+| PR-C P2.9 | **MCP server proxy** | `POST /mcp/rpc` — JSON-RPC 2.0 handler with `tools/list` + `tools/call`. Dispatches to `ubl.deliver`, `ubl.query`, `ubl.verify`, `registry.listTypes`. Uses `mcp_code()` for error mapping. |
+| PR-C P2.10 | **Meta-chips for type registration** | `meta_chip.rs` — `ubl/meta.register` (mandatory KATs, reserved prefix check, KAT @type validation), `ubl/meta.describe`, `ubl/meta.deprecate`. 16 tests. |
 
 ---
 
