@@ -6,12 +6,18 @@ All Rust. Everything through the pipeline. The gate is the only entry point.
 
 ## What is UBL?
 
-UBL is an **autopoietic governance system** — it validates external chips using the same fractal architecture that governs itself. Every action is a chip, every chip goes through the pipeline, every output is a receipt.
+UBL is a **protocol stack** — eight layers that turn any domain into a deterministic, auditable, LLM-augmented system. Every action is a chip, every chip goes through the pipeline, every output is a receipt.
 
-- **Reasoning Bits** (RBs) &rarr; **Circuits** &rarr; **PolicyBits** &rarr; **Systems**
-- **KNOCK &rarr; WA &rarr; CHECK &rarr; TR &rarr; WF** pipeline
-- **NRF-1.1** canonical encoding with BLAKE3 content-addressed CIDs
-- **Genesis Policy** — self-signed root chip, bootstrapped at startup
+- **Chips** — the atomic unit of every action, fact, and intent
+- **Pipeline** — KNOCK &rarr; WA &rarr; CHECK &rarr; TR &rarr; WF deterministic engine
+- **Policy Gates** — governance as code (genesis, quorum, dependency chains)
+- **Runtime** — certified executor, arbiter, notary
+- **Receipts** — proof of everything (UnifiedReceipt with HMAC-BLAKE3 auth chain)
+- **Registry** — CID/DID identity, ChipStore, append-only ledger
+- **Protocols** — domain-specific chip vocabularies (Auth, Money, Media, Advisory)
+- **Products** — configuration on top of protocols (AI Passport, Notarization, Video editor)
+
+You never write a new system. You write a new `@type`, a new policy, and the leverage is already there.
 
 ## Quick Start
 
@@ -19,7 +25,7 @@ UBL is an **autopoietic governance system** — it validates external chips usin
 # Build the entire workspace
 cargo build --workspace
 
-# Run all tests (~103 across rb_vm, ubl_receipt, ubl_runtime)
+# Run all tests (~255 across rb_vm, ubl_receipt, ubl_runtime, ubl_ai_nrf1, ubl_ledger)
 cargo test --workspace
 
 # Start the gate server (port 4000)
@@ -82,19 +88,26 @@ ubl-master/
 │   ├── ubl_runtime/      # Core pipeline: KNOCK→WA→CHECK→TR→WF
 │   ├── ubl_receipt/      # Receipt types, Unified Receipt, policy trace
 │   ├── ubl_chipstore/    # Content-addressable chip storage (in-memory, sled)
-│   ├── ubl_cli/          # ublx command-line tool
+│   ├── ubl_unc1/         # UNC-1 numeric canon (int/dec/rat/bnd + units)
+│   ├── ubl_kms/          # Key Management — Ed25519 sign/verify over canonical NRF-1
+│   ├── ubl_cli/          # ublx command-line tool (verify, cid, explain, disasm, ...)
 │   ├── ubl_config/       # Configuration management
 │   ├── ubl_did/          # DID identity (stub)
-│   └── ubl_ledger/       # Ledger abstraction (stub)
+│   └── ubl_ledger/       # Ledger (NdjsonLedger, InMemoryLedger)
 ├── services/
 │   └── ubl_gate/         # HTTP API gateway (axum)
 ├── logline/              # LogLine narrative engine
 ├── scripts/              # CI helper scripts
+├── schemas/              # JSON Schemas (UNC-1, etc.)
+├── kats/                 # Known Answer Tests (UNC-1, rho_vectors, etc.)
+├── docs/                 # Reference docs, VM opcodes, migration guides
 ├── specs/                # Example chip and policy files
 ├── .github/workflows/    # CI pipeline (mirrors KNOCK→WA→TR→WF)
-├── ARCHITECTURE.md       # Full system specification
-├── ALIGNED_TASKLIST.md   # Sprint task tracking
-└── ROADMAP_DECADE.md     # Long-term roadmap
+├── ARCHITECTURE.md       # Full system specification (source of truth)
+├── UNC-1.md              # UNC-1 Numeric Canon spec
+├── TASKLIST.md           # Unified task tracking (done + pending + horizons)
+├── Makefile              # Standard targets: build, test, fmt, lint, kat, gate
+└── ROADMAP_DECADE.md     # Long-term vision
 ```
 
 ## Key Concepts
@@ -153,28 +166,38 @@ Evaluation order: genesis first, chip-specific last. First DENY short-circuits.
 |-------|-------|
 | `rb_vm` | 33 |
 | `ubl_receipt` | 11 |
-| `ubl_runtime` | 59 |
-| **Total** | **103+** |
+| `ubl_runtime` | 141 |
+| `ubl_ai_nrf1` | 64 |
+| `ubl_ledger` | 6 |
+| **Total** | **~255** |
 
 ## Development Status
 
 **Done:**
 - Full KNOCK&rarr;WA&rarr;CHECK&rarr;TR&rarr;WF pipeline with real RB-VM execution
 - Genesis policy self-signed and bootstrapped at startup
-- Unified Receipt with auth chain and per-RB policy trace
-- ChipStore integration (in-memory and sled backends)
-- Canonical error responses (`UblError` with stable codes)
-- Anti-replay (nonce-based)
+- Unified Receipt with HMAC-BLAKE3 auth chain and per-RB policy trace
+- ChipStore integration (in-memory and sled backends), wired into pipeline WF
+- Canonical error responses (`UblError` with Universal Envelope, stable codes)
+- Anti-replay (16-byte hex nonce)
 - `@world` scoping (`a/{app}/t/{tenant}`)
 - NDJSON ledger for receipt persistence
 - In-process EventBus (tokio broadcast)
 - CI workflow mirroring the pipeline stages
+- **Auth as Pipeline**: 8 onboarding chip types (`ubl/app`, `ubl/user`, `ubl/tenant`, `ubl/membership`, `ubl/token`, `ubl/revoke`, `ubl/worldscope`, `ubl/role`) with dependency chain enforcement
+- **AI Passport**: LLM identity, rights, duties as a chip. Advisory wiring and gate endpoints.
+- **P0/P1 Policy**: Genesis policy + policy update with 2-of-N quorum design
 
-**Next (Sprint 4):**
-- AI Passport advisory receipts
-- WASM adapter framework
-- Rich URLs with offline verification
-- CLI completion (`ublx explain`, `ublx search`)
+**Next — Hardening the Base:**
+- SHA2-256 → BLAKE3 migration
+- Real DID resolution (replace placeholder DIDs)
+- Runtime self-attestation (`runtime_hash`)
+- Structured tracing (replace `eprintln!`)
+- P0→P1 rollout automation
+
+**Protocol Horizons** (after base is solid): Money, Media (VCX-Core), Documents, Federation
+
+See [TASKLIST.md](TASKLIST.md) for the full breakdown.
 
 ## License
 

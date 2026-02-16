@@ -1,0 +1,19 @@
+[package]
+name = "ubl_kms"
+version = "0.1.0"
+edition = "2021"
+description = "UBL Key Management — Ed25519 sign/verify over canonical NRF-1 bytes"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+rand = "0.8"
+blake3 = { workspace = true }
+hex = "0.4"
+base64 = "0.22"
+ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
+serde_json = "1"
+thiserror = "1"
+bs58 = "0.5"
+
+[dev-dependencies]
+serde_json = "1"

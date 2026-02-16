@@ -9,6 +9,8 @@ members = [
   "crates/ubl_ledger",
   "crates/ubl_cli",
   "crates/ubl_chipstore",
+  "crates/ubl_unc1",
+  "crates/ubl_kms",
   "services/ubl_gate",
 ]
 resolver = "2"

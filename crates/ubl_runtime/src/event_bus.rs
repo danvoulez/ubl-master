@@ -56,6 +56,30 @@ pub struct ReceiptEvent {
     pub artifact_cids: Vec<String>,
     /// Full receipt body
     pub metadata: serde_json::Value,
+
+    // ── Canonical stage event fields (P1.5) ──
+
+    /// Input CID for this stage (chip body CID or previous stage output)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cid: Option<String>,
+    /// Output CID produced by this stage
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_cid: Option<String>,
+    /// BLAKE3 hash of the running binary
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_hash: Option<String>,
+    /// Build metadata (rustc, os, arch, profile, git_commit)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_meta: Option<serde_json::Value>,
+    /// @world anchor from the chip
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world: Option<String>,
+    /// Actor DID (pipeline executor)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Stage latency in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
 }
 
 impl ReceiptEvent {
@@ -82,6 +106,13 @@ impl ReceiptEvent {
             rb_count: None,
             artifact_cids: vec![],
             metadata,
+            input_cid: None,
+            output_cid: None,
+            binary_hash: None,
+            build_meta: None,
+            world: None,
+            actor: None,
+            latency_ms: None,
         }
     }
 }

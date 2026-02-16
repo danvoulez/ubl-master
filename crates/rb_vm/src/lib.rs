@@ -7,12 +7,15 @@
 //! - Minimal opcode set aligned with Fractal lower layer canon
 
 pub mod canon;
+pub mod disasm;
 pub mod exec;
 pub mod opcode;
 pub mod providers;
 pub mod tlv;
 pub mod types;
 
+pub use disasm::disassemble;
+pub use canon::RhoCanon;
 pub use exec::{CasProvider, ExecError, Fuel, SignProvider, TraceStep, Vm, VmConfig, VmOutcome};
 pub use opcode::Opcode;
 pub use types::{Cid, RcPayload, Value};

@@ -1,0 +1,68 @@
+{
+  "@type": "policy/update",
+  "@ver": 1,
+  "@id": "",
+  "parent": "b3:P0_PLACEHOLDER",
+  "label": "P1 — Enable Onboarding & Core Types",
+  "activation_time": "2026-02-17T10:00:00Z",
+  "diff": {
+    "permit_types+": [
+      "ubl/app",
+      "ubl/user",
+      "ubl/tenant",
+      "ubl/membership",
+      "ubl/token",
+      "ubl/revoke",
+      "advisory/opinion",
+      "advisory/decision",
+      "vcx/manifest",
+      "ubl/script",
+      "ubl/document"
+    ],
+    "matriz_autonomia": {
+      "vcx.trim": "auto",
+      "vcx.reorder": "auto",
+      "vcx.publish": "human_2ofN",
+      "money.transfer": "human_2ofN"
+    },
+    "advisory": {
+      "allow_emit": true,
+      "allow_consume": true,
+      "opinion_required_for": [
+        "ubl/script",
+        "vcx/manifest"
+      ],
+      "decision_required_for": [
+        "vcx.publish",
+        "money.transfer"
+      ]
+    },
+    "check_chain": [
+      {
+        "rb": "onboard.app_must_exist_first"
+      },
+      {
+        "rb": "onboard.user_requires_app"
+      },
+      {
+        "rb": "onboard.tenant_requires_user"
+      },
+      {
+        "rb": "onboard.membership_requires_tenant_and_admin"
+      },
+      {
+        "rb": "onboard.token_requires_user_and_membership"
+      }
+    ]
+  },
+  "signatures": [
+    {
+      "by": "did:key:zDan",
+      "sig": "ed25519:PLACEHOLDER"
+    },
+    {
+      "by": "did:key:zSec",
+      "sig": "ed25519:PLACEHOLDER"
+    }
+  ]
+}

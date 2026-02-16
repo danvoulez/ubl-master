@@ -26,14 +26,54 @@ pub enum ErrorCode {
     KnockMissingAnchor,
     #[serde(rename = "KNOCK_NOT_OBJECT")]
     KnockNotObject,
+    #[serde(rename = "KNOCK_RAW_FLOAT")]
+    KnockRawFloat,
 
     // Pipeline errors (produce DENY receipt)
     #[serde(rename = "POLICY_DENIED")]
     PolicyDenied,
     #[serde(rename = "INVALID_CHIP")]
     InvalidChip,
+    #[serde(rename = "DEPENDENCY_MISSING")]
+    DependencyMissing,
+
+    // VM execution errors (produce DENY receipt)
+    #[serde(rename = "FUEL_EXHAUSTED")]
+    FuelExhausted,
+    #[serde(rename = "TYPE_MISMATCH")]
+    TypeMismatch,
+    #[serde(rename = "STACK_UNDERFLOW")]
+    StackUnderflow,
+    #[serde(rename = "CAS_NOT_FOUND")]
+    CasNotFound,
+
+    // Security errors
+    #[serde(rename = "REPLAY_DETECTED")]
+    ReplayDetected,
+    #[serde(rename = "CANON_ERROR")]
+    CanonError,
+    #[serde(rename = "SIGN_ERROR")]
+    SignError,
+    #[serde(rename = "STORAGE_ERROR")]
+    StorageError,
+
     #[serde(rename = "INTERNAL_ERROR")]
     InternalError,
+
+    // ── Unified taxonomy additions (P1.7) ──
+
+    /// Authentication required or invalid credentials.
+    #[serde(rename = "UNAUTHORIZED")]
+    Unauthorized,
+    /// Resource not found.
+    #[serde(rename = "NOT_FOUND")]
+    NotFound,
+    /// Rate limit exceeded.
+    #[serde(rename = "TOO_MANY_REQUESTS")]
+    TooManyRequests,
+    /// Service temporarily unavailable.
+    #[serde(rename = "UNAVAILABLE")]
+    Unavailable,
 }
 
 impl ErrorCode {
@@ -46,15 +86,83 @@ impl ErrorCode {
             | Self::KnockDuplicateKey
             | Self::KnockInvalidUtf8
             | Self::KnockMissingAnchor
-            | Self::KnockNotObject => 400,
+            | Self::KnockNotObject
+            | Self::KnockRawFloat => 400,
 
             Self::PolicyDenied => 403,
+            Self::DependencyMissing => 409,
+            Self::ReplayDetected => 409,
             Self::InvalidChip => 422,
+            Self::FuelExhausted => 422,
+            Self::TypeMismatch => 422,
+            Self::StackUnderflow => 422,
+            Self::CasNotFound => 422,
+            Self::CanonError => 422,
+            Self::SignError => 422,
+            Self::StorageError => 500,
             Self::InternalError => 500,
+            Self::Unauthorized => 401,
+            Self::NotFound => 404,
+            Self::TooManyRequests => 429,
+            Self::Unavailable => 503,
+        }
+    }
+
+    /// Unified error category per the P1.7 taxonomy.
+    ///
+    /// Maps every `ErrorCode` to one of 8 categories:
+    /// BadInput, Unauthorized, Forbidden, NotFound, Conflict,
+    /// TooManyRequests, Internal, Unavailable.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::KnockBodyTooLarge
+            | Self::KnockDepthExceeded
+            | Self::KnockArrayTooLong
+            | Self::KnockDuplicateKey
+            | Self::KnockInvalidUtf8
+            | Self::KnockMissingAnchor
+            | Self::KnockNotObject
+            | Self::KnockRawFloat
+            | Self::InvalidChip
+            | Self::CanonError
+            | Self::FuelExhausted
+            | Self::TypeMismatch
+            | Self::StackUnderflow
+            | Self::CasNotFound => "BadInput",
+
+            Self::Unauthorized | Self::SignError => "Unauthorized",
+            Self::PolicyDenied => "Forbidden",
+            Self::NotFound | Self::DependencyMissing => "NotFound",
+            Self::ReplayDetected => "Conflict",
+            Self::TooManyRequests => "TooManyRequests",
+            Self::StorageError | Self::InternalError => "Internal",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+
+    /// MCP error code mapping.
+    ///
+    /// Maps to JSON-RPC 2.0 error codes used by MCP:
+    /// -32600 (Invalid Request), -32602 (Invalid Params),
+    /// -32001 (Unauthorized), -32003 (Forbidden), -32004 (Not Found),
+    /// -32005 (Conflict), -32006 (Too Many Requests),
+    /// -32603 (Internal), -32000 (Server Error/Unavailable).
+    pub fn mcp_code(&self) -> i32 {
+        match self.category() {
+            "BadInput" => -32602,
+            "Unauthorized" => -32001,
+            "Forbidden" => -32003,
+            "NotFound" => -32004,
+            "Conflict" => -32005,
+            "TooManyRequests" => -32006,
+            "Internal" => -32603,
+            "Unavailable" => -32000,
+            _ => -32603,
         }
     }
 
     /// Whether this error produces a receipt (DENY) or just an HTTP error.
+    /// KNOCK errors are pre-pipeline — no receipt. Everything else gets a DENY receipt.
     pub fn produces_receipt(&self) -> bool {
         !matches!(
             self,
@@ -65,6 +173,19 @@ impl ErrorCode {
                 | Self::KnockInvalidUtf8
                 | Self::KnockMissingAnchor
                 | Self::KnockNotObject
+                | Self::KnockRawFloat
+                | Self::Unauthorized
+                | Self::NotFound
+                | Self::TooManyRequests
+                | Self::Unavailable
+        )
+    }
+
+    /// Whether this error is a VM execution error.
+    pub fn is_vm_error(&self) -> bool {
+        matches!(
+            self,
+            Self::FuelExhausted | Self::TypeMismatch | Self::StackUnderflow | Self::CasNotFound
         )
     }
 }
@@ -97,6 +218,15 @@ impl UblError {
             }
             PipelineError::PolicyDenied(msg) => (ErrorCode::PolicyDenied, msg.clone()),
             PipelineError::InvalidChip(msg) => (ErrorCode::InvalidChip, msg.clone()),
+            PipelineError::DependencyMissing(msg) => (ErrorCode::DependencyMissing, msg.clone()),
+            PipelineError::FuelExhausted(msg) => (ErrorCode::FuelExhausted, msg.clone()),
+            PipelineError::TypeMismatch(msg) => (ErrorCode::TypeMismatch, msg.clone()),
+            PipelineError::StackUnderflow(msg) => (ErrorCode::StackUnderflow, msg.clone()),
+            PipelineError::CasNotFound(msg) => (ErrorCode::CasNotFound, msg.clone()),
+            PipelineError::ReplayDetected(msg) => (ErrorCode::ReplayDetected, msg.clone()),
+            PipelineError::CanonError(msg) => (ErrorCode::CanonError, msg.clone()),
+            PipelineError::SignError(msg) => (ErrorCode::SignError, msg.clone()),
+            PipelineError::StorageError(msg) => (ErrorCode::StorageError, msg.clone()),
             PipelineError::Internal(msg) => (ErrorCode::InternalError, msg.clone()),
         };
 
@@ -144,6 +274,8 @@ fn classify_knock_error(msg: &str) -> ErrorCode {
         ErrorCode::KnockMissingAnchor
     } else if msg.contains("KNOCK-007") {
         ErrorCode::KnockNotObject
+    } else if msg.contains("KNOCK-008") {
+        ErrorCode::KnockRawFloat
     } else {
         ErrorCode::KnockInvalidUtf8 // fallback
     }
@@ -217,11 +349,23 @@ mod tests {
             ErrorCode::KnockInvalidUtf8,
             ErrorCode::KnockMissingAnchor,
             ErrorCode::KnockNotObject,
+            ErrorCode::KnockRawFloat,
         ];
         for code in &codes {
             assert_eq!(code.http_status(), 400, "{:?} should be 400", code);
             assert!(!code.produces_receipt(), "{:?} should not produce receipt", code);
         }
+    }
+
+    #[test]
+    fn knock_raw_float_maps_to_400() {
+        let err = PipelineError::Knock(
+            "KNOCK-008: raw float in payload violates UNC-1 — use @num atoms: 12.34".to_string(),
+        );
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::KnockRawFloat);
+        assert_eq!(ubl_err.code.http_status(), 400);
+        assert!(!ubl_err.code.produces_receipt());
     }
 
     #[test]
@@ -237,5 +381,217 @@ mod tests {
         let e1 = UblError::from_pipeline_error(&err);
         let e2 = UblError::from_pipeline_error(&err);
         assert_ne!(e1.id, e2.id);
+    }
+
+    #[test]
+    fn fuel_exhausted_maps_to_422() {
+        let err = PipelineError::FuelExhausted("VM fuel exhausted (limit: 10000)".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::FuelExhausted);
+        assert_eq!(ubl_err.code.http_status(), 422);
+        assert!(ubl_err.code.produces_receipt());
+        assert!(ubl_err.code.is_vm_error());
+    }
+
+    #[test]
+    fn type_mismatch_maps_to_422() {
+        let err = PipelineError::TypeMismatch("type mismatch at AddI64".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::TypeMismatch);
+        assert_eq!(ubl_err.code.http_status(), 422);
+        assert!(ubl_err.code.is_vm_error());
+    }
+
+    #[test]
+    fn stack_underflow_maps_to_422() {
+        let err = PipelineError::StackUnderflow("stack underflow at Drop".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::StackUnderflow);
+        assert_eq!(ubl_err.code.http_status(), 422);
+        assert!(ubl_err.code.is_vm_error());
+    }
+
+    #[test]
+    fn cas_not_found_maps_to_422() {
+        let err = PipelineError::CasNotFound("cas_get_not_found".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::CasNotFound);
+        assert_eq!(ubl_err.code.http_status(), 422);
+        assert!(ubl_err.code.is_vm_error());
+    }
+
+    #[test]
+    fn replay_detected_maps_to_409() {
+        let err = PipelineError::ReplayDetected("duplicate nonce".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::ReplayDetected);
+        assert_eq!(ubl_err.code.http_status(), 409);
+        assert!(ubl_err.code.produces_receipt());
+        assert!(!ubl_err.code.is_vm_error());
+    }
+
+    #[test]
+    fn canon_error_maps_to_422() {
+        let err = PipelineError::CanonError("NFC normalization failed".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::CanonError);
+        assert_eq!(ubl_err.code.http_status(), 422);
+    }
+
+    #[test]
+    fn sign_error_maps_to_422() {
+        let err = PipelineError::SignError("invalid signature".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::SignError);
+        assert_eq!(ubl_err.code.http_status(), 422);
+    }
+
+    #[test]
+    fn storage_error_maps_to_500() {
+        let err = PipelineError::StorageError("disk full".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::StorageError);
+        assert_eq!(ubl_err.code.http_status(), 500);
+        assert!(ubl_err.code.produces_receipt());
+    }
+
+    #[test]
+    fn all_vm_errors_are_422() {
+        let vm_codes = [
+            ErrorCode::FuelExhausted,
+            ErrorCode::TypeMismatch,
+            ErrorCode::StackUnderflow,
+            ErrorCode::CasNotFound,
+        ];
+        for code in &vm_codes {
+            assert_eq!(code.http_status(), 422, "{:?} should be 422", code);
+            assert!(code.is_vm_error(), "{:?} should be VM error", code);
+            assert!(code.produces_receipt(), "{:?} should produce receipt", code);
+        }
+    }
+
+    #[test]
+    fn non_vm_errors_are_not_vm_errors() {
+        let non_vm = [
+            ErrorCode::PolicyDenied,
+            ErrorCode::InvalidChip,
+            ErrorCode::InternalError,
+            ErrorCode::ReplayDetected,
+            ErrorCode::KnockBodyTooLarge,
+        ];
+        for code in &non_vm {
+            assert!(!code.is_vm_error(), "{:?} should NOT be VM error", code);
+        }
+    }
+
+    #[test]
+    fn dependency_missing_maps_to_409() {
+        let err = PipelineError::DependencyMissing("ubl/app required before ubl/user".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::DependencyMissing);
+        assert_eq!(ubl_err.code.http_status(), 409);
+    }
+
+    // ── Unified taxonomy tests (P1.7) ──
+
+    #[test]
+    fn new_codes_have_correct_http_status() {
+        assert_eq!(ErrorCode::Unauthorized.http_status(), 401);
+        assert_eq!(ErrorCode::NotFound.http_status(), 404);
+        assert_eq!(ErrorCode::TooManyRequests.http_status(), 429);
+        assert_eq!(ErrorCode::Unavailable.http_status(), 503);
+    }
+
+    #[test]
+    fn new_codes_do_not_produce_receipts() {
+        assert!(!ErrorCode::Unauthorized.produces_receipt());
+        assert!(!ErrorCode::NotFound.produces_receipt());
+        assert!(!ErrorCode::TooManyRequests.produces_receipt());
+        assert!(!ErrorCode::Unavailable.produces_receipt());
+    }
+
+    #[test]
+    fn category_covers_all_8_categories() {
+        let mut categories = std::collections::HashSet::new();
+        let all_codes = [
+            ErrorCode::KnockBodyTooLarge,
+            ErrorCode::Unauthorized,
+            ErrorCode::PolicyDenied,
+            ErrorCode::NotFound,
+            ErrorCode::ReplayDetected,
+            ErrorCode::TooManyRequests,
+            ErrorCode::InternalError,
+            ErrorCode::Unavailable,
+        ];
+        for code in &all_codes {
+            categories.insert(code.category());
+        }
+        assert_eq!(categories.len(), 8, "must cover all 8 taxonomy categories");
+        assert!(categories.contains("BadInput"));
+        assert!(categories.contains("Unauthorized"));
+        assert!(categories.contains("Forbidden"));
+        assert!(categories.contains("NotFound"));
+        assert!(categories.contains("Conflict"));
+        assert!(categories.contains("TooManyRequests"));
+        assert!(categories.contains("Internal"));
+        assert!(categories.contains("Unavailable"));
+    }
+
+    #[test]
+    fn category_assignments_correct() {
+        assert_eq!(ErrorCode::KnockBodyTooLarge.category(), "BadInput");
+        assert_eq!(ErrorCode::InvalidChip.category(), "BadInput");
+        assert_eq!(ErrorCode::FuelExhausted.category(), "BadInput");
+        assert_eq!(ErrorCode::Unauthorized.category(), "Unauthorized");
+        assert_eq!(ErrorCode::SignError.category(), "Unauthorized");
+        assert_eq!(ErrorCode::PolicyDenied.category(), "Forbidden");
+        assert_eq!(ErrorCode::DependencyMissing.category(), "NotFound");
+        assert_eq!(ErrorCode::NotFound.category(), "NotFound");
+        assert_eq!(ErrorCode::ReplayDetected.category(), "Conflict");
+        assert_eq!(ErrorCode::TooManyRequests.category(), "TooManyRequests");
+        assert_eq!(ErrorCode::InternalError.category(), "Internal");
+        assert_eq!(ErrorCode::StorageError.category(), "Internal");
+        assert_eq!(ErrorCode::Unavailable.category(), "Unavailable");
+    }
+
+    #[test]
+    fn mcp_codes_are_negative() {
+        let all_codes = [
+            ErrorCode::KnockBodyTooLarge,
+            ErrorCode::Unauthorized,
+            ErrorCode::PolicyDenied,
+            ErrorCode::NotFound,
+            ErrorCode::ReplayDetected,
+            ErrorCode::TooManyRequests,
+            ErrorCode::InternalError,
+            ErrorCode::Unavailable,
+        ];
+        for code in &all_codes {
+            assert!(code.mcp_code() < 0, "{:?} mcp_code must be negative", code);
+        }
+    }
+
+    #[test]
+    fn mcp_code_mapping() {
+        assert_eq!(ErrorCode::InvalidChip.mcp_code(), -32602);      // BadInput
+        assert_eq!(ErrorCode::Unauthorized.mcp_code(), -32001);      // Unauthorized
+        assert_eq!(ErrorCode::PolicyDenied.mcp_code(), -32003);      // Forbidden
+        assert_eq!(ErrorCode::NotFound.mcp_code(), -32004);          // NotFound
+        assert_eq!(ErrorCode::ReplayDetected.mcp_code(), -32005);    // Conflict
+        assert_eq!(ErrorCode::TooManyRequests.mcp_code(), -32006);   // TooManyRequests
+        assert_eq!(ErrorCode::InternalError.mcp_code(), -32603);     // Internal
+        assert_eq!(ErrorCode::Unavailable.mcp_code(), -32000);       // Unavailable
+    }
+
+    #[test]
+    fn new_codes_serialize_correctly() {
+        let json = serde_json::to_value(ErrorCode::Unauthorized).unwrap();
+        assert_eq!(json, "UNAUTHORIZED");
+        let json = serde_json::to_value(ErrorCode::NotFound).unwrap();
+        assert_eq!(json, "NOT_FOUND");
+        let json = serde_json::to_value(ErrorCode::TooManyRequests).unwrap();
+        assert_eq!(json, "TOO_MANY_REQUESTS");
+        let json = serde_json::to_value(ErrorCode::Unavailable).unwrap();
+        assert_eq!(json, "UNAVAILABLE");
     }
 }

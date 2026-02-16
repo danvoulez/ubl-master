@@ -1,38 +1,37 @@
-//! Auth as Pipeline — registration, sessions, and permissions are chips.
+//! Onboarding — the dependency chain for first-time entities.
 //!
-//! Engineering principle #5: Auth IS the pipeline. No separate auth system.
-//! - Registration = `ubl/user` chip
-//! - Login = `ubl/token` chip
-//! - Permission = policy evaluation at CHECK
-//! - Blocking/permitting people = policy on a chip type
+//! Everything is a chip. The onboarding order is:
+//!   1. `ubl/app`        — defines an application scope
+//!   2. `ubl/user`       — registers a human identity under an app
+//!   3. `ubl/tenant`     — creates a Circle (personal/group/company)
+//!   4. `ubl/membership` — links user → tenant with role (admin | member)
+//!   5. `ubl/token`      — creates a session for an existing user
+//!   6. `ubl/revoke`     — append-only suspension of any entity
 //!
-//! There is no middleware. Every auth action is a chip that goes through
-//! KNOCK→WA→CHECK→TR→WF. The receipt IS the proof of auth.
+//! The chip body IS the onboarding data. It never mutates.
+//! The receipt chain is what gives it authority:
+//!   - chip exists + allow receipt = active
+//!   - chip exists + revoke receipt = suspended
+//!   - no chip = doesn't exist
+//!
+//! Roles are intentionally simple: admin and member.
+//!   - admin: change Circle rules, invite/remove members, manage policies
+//!   - member: submit chips, read own data, read shared Circle data
+//!   - neither can delete anything — append-only ledger, always
+//!
+//! Engineering principle #5: Auth IS the pipeline. No middleware.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-// ── User Registration ───────────────────────────────────────────
+// ── Errors ──────────────────────────────────────────────────────
 
-/// A registered user identity — parsed from a `ubl/user` chip body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserIdentity {
-    /// DID of the user (e.g. "did:key:z6Mk...")
-    pub did: String,
-    /// Human-readable display name
-    pub display_name: String,
-    /// Roles assigned to this user
-    pub roles: Vec<String>,
-    /// Whether the user is active
-    pub active: bool,
-}
-
-/// Errors from user identity parsing.
 #[derive(Debug, Clone)]
 pub enum AuthError {
     MissingField(String),
     InvalidField(String),
     Unauthorized(String),
+    DependencyMissing(String),
     TokenExpired,
     TokenInvalid(String),
 }
@@ -43,6 +42,7 @@ impl std::fmt::Display for AuthError {
             AuthError::MissingField(s) => write!(f, "Missing field: {}", s),
             AuthError::InvalidField(s) => write!(f, "Invalid field: {}", s),
             AuthError::Unauthorized(s) => write!(f, "Unauthorized: {}", s),
+            AuthError::DependencyMissing(s) => write!(f, "Dependency missing: {}", s),
             AuthError::TokenExpired => write!(f, "Token expired"),
             AuthError::TokenInvalid(s) => write!(f, "Invalid token: {}", s),
         }
@@ -51,16 +51,60 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-impl UserIdentity {
-    /// Parse a user identity from a `ubl/user` chip body.
+// ── Role ────────────────────────────────────────────────────────
+
+/// Two roles. That's it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Admin,
+    Member,
+}
+
+impl Role {
+    pub fn from_str(s: &str) -> Result<Self, AuthError> {
+        match s {
+            "admin" => Ok(Role::Admin),
+            "member" => Ok(Role::Member),
+            other => Err(AuthError::InvalidField(
+                format!("Role must be 'admin' or 'member', got '{}'", other),
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Member => "member",
+        }
+    }
+}
+
+// ── 1. App Registration ─────────────────────────────────────────
+
+/// An application scope — the first thing that must exist.
+/// Defines `a/{slug}` in `@world`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRegistration {
+    /// URL-safe slug (e.g. "acme", "lab512")
+    pub slug: String,
+    /// Human-readable name
+    pub display_name: String,
+    /// DID of the app owner
+    pub owner_did: String,
+}
+
+impl AppRegistration {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let did = body.get("did")
+        let slug = body.get("slug")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AuthError::MissingField("did".into()))?
+            .ok_or_else(|| AuthError::MissingField("slug".into()))?
             .to_string();
 
-        if !did.starts_with("did:") {
-            return Err(AuthError::InvalidField(format!("DID must start with 'did:': {}", did)));
+        if slug.is_empty() || slug.contains('/') || slug.contains(' ') {
+            return Err(AuthError::InvalidField(
+                format!("slug must be non-empty, no spaces or slashes: '{}'", slug),
+            ));
         }
 
         let display_name = body.get("display_name")
@@ -72,19 +116,75 @@ impl UserIdentity {
             return Err(AuthError::InvalidField("display_name cannot be empty".into()));
         }
 
-        let roles = body.get("roles")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_else(|| vec!["user".to_string()]);
+        let owner_did = body.get("owner_did")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("owner_did".into()))?
+            .to_string();
 
-        let active = body.get("active")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        if !owner_did.starts_with("did:") {
+            return Err(AuthError::InvalidField(
+                format!("owner_did must start with 'did:': '{}'", owner_did),
+            ));
+        }
 
-        Ok(Self { did, display_name, roles, active })
+        Ok(Self { slug, display_name, owner_did })
     }
 
-    /// Produce the canonical chip body for this user.
+    pub fn to_chip_body(&self, id: &str) -> Value {
+        json!({
+            "@type": "ubl/app",
+            "@id": id,
+            "@ver": "1.0",
+            "@world": format!("a/{}", self.slug),
+            "slug": self.slug,
+            "display_name": self.display_name,
+            "owner_did": self.owner_did,
+        })
+    }
+
+    /// The @world prefix this app defines.
+    pub fn world_prefix(&self) -> String {
+        format!("a/{}", self.slug)
+    }
+}
+
+// ── 2. User Identity ────────────────────────────────────────────
+
+/// A registered user identity — parsed from a `ubl/user` chip body.
+/// The chip's @world must reference an existing app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIdentity {
+    /// DID of the user (e.g. "did:key:z6Mk...")
+    pub did: String,
+    /// Human-readable display name
+    pub display_name: String,
+}
+
+impl UserIdentity {
+    pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
+        let did = body.get("did")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("did".into()))?
+            .to_string();
+
+        if !did.starts_with("did:") {
+            return Err(AuthError::InvalidField(
+                format!("DID must start with 'did:': '{}'", did),
+            ));
+        }
+
+        let display_name = body.get("display_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("display_name".into()))?
+            .to_string();
+
+        if display_name.is_empty() {
+            return Err(AuthError::InvalidField("display_name cannot be empty".into()));
+        }
+
+        Ok(Self { did, display_name })
+    }
+
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
         json!({
             "@type": "ubl/user",
@@ -93,32 +193,139 @@ impl UserIdentity {
             "@world": world,
             "did": self.did,
             "display_name": self.display_name,
-            "roles": self.roles,
-            "active": self.active,
         })
-    }
-
-    /// Check if this user has a specific role.
-    pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|r| r == role)
-    }
-
-    /// Check if this user is an admin.
-    pub fn is_admin(&self) -> bool {
-        self.has_role("admin")
     }
 }
 
-// ── Session Token ───────────────────────────────────────────────
+// ── 3. Tenant / Circle ──────────────────────────────────────────
+
+/// A tenant (publicly: Circle). Personal project, group, or company.
+/// Defines `a/{app}/t/{slug}` in `@world`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantCircle {
+    /// URL-safe slug (e.g. "prod", "personal", "engineering")
+    pub slug: String,
+    /// Human-readable name
+    pub display_name: String,
+    /// CID of the user chip that created this Circle
+    pub creator_cid: String,
+}
+
+impl TenantCircle {
+    pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
+        let slug = body.get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("slug".into()))?
+            .to_string();
+
+        if slug.is_empty() || slug.contains('/') || slug.contains(' ') {
+            return Err(AuthError::InvalidField(
+                format!("slug must be non-empty, no spaces or slashes: '{}'", slug),
+            ));
+        }
+
+        let display_name = body.get("display_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("display_name".into()))?
+            .to_string();
+
+        if display_name.is_empty() {
+            return Err(AuthError::InvalidField("display_name cannot be empty".into()));
+        }
+
+        let creator_cid = body.get("creator_cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("creator_cid".into()))?
+            .to_string();
+
+        if !creator_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("creator_cid must start with 'b3:': '{}'", creator_cid),
+            ));
+        }
+
+        Ok(Self { slug, display_name, creator_cid })
+    }
+
+    pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
+        json!({
+            "@type": "ubl/tenant",
+            "@id": id,
+            "@ver": "1.0",
+            "@world": world,
+            "slug": self.slug,
+            "display_name": self.display_name,
+            "creator_cid": self.creator_cid,
+        })
+    }
+}
+
+// ── 4. Membership ───────────────────────────────────────────────
+
+/// Links a user to a tenant with a role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Membership {
+    /// CID of the user chip
+    pub user_cid: String,
+    /// CID of the tenant chip
+    pub tenant_cid: String,
+    /// Role: admin or member
+    pub role: Role,
+}
+
+impl Membership {
+    pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
+        let user_cid = body.get("user_cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("user_cid".into()))?
+            .to_string();
+
+        if !user_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("user_cid must start with 'b3:': '{}'", user_cid),
+            ));
+        }
+
+        let tenant_cid = body.get("tenant_cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("tenant_cid".into()))?
+            .to_string();
+
+        if !tenant_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("tenant_cid must start with 'b3:': '{}'", tenant_cid),
+            ));
+        }
+
+        let role_str = body.get("role")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("role".into()))?;
+
+        let role = Role::from_str(role_str)?;
+
+        Ok(Self { user_cid, tenant_cid, role })
+    }
+
+    pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
+        json!({
+            "@type": "ubl/membership",
+            "@id": id,
+            "@ver": "1.0",
+            "@world": world,
+            "user_cid": self.user_cid,
+            "tenant_cid": self.tenant_cid,
+            "role": self.role.as_str(),
+        })
+    }
+}
+
+// ── 5. Session Token ────────────────────────────────────────────
 
 /// A session token — parsed from a `ubl/token` chip body.
-/// Tokens are chips: they go through the pipeline, get a receipt, and
-/// the receipt CID IS the session proof.
+/// The receipt CID IS the session proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionToken {
-    /// DID of the user this token belongs to
-    pub user_did: String,
-    /// CID of the user chip that created this token
+    /// CID of the user chip this token belongs to
     pub user_cid: String,
     /// Token scope (what this token can do)
     pub scope: Vec<String>,
@@ -129,17 +336,17 @@ pub struct SessionToken {
 }
 
 impl SessionToken {
-    /// Parse a session token from a `ubl/token` chip body.
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let user_did = body.get("user_did")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AuthError::MissingField("user_did".into()))?
-            .to_string();
-
         let user_cid = body.get("user_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("user_cid".into()))?
             .to_string();
+
+        if !user_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("user_cid must start with 'b3:': '{}'", user_cid),
+            ));
+        }
 
         let scope = body.get("scope")
             .and_then(|v| v.as_array())
@@ -156,17 +363,15 @@ impl SessionToken {
             .ok_or_else(|| AuthError::MissingField("kid".into()))?
             .to_string();
 
-        Ok(Self { user_did, user_cid, scope, expires_at, kid })
+        Ok(Self { user_cid, scope, expires_at, kid })
     }
 
-    /// Produce the canonical chip body for this token.
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
         json!({
             "@type": "ubl/token",
             "@id": id,
             "@ver": "1.0",
             "@world": world,
-            "user_did": self.user_did,
             "user_cid": self.user_cid,
             "scope": self.scope,
             "expires_at": self.expires_at,
@@ -174,94 +379,209 @@ impl SessionToken {
         })
     }
 
-    /// Check if the token has expired (compared to `now` RFC-3339 string).
     pub fn is_expired(&self, now: &str) -> bool {
-        // Simple string comparison works for RFC-3339 UTC timestamps
         self.expires_at < now.to_string()
     }
 
-    /// Check if the token has a specific scope.
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scope.iter().any(|s| s == scope || s == "*")
     }
 }
 
-// ── Permission Check (at CHECK stage) ───────────────────────────
+// ── 6. Revocation ───────────────────────────────────────────────
 
-/// Permission context extracted from a chip + token for CHECK evaluation.
+/// Append-only suspension of any entity. Nothing is deleted.
+/// A revoke chip targets another chip by CID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Revocation {
+    /// CID of the chip being revoked
+    pub target_cid: String,
+    /// Reason for revocation
+    pub reason: String,
+    /// CID of the actor (user chip) performing the revocation
+    pub actor_cid: String,
+}
+
+impl Revocation {
+    pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
+        let target_cid = body.get("target_cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("target_cid".into()))?
+            .to_string();
+
+        if !target_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("target_cid must start with 'b3:': '{}'", target_cid),
+            ));
+        }
+
+        let reason = body.get("reason")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("reason".into()))?
+            .to_string();
+
+        if reason.is_empty() {
+            return Err(AuthError::InvalidField("reason cannot be empty".into()));
+        }
+
+        let actor_cid = body.get("actor_cid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AuthError::MissingField("actor_cid".into()))?
+            .to_string();
+
+        if !actor_cid.starts_with("b3:") {
+            return Err(AuthError::InvalidField(
+                format!("actor_cid must start with 'b3:': '{}'", actor_cid),
+            ));
+        }
+
+        Ok(Self { target_cid, reason, actor_cid })
+    }
+
+    pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
+        json!({
+            "@type": "ubl/revoke",
+            "@id": id,
+            "@ver": "1.0",
+            "@world": world,
+            "target_cid": self.target_cid,
+            "reason": self.reason,
+            "actor_cid": self.actor_cid,
+        })
+    }
+}
+
+// ── @world Parsing ──────────────────────────────────────────────
+
+/// Parse a `@world` string into its app and optional tenant components.
+/// Format: `a/{app}` or `a/{app}/t/{tenant}`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldScope {
+    pub app: String,
+    pub tenant: Option<String>,
+}
+
+impl WorldScope {
+    pub fn parse(world: &str) -> Result<Self, AuthError> {
+        let parts: Vec<&str> = world.split('/').collect();
+
+        if parts.len() < 2 || parts[0] != "a" {
+            return Err(AuthError::InvalidField(
+                format!("@world must start with 'a/{{app}}': '{}'", world),
+            ));
+        }
+
+        let app = parts[1].to_string();
+        if app.is_empty() {
+            return Err(AuthError::InvalidField("app slug cannot be empty".into()));
+        }
+
+        let tenant = if parts.len() >= 4 && parts[2] == "t" {
+            let t = parts[3].to_string();
+            if t.is_empty() {
+                return Err(AuthError::InvalidField("tenant slug cannot be empty".into()));
+            }
+            Some(t)
+        } else if parts.len() == 2 {
+            None
+        } else {
+            return Err(AuthError::InvalidField(
+                format!("@world format must be 'a/{{app}}' or 'a/{{app}}/t/{{tenant}}': '{}'", world),
+            ));
+        };
+
+        Ok(Self { app, tenant })
+    }
+
+    pub fn to_string(&self) -> String {
+        match &self.tenant {
+            Some(t) => format!("a/{}/t/{}", self.app, t),
+            None => format!("a/{}", self.app),
+        }
+    }
+
+    pub fn app_world(&self) -> String {
+        format!("a/{}", self.app)
+    }
+}
+
+// ── Permission Context ──────────────────────────────────────────
+
+/// Permission context for CHECK stage RB evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionContext {
-    /// DID of the acting user
     pub actor_did: String,
-    /// Roles of the acting user
-    pub actor_roles: Vec<String>,
-    /// Scopes from the session token
+    pub actor_role: Role,
     pub token_scopes: Vec<String>,
-    /// The chip type being submitted
     pub chip_type: String,
-    /// The operation (create, update, delete)
-    pub operation: String,
-    /// The target world
     pub world: String,
 }
 
 impl PermissionContext {
-    /// Build a permission context from user + token + chip request.
-    pub fn new(
-        user: &UserIdentity,
-        token: &SessionToken,
-        chip_type: &str,
-        operation: &str,
-        world: &str,
-    ) -> Self {
-        Self {
-            actor_did: user.did.clone(),
-            actor_roles: user.roles.clone(),
-            token_scopes: token.scope.clone(),
-            chip_type: chip_type.to_string(),
-            operation: operation.to_string(),
-            world: world.to_string(),
-        }
-    }
-
-    /// Convert to a flat map for RB expression evaluation.
     pub fn to_eval_context(&self) -> std::collections::HashMap<String, String> {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("actor.did".to_string(), self.actor_did.clone());
-        ctx.insert("actor.roles".to_string(), self.actor_roles.join(","));
+        ctx.insert("actor.role".to_string(), self.actor_role.as_str().to_string());
         ctx.insert("token.scopes".to_string(), self.token_scopes.join(","));
         ctx.insert("chip.@type".to_string(), self.chip_type.clone());
-        ctx.insert("chip.operation".to_string(), self.operation.clone());
         ctx.insert("chip.@world".to_string(), self.world.clone());
         ctx
     }
 
-    /// Quick check: does the actor have permission for this operation?
-    /// This is a convenience method — the real check happens at CHECK via RBs.
+    /// Quick permission check. Real enforcement is at CHECK via RBs.
     pub fn quick_check(&self) -> Result<(), AuthError> {
-        // Admin can do anything
-        if self.actor_roles.contains(&"admin".to_string()) {
+        if self.actor_role == Role::Admin {
             return Ok(());
         }
 
-        // Token must have matching scope
-        let required_scope = match self.operation.as_str() {
-            "create" => "write",
-            "update" => "write",
-            "delete" => "admin",
-            "read" => "read",
-            _ => "write",
-        };
+        // Members can read and write, but not admin-level operations
+        let needs_admin = self.chip_type == "ubl/revoke"
+            || self.chip_type == "ubl/membership";
 
-        if !self.token_scopes.iter().any(|s| s == required_scope || s == "*") {
-            return Err(AuthError::Unauthorized(format!(
-                "Token lacks '{}' scope for operation '{}'",
-                required_scope, self.operation
-            )));
+        if needs_admin {
+            return Err(AuthError::Unauthorized(
+                format!("'{}' requires admin role", self.chip_type),
+            ));
         }
 
         Ok(())
     }
+}
+
+// ── Onboarding Chip Type Registry ───────────────────────────────
+
+/// All onboarding chip types in dependency order.
+pub const ONBOARDING_TYPES: &[&str] = &[
+    "ubl/app",
+    "ubl/user",
+    "ubl/tenant",
+    "ubl/membership",
+    "ubl/token",
+    "ubl/revoke",
+];
+
+/// Check if a chip type is an onboarding type.
+pub fn is_onboarding_type(chip_type: &str) -> bool {
+    ONBOARDING_TYPES.contains(&chip_type)
+}
+
+/// Validate an onboarding chip body based on its @type.
+pub fn validate_onboarding_chip(body: &Value) -> Result<(), AuthError> {
+    let chip_type = body.get("@type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AuthError::MissingField("@type".into()))?;
+
+    match chip_type {
+        "ubl/app" => { AppRegistration::from_chip_body(body)?; }
+        "ubl/user" => { UserIdentity::from_chip_body(body)?; }
+        "ubl/tenant" => { TenantCircle::from_chip_body(body)?; }
+        "ubl/membership" => { Membership::from_chip_body(body)?; }
+        "ubl/token" => { SessionToken::from_chip_body(body)?; }
+        "ubl/revoke" => { Revocation::from_chip_body(body)?; }
+        _ => {} // not an onboarding type, skip
+    }
+
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -270,94 +590,184 @@ impl PermissionContext {
 mod tests {
     use super::*;
 
+    // ── App ─────────────────────────────────────────────────────
+
     #[test]
-    fn user_identity_from_chip_body() {
+    fn app_registration_parse() {
+        let body = json!({
+            "@type": "ubl/app",
+            "@id": "app-001",
+            "@ver": "1.0",
+            "@world": "a/acme",
+            "slug": "acme",
+            "display_name": "Acme Corp",
+            "owner_did": "did:key:z6MkOwner",
+        });
+
+        let app = AppRegistration::from_chip_body(&body).unwrap();
+        assert_eq!(app.slug, "acme");
+        assert_eq!(app.world_prefix(), "a/acme");
+    }
+
+    #[test]
+    fn app_slug_no_slashes() {
+        let body = json!({"slug": "a/b", "display_name": "X", "owner_did": "did:key:z"});
+        assert!(AppRegistration::from_chip_body(&body).is_err());
+    }
+
+    #[test]
+    fn app_slug_no_spaces() {
+        let body = json!({"slug": "my app", "display_name": "X", "owner_did": "did:key:z"});
+        assert!(AppRegistration::from_chip_body(&body).is_err());
+    }
+
+    #[test]
+    fn app_roundtrip() {
+        let app = AppRegistration {
+            slug: "lab512".into(),
+            display_name: "Lab 512".into(),
+            owner_did: "did:key:z6MkOwner".into(),
+        };
+        let body = app.to_chip_body("a1");
+        assert_eq!(body["@type"], "ubl/app");
+        assert_eq!(body["@world"], "a/lab512");
+        let parsed = AppRegistration::from_chip_body(&body).unwrap();
+        assert_eq!(parsed.slug, "lab512");
+    }
+
+    // ── User ────────────────────────────────────────────────────
+
+    #[test]
+    fn user_identity_parse() {
         let body = json!({
             "@type": "ubl/user",
-            "@id": "user-001",
-            "@ver": "1.0",
-            "@world": "a/acme/t/prod",
-            "did": "did:key:z6MkTest",
+            "@world": "a/acme",
+            "did": "did:key:z6MkAlice",
             "display_name": "Alice",
-            "roles": ["admin", "user"],
-            "active": true,
         });
-
         let user = UserIdentity::from_chip_body(&body).unwrap();
-        assert_eq!(user.did, "did:key:z6MkTest");
-        assert_eq!(user.display_name, "Alice");
-        assert!(user.has_role("admin"));
-        assert!(user.is_admin());
-        assert!(user.active);
+        assert_eq!(user.did, "did:key:z6MkAlice");
     }
 
     #[test]
-    fn user_identity_defaults() {
-        let body = json!({
-            "did": "did:key:z6MkTest",
-            "display_name": "Bob",
-        });
-
-        let user = UserIdentity::from_chip_body(&body).unwrap();
-        assert_eq!(user.roles, vec!["user"]);
-        assert!(user.active);
-        assert!(!user.is_admin());
-    }
-
-    #[test]
-    fn user_identity_missing_did_fails() {
+    fn user_missing_did_fails() {
         let body = json!({"display_name": "Alice"});
         assert!(UserIdentity::from_chip_body(&body).is_err());
     }
 
     #[test]
-    fn user_identity_invalid_did_fails() {
+    fn user_invalid_did_fails() {
         let body = json!({"did": "not-a-did", "display_name": "Alice"});
-        let err = UserIdentity::from_chip_body(&body).unwrap_err();
-        assert!(matches!(err, AuthError::InvalidField(_)));
+        assert!(matches!(
+            UserIdentity::from_chip_body(&body).unwrap_err(),
+            AuthError::InvalidField(_)
+        ));
     }
 
     #[test]
-    fn user_identity_empty_name_fails() {
-        let body = json!({"did": "did:key:z6MkTest", "display_name": ""});
+    fn user_empty_name_fails() {
+        let body = json!({"did": "did:key:z6Mk", "display_name": ""});
         assert!(UserIdentity::from_chip_body(&body).is_err());
     }
 
     #[test]
-    fn user_identity_roundtrip() {
+    fn user_roundtrip() {
         let user = UserIdentity {
-            did: "did:key:z6MkTest".into(),
+            did: "did:key:z6MkAlice".into(),
             display_name: "Alice".into(),
-            roles: vec!["admin".into()],
-            active: true,
         };
-
-        let body = user.to_chip_body("u1", "a/acme/t/prod");
+        let body = user.to_chip_body("u1", "a/acme");
         assert_eq!(body["@type"], "ubl/user");
-        assert_eq!(body["did"], "did:key:z6MkTest");
-
         let parsed = UserIdentity::from_chip_body(&body).unwrap();
         assert_eq!(parsed.did, user.did);
-        assert_eq!(parsed.display_name, user.display_name);
+    }
+
+    // ── Tenant / Circle ─────────────────────────────────────────
+
+    #[test]
+    fn tenant_parse() {
+        let body = json!({
+            "@type": "ubl/tenant",
+            "@world": "a/acme",
+            "slug": "engineering",
+            "display_name": "Engineering Circle",
+            "creator_cid": "b3:user123",
+        });
+        let tenant = TenantCircle::from_chip_body(&body).unwrap();
+        assert_eq!(tenant.slug, "engineering");
+        assert_eq!(tenant.creator_cid, "b3:user123");
     }
 
     #[test]
-    fn session_token_from_chip_body() {
+    fn tenant_bad_creator_cid() {
+        let body = json!({
+            "slug": "eng", "display_name": "Eng", "creator_cid": "not-a-cid",
+        });
+        assert!(TenantCircle::from_chip_body(&body).is_err());
+    }
+
+    #[test]
+    fn tenant_roundtrip() {
+        let t = TenantCircle {
+            slug: "prod".into(),
+            display_name: "Production".into(),
+            creator_cid: "b3:user123".into(),
+        };
+        let body = t.to_chip_body("t1", "a/acme");
+        assert_eq!(body["@type"], "ubl/tenant");
+        let parsed = TenantCircle::from_chip_body(&body).unwrap();
+        assert_eq!(parsed.slug, "prod");
+    }
+
+    // ── Membership ──────────────────────────────────────────────
+
+    #[test]
+    fn membership_parse() {
+        let body = json!({
+            "@type": "ubl/membership",
+            "@world": "a/acme/t/prod",
+            "user_cid": "b3:user123",
+            "tenant_cid": "b3:tenant456",
+            "role": "admin",
+        });
+        let m = Membership::from_chip_body(&body).unwrap();
+        assert_eq!(m.role, Role::Admin);
+    }
+
+    #[test]
+    fn membership_invalid_role() {
+        let body = json!({
+            "user_cid": "b3:u", "tenant_cid": "b3:t", "role": "superadmin",
+        });
+        assert!(Membership::from_chip_body(&body).is_err());
+    }
+
+    #[test]
+    fn membership_roundtrip() {
+        let m = Membership {
+            user_cid: "b3:user123".into(),
+            tenant_cid: "b3:tenant456".into(),
+            role: Role::Member,
+        };
+        let body = m.to_chip_body("m1", "a/acme/t/prod");
+        assert_eq!(body["role"], "member");
+        let parsed = Membership::from_chip_body(&body).unwrap();
+        assert_eq!(parsed.role, Role::Member);
+    }
+
+    // ── Token ───────────────────────────────────────────────────
+
+    #[test]
+    fn token_parse() {
         let body = json!({
             "@type": "ubl/token",
-            "@id": "tok-001",
-            "@ver": "1.0",
-            "@world": "a/acme/t/prod",
-            "user_did": "did:key:z6MkTest",
+            "@world": "a/acme",
             "user_cid": "b3:user123",
             "scope": ["read", "write"],
             "expires_at": "2026-12-31T23:59:59Z",
-            "kid": "did:key:z6MkTest#v0",
+            "kid": "did:key:z6Mk#v0",
         });
-
         let token = SessionToken::from_chip_body(&body).unwrap();
-        assert_eq!(token.user_did, "did:key:z6MkTest");
-        assert_eq!(token.user_cid, "b3:user123");
         assert!(token.has_scope("read"));
         assert!(token.has_scope("write"));
         assert!(!token.has_scope("admin"));
@@ -366,108 +776,191 @@ mod tests {
     }
 
     #[test]
-    fn session_token_missing_fields_fail() {
-        let body = json!({"user_did": "did:key:x"});
+    fn token_missing_fields() {
+        let body = json!({"user_cid": "b3:u"});
         assert!(SessionToken::from_chip_body(&body).is_err());
     }
 
     #[test]
-    fn session_token_roundtrip() {
-        let token = SessionToken {
-            user_did: "did:key:z6MkTest".into(),
-            user_cid: "b3:user123".into(),
-            scope: vec!["read".into(), "write".into()],
-            expires_at: "2026-12-31T23:59:59Z".into(),
-            kid: "did:key:z6MkTest#v0".into(),
-        };
-
-        let body = token.to_chip_body("t1", "a/acme/t/prod");
-        assert_eq!(body["@type"], "ubl/token");
-
-        let parsed = SessionToken::from_chip_body(&body).unwrap();
-        assert_eq!(parsed.user_did, token.user_did);
-        assert_eq!(parsed.scope, token.scope);
-    }
-
-    #[test]
-    fn wildcard_scope_grants_everything() {
+    fn token_wildcard_scope() {
         let body = json!({
-            "user_did": "did:key:x",
             "user_cid": "b3:u",
             "scope": ["*"],
             "expires_at": "2099-01-01T00:00:00Z",
             "kid": "did:key:x#v0",
         });
-
         let token = SessionToken::from_chip_body(&body).unwrap();
-        assert!(token.has_scope("read"));
-        assert!(token.has_scope("write"));
-        assert!(token.has_scope("admin"));
         assert!(token.has_scope("anything"));
     }
 
     #[test]
-    fn permission_context_quick_check_admin() {
-        let user = UserIdentity {
-            did: "did:key:admin".into(),
-            display_name: "Admin".into(),
-            roles: vec!["admin".into()],
-            active: true,
-        };
+    fn token_roundtrip() {
         let token = SessionToken {
-            user_did: "did:key:admin".into(),
-            user_cid: "b3:u".into(),
-            scope: vec!["read".into()], // even with limited scope
-            expires_at: "2099-01-01T00:00:00Z".into(),
-            kid: "did:key:admin#v0".into(),
-        };
-
-        let ctx = PermissionContext::new(&user, &token, "ubl/user", "delete", "a/x/t/y");
-        assert!(ctx.quick_check().is_ok()); // admin bypasses scope check
-    }
-
-    #[test]
-    fn permission_context_quick_check_insufficient_scope() {
-        let user = UserIdentity {
-            did: "did:key:user".into(),
-            display_name: "User".into(),
-            roles: vec!["user".into()],
-            active: true,
-        };
-        let token = SessionToken {
-            user_did: "did:key:user".into(),
-            user_cid: "b3:u".into(),
-            scope: vec!["read".into()],
-            expires_at: "2099-01-01T00:00:00Z".into(),
-            kid: "did:key:user#v0".into(),
-        };
-
-        let ctx = PermissionContext::new(&user, &token, "ubl/user", "create", "a/x/t/y");
-        assert!(ctx.quick_check().is_err()); // read scope can't create
-    }
-
-    #[test]
-    fn permission_context_to_eval_context() {
-        let user = UserIdentity {
-            did: "did:key:z6Mk".into(),
-            display_name: "Alice".into(),
-            roles: vec!["user".into(), "editor".into()],
-            active: true,
-        };
-        let token = SessionToken {
-            user_did: "did:key:z6Mk".into(),
-            user_cid: "b3:u".into(),
+            user_cid: "b3:user123".into(),
             scope: vec!["read".into(), "write".into()],
-            expires_at: "2099-01-01T00:00:00Z".into(),
+            expires_at: "2026-12-31T23:59:59Z".into(),
             kid: "did:key:z6Mk#v0".into(),
         };
+        let body = token.to_chip_body("t1", "a/acme");
+        assert_eq!(body["@type"], "ubl/token");
+        let parsed = SessionToken::from_chip_body(&body).unwrap();
+        assert_eq!(parsed.user_cid, "b3:user123");
+    }
 
-        let ctx = PermissionContext::new(&user, &token, "ubl/user", "create", "a/acme/t/prod");
-        let eval = ctx.to_eval_context();
-        assert_eq!(eval["actor.did"], "did:key:z6Mk");
-        assert_eq!(eval["actor.roles"], "user,editor");
-        assert_eq!(eval["token.scopes"], "read,write");
-        assert_eq!(eval["chip.@type"], "ubl/user");
-        assert_eq!(eval["chip.operation"], "create");
+    // ── Revocation ──────────────────────────────────────────────
+
+    #[test]
+    fn revocation_parse() {
+        let body = json!({
+            "@type": "ubl/revoke",
+            "@world": "a/acme/t/prod",
+            "target_cid": "b3:target789",
+            "reason": "Policy violation",
+            "actor_cid": "b3:admin001",
+        });
+        let r = Revocation::from_chip_body(&body).unwrap();
+        assert_eq!(r.target_cid, "b3:target789");
+    }
+
+    #[test]
+    fn revocation_empty_reason_fails() {
+        let body = json!({
+            "target_cid": "b3:t", "reason": "", "actor_cid": "b3:a",
+        });
+        assert!(Revocation::from_chip_body(&body).is_err());
+    }
+
+    #[test]
+    fn revocation_roundtrip() {
+        let r = Revocation {
+            target_cid: "b3:target789".into(),
+            reason: "Suspended by admin".into(),
+            actor_cid: "b3:admin001".into(),
+        };
+        let body = r.to_chip_body("r1", "a/acme/t/prod");
+        assert_eq!(body["@type"], "ubl/revoke");
+        let parsed = Revocation::from_chip_body(&body).unwrap();
+        assert_eq!(parsed.reason, "Suspended by admin");
+    }
+
+    // ── WorldScope ──────────────────────────────────────────────
+
+    #[test]
+    fn world_scope_app_only() {
+        let w = WorldScope::parse("a/acme").unwrap();
+        assert_eq!(w.app, "acme");
+        assert_eq!(w.tenant, None);
+        assert_eq!(w.to_string(), "a/acme");
+    }
+
+    #[test]
+    fn world_scope_app_and_tenant() {
+        let w = WorldScope::parse("a/acme/t/prod").unwrap();
+        assert_eq!(w.app, "acme");
+        assert_eq!(w.tenant, Some("prod".into()));
+        assert_eq!(w.app_world(), "a/acme");
+    }
+
+    #[test]
+    fn world_scope_invalid() {
+        assert!(WorldScope::parse("invalid").is_err());
+        assert!(WorldScope::parse("b/acme").is_err());
+        assert!(WorldScope::parse("a/").is_err());
+    }
+
+    // ── Permission Context ──────────────────────────────────────
+
+    #[test]
+    fn admin_can_do_anything() {
+        let ctx = PermissionContext {
+            actor_did: "did:key:admin".into(),
+            actor_role: Role::Admin,
+            token_scopes: vec!["read".into()],
+            chip_type: "ubl/revoke".into(),
+            world: "a/acme/t/prod".into(),
+        };
+        assert!(ctx.quick_check().is_ok());
+    }
+
+    #[test]
+    fn member_cannot_revoke() {
+        let ctx = PermissionContext {
+            actor_did: "did:key:user".into(),
+            actor_role: Role::Member,
+            token_scopes: vec!["read".into(), "write".into()],
+            chip_type: "ubl/revoke".into(),
+            world: "a/acme/t/prod".into(),
+        };
+        assert!(ctx.quick_check().is_err());
+    }
+
+    #[test]
+    fn member_cannot_manage_membership() {
+        let ctx = PermissionContext {
+            actor_did: "did:key:user".into(),
+            actor_role: Role::Member,
+            token_scopes: vec!["*".into()],
+            chip_type: "ubl/membership".into(),
+            world: "a/acme/t/prod".into(),
+        };
+        assert!(ctx.quick_check().is_err());
+    }
+
+    #[test]
+    fn member_can_submit_regular_chips() {
+        let ctx = PermissionContext {
+            actor_did: "did:key:user".into(),
+            actor_role: Role::Member,
+            token_scopes: vec!["read".into(), "write".into()],
+            chip_type: "ubl/user".into(),
+            world: "a/acme".into(),
+        };
+        assert!(ctx.quick_check().is_ok());
+    }
+
+    // ── Validate Onboarding ─────────────────────────────────────
+
+    #[test]
+    fn validate_onboarding_app() {
+        let body = json!({
+            "@type": "ubl/app",
+            "slug": "acme",
+            "display_name": "Acme",
+            "owner_did": "did:key:z6Mk",
+        });
+        assert!(validate_onboarding_chip(&body).is_ok());
+    }
+
+    #[test]
+    fn validate_onboarding_bad_user() {
+        let body = json!({
+            "@type": "ubl/user",
+            "did": "not-a-did",
+            "display_name": "Alice",
+        });
+        assert!(validate_onboarding_chip(&body).is_err());
+    }
+
+    #[test]
+    fn is_onboarding_type_check() {
+        assert!(is_onboarding_type("ubl/app"));
+        assert!(is_onboarding_type("ubl/user"));
+        assert!(is_onboarding_type("ubl/tenant"));
+        assert!(is_onboarding_type("ubl/membership"));
+        assert!(is_onboarding_type("ubl/token"));
+        assert!(is_onboarding_type("ubl/revoke"));
+        assert!(!is_onboarding_type("ubl/advisory"));
+        assert!(!is_onboarding_type("ubl/ai.passport"));
+    }
+
+    // ── Role ────────────────────────────────────────────────────
+
+    #[test]
+    fn role_only_two() {
+        assert!(Role::from_str("admin").is_ok());
+        assert!(Role::from_str("member").is_ok());
+        assert!(Role::from_str("superadmin").is_err());
+        assert!(Role::from_str("user").is_err());
+        assert!(Role::from_str("").is_err());
     }
 }

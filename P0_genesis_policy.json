@@ -1,0 +1,65 @@
+{
+  "@type": "policy/genesis",
+  "@ver": 1,
+  "@id": "",
+  "label": "P0 — Genesis (hardcoded)",
+  "trust_root": {
+    "owners": [
+      {
+        "did": "did:key:zDan",
+        "weight": 1
+      },
+      {
+        "did": "did:key:zSec",
+        "weight": 1
+      },
+      {
+        "did": "did:key:zOps",
+        "weight": 1
+      }
+    ],
+    "quorum": {
+      "threshold": 2,
+      "members": [
+        "did:key:zDan",
+        "did:key:zSec",
+        "did:key:zOps"
+      ]
+    },
+    "break_glass": {
+      "method": "out-of-band",
+      "did": "did:key:zDan"
+    }
+  },
+  "runtime_allowlist": [
+    "sha256:rt-PROD-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "sha256:rt-PROD-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+  ],
+  "permit_types": [
+    "policy/*",
+    "skill/primer"
+  ],
+  "deny_types": [
+    "*"
+  ],
+  "advisory": {
+    "allow_emit": false,
+    "allow_consume": true
+  },
+  "requirements": {
+    "encoding": "nrf-1",
+    "no_floats": true,
+    "unicode_normalized": true,
+    "timestamp": "utc-only",
+    "runtime_hash_required": true
+  },
+  "onboarding_invariants": [
+    "no_dedicated_endpoints",
+    "append_only_ledger",
+    "policy_immutability_per_receipt"
+  ],
+  "kats": [
+    "b3:kat-canonical-json",
+    "b3:kat-receipt-verify"
+  ]
+}

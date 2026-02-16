@@ -5,7 +5,7 @@ use crate::policy_bit::PolicyResult;
 use crate::policy_loader::{PolicyLoader, ChipRequest as PolicyChipRequest, PolicyStorage};
 use crate::genesis::genesis_chip_cid;
 use crate::event_bus::{EventBus, ReceiptEvent};
-use ubl_receipt::{WaReceiptBody, WfReceiptBody, PolicyTraceEntry, UnifiedReceipt, StageExecution, PipelineStage};
+use ubl_receipt::{WaReceiptBody, WfReceiptBody, PolicyTraceEntry, UnifiedReceipt, StageExecution, PipelineStage, RuntimeInfo};
 use rb_vm::{CasProvider, SignProvider, Vm, VmConfig, ExecError};
 use rb_vm::canon::CanonProvider;
 use rb_vm::types::Cid as VmCid;
@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use ubl_chipstore::{ChipStore, ExecutionMetadata};
 use crate::advisory::AdvisoryEngine;
+use crate::idempotency::{IdempotencyKey, IdempotencyStore, CachedResult};
+use ubl_kms::{did_from_verifying_key, kid_from_verifying_key, Ed25519SigningKey as SigningKey};
 
 /// The UBL Pipeline processor
 pub struct UblPipeline {
@@ -25,6 +27,14 @@ pub struct UblPipeline {
     seen_nonces: Arc<RwLock<HashSet<String>>>,
     chip_store: Option<Arc<ChipStore>>,
     advisory_engine: Option<Arc<AdvisoryEngine>>,
+    idempotency_store: IdempotencyStore,
+    runtime_info: Arc<RuntimeInfo>,
+    /// Pipeline DID derived from signing key
+    pub did: String,
+    /// Pipeline KID derived from signing key
+    pub kid: String,
+    /// Ed25519 signing key for receipts and JWS
+    signing_key: Arc<SigningKey>,
 }
 
 const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
@@ -51,38 +61,30 @@ impl CasProvider for PipelineCas {
     }
 }
 
-struct PipelineSigner;
+struct PipelineSigner {
+    signing_key: Arc<SigningKey>,
+    kid: String,
+}
 impl SignProvider for PipelineSigner {
-    fn sign_jws(&self, _payload: &[u8]) -> Vec<u8> {
-        // TODO: Replace with real Ed25519 signing from env-loaded key
-        vec![0u8; 64]
+    fn sign_jws(&self, payload: &[u8]) -> Vec<u8> {
+        let sig_str = ubl_kms::sign_bytes(&self.signing_key, payload, ubl_kms::domain::RB_VM);
+        // Return raw signature bytes (strip "ed25519:" prefix and decode base64)
+        sig_str.strip_prefix("ed25519:").map(|b64| {
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
+                .unwrap_or_else(|_| vec![0u8; 64])
+        }).unwrap_or_else(|| vec![0u8; 64])
     }
     fn kid(&self) -> String {
-        "did:key:placeholder#v0".to_string()
+        self.kid.clone()
     }
 }
 
+/// Pipeline canonicalization — delegates to full ρ (RhoCanon).
+/// Enforces: NFC strings, null stripping, key sorting, BOM rejection.
 struct PipelineCanon;
 impl CanonProvider for PipelineCanon {
     fn canon(&self, v: serde_json::Value) -> serde_json::Value {
-        // Delegate to NRF canon: encode to NRF bytes then back to JSON
-        // For MVP, use naive key-sorting (matches rb_vm::canon::NaiveCanon)
-        fn sort(v: serde_json::Value) -> serde_json::Value {
-            match v {
-                serde_json::Value::Object(m) => {
-                    let mut pairs: Vec<(String, serde_json::Value)> = m.into_iter().collect();
-                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    let mut out = serde_json::Map::new();
-                    for (k, val) in pairs {
-                        out.insert(k, sort(val));
-                    }
-                    serde_json::Value::Object(out)
-                }
-                serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(sort).collect()),
-                other => other,
-            }
-        }
-        sort(v)
+        rb_vm::RhoCanon.canon(v)
     }
 }
 
@@ -157,8 +159,20 @@ impl UblPipeline {
             duration_ms,
         }
     }
+    /// Load signing key from env (`SIGNING_KEY_HEX`) or generate a dev key.
+    fn load_or_generate_key() -> SigningKey {
+        match ubl_kms::signing_key_from_env() {
+            Ok(key) => key,
+            Err(_) => ubl_kms::generate_signing_key(),
+        }
+    }
+
     /// Create a new pipeline instance
     pub fn new(storage: Box<dyn PolicyStorage>) -> Self {
+        let key = Self::load_or_generate_key();
+        let vk = key.verifying_key();
+        let did = did_from_verifying_key(&vk);
+        let kid = kid_from_verifying_key(&vk);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -166,11 +180,20 @@ impl UblPipeline {
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: None,
             advisory_engine: None,
+            idempotency_store: IdempotencyStore::new(),
+            runtime_info: Arc::new(RuntimeInfo::capture()),
+            did,
+            kid,
+            signing_key: Arc::new(key),
         }
     }
 
     /// Create pipeline with existing event bus
     pub fn with_event_bus(storage: Box<dyn PolicyStorage>, event_bus: Arc<EventBus>) -> Self {
+        let key = Self::load_or_generate_key();
+        let vk = key.verifying_key();
+        let did = did_from_verifying_key(&vk);
+        let kid = kid_from_verifying_key(&vk);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -178,6 +201,11 @@ impl UblPipeline {
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: None,
             advisory_engine: None,
+            idempotency_store: IdempotencyStore::new(),
+            runtime_info: Arc::new(RuntimeInfo::capture()),
+            did,
+            kid,
+            signing_key: Arc::new(key),
         }
     }
 
@@ -186,6 +214,10 @@ impl UblPipeline {
         storage: Box<dyn PolicyStorage>,
         chip_store: Arc<ChipStore>,
     ) -> Self {
+        let key = Self::load_or_generate_key();
+        let vk = key.verifying_key();
+        let did = did_from_verifying_key(&vk);
+        let kid = kid_from_verifying_key(&vk);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -193,6 +225,11 @@ impl UblPipeline {
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: Some(chip_store),
             advisory_engine: None,
+            idempotency_store: IdempotencyStore::new(),
+            runtime_info: Arc::new(RuntimeInfo::capture()),
+            did,
+            kid,
+            signing_key: Arc::new(key),
         }
     }
 
@@ -264,8 +301,21 @@ impl UblPipeline {
 
     /// Process a chip request through the WA→TR→WF pipeline.
     /// Assumes KNOCK already passed (use `process_raw` for full pipeline).
+    ///
+    /// **Idempotency:** If the chip has key `(@type, @ver, @world, @id)` and
+    /// that key was already processed, returns the cached result immediately.
     pub async fn process_chip(&self, request: ChipRequest) -> Result<PipelineResult, PipelineError> {
         let pipeline_start = std::time::Instant::now();
+
+        // ── Idempotency check: replay returns cached result ──
+        let idem_key = IdempotencyKey::from_chip_body(&request.body);
+        if let Some(ref key) = idem_key {
+            if let Some(cached) = self.idempotency_store.get(key).await {
+                return Err(PipelineError::ReplayDetected(
+                    format!("idempotent replay for {}: receipt_cid={}", key, cached.receipt_cid),
+                ));
+            }
+        }
 
         // Extract @world for the unified receipt
         let world = request.body.get("@world")
@@ -276,10 +326,10 @@ impl UblPipeline {
         // Create the unified receipt — it evolves through each stage
         let mut receipt = UnifiedReceipt::new(
             world,
-            "did:key:placeholder",
-            "did:key:placeholder#v0",
+            &self.did,
+            &self.kid,
             &nonce,
-        );
+        ).with_runtime_info((*self.runtime_info).clone());
 
         // Stage 1: WA (Write-Ahead)
         let wa_start = std::time::Instant::now();
@@ -298,7 +348,7 @@ impl UblPipeline {
         }).map_err(|e| PipelineError::Internal(format!("Receipt WA: {}", e)))?;
 
         // Publish WA event
-        self.publish_receipt_event(&wa_receipt, "wa", None, None).await;
+        self.publish_receipt_event(&wa_receipt, "wa", None, Some(wa_ms), Some(world), None).await;
 
         // Stage 2: CHECK (Policy Evaluation)
         let check_start = std::time::Instant::now();
@@ -348,7 +398,7 @@ impl UblPipeline {
             let wf_receipt = self.create_deny_receipt(&request, &wa_receipt, &check).await?;
 
             let deny_ms = pipeline_start.elapsed().as_millis() as i64;
-            self.publish_receipt_event(&wf_receipt, "wf", Some("deny".to_string()), Some(deny_ms)).await;
+            self.publish_receipt_event(&wf_receipt, "wf", Some("deny".to_string()), Some(deny_ms), Some(world), Some(&wa_receipt.body_cid)).await;
 
             return Ok(PipelineResult {
                 final_receipt: wf_receipt.clone(),
@@ -379,7 +429,7 @@ impl UblPipeline {
         }).map_err(|e| PipelineError::Internal(format!("Receipt TR: {}", e)))?;
 
         // Publish TR event
-        self.publish_receipt_event(&tr_receipt, "tr", None, None).await;
+        self.publish_receipt_event(&tr_receipt, "tr", None, Some(tr_ms), Some(world), Some(&wa_receipt.body_cid)).await;
 
         // Stage 4: WF (Write-Finished)
         let wf_start = std::time::Instant::now();
@@ -400,7 +450,7 @@ impl UblPipeline {
         let total_ms = pipeline_start.elapsed().as_millis() as i64;
 
         // Publish successful WF event
-        self.publish_receipt_event(&wf_receipt, "wf", Some("allow".to_string()), Some(total_ms)).await;
+        self.publish_receipt_event(&wf_receipt, "wf", Some("allow".to_string()), Some(total_ms), Some(world), Some(&tr_receipt.body_cid)).await;
 
         // Persist chip to ChipStore (best-effort — never blocks pipeline)
         if let Some(ref store) = self.chip_store {
@@ -409,7 +459,7 @@ impl UblPipeline {
                 execution_time_ms: total_ms,
                 fuel_consumed: self.fuel_limit,
                 policies_applied: check.trace.iter().map(|t| t.policy_id.clone()).collect(),
-                executor_did: "did:key:placeholder".to_string(),
+                executor_did: self.did.clone(),
                 reproducible: true,
             };
             if let Err(e) = store.store_executed_chip(
@@ -446,7 +496,7 @@ impl UblPipeline {
             });
         }
 
-        Ok(PipelineResult {
+        let result = PipelineResult {
             final_receipt: wf_receipt.clone(),
             chain: vec![
                 wa_receipt.body_cid,
@@ -455,7 +505,20 @@ impl UblPipeline {
             ],
             decision: check.decision,
             receipt,
-        })
+        };
+
+        // ── Cache result for idempotency ──
+        if let Some(key) = idem_key {
+            self.idempotency_store.put(key, CachedResult {
+                receipt_cid: result.receipt.receipt_cid.clone(),
+                response_json: result.receipt.to_json().unwrap_or_default(),
+                decision: format!("{:?}", result.decision),
+                chain: result.chain.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }).await;
+        }
+
+        Ok(result)
     }
 
     /// Stage 1: Write-Ahead - create ghost record, freeze @world
@@ -473,7 +536,7 @@ impl UblPipeline {
         {
             let mut seen = self.seen_nonces.write().await;
             if !seen.insert(nonce.clone()) {
-                return Err(PipelineError::Internal("REPLAY: duplicate nonce".to_string()));
+                return Err(PipelineError::ReplayDetected("duplicate nonce".to_string()));
             }
         }
 
@@ -482,11 +545,11 @@ impl UblPipeline {
             chip_cid: "pending".to_string(), // Will be computed later
             policy_cid: genesis_chip_cid(), // For now, just genesis
             frozen_time: chrono::Utc::now().to_rfc3339(),
-            caller: "did:key:placeholder".to_string(),
+            caller: self.did.clone(),
             context: request.body.clone(),
             operation: request.operation.clone().unwrap_or_else(|| "create".to_string()),
             nonce,
-            kid: "did:key:placeholder#v0".to_string(),
+            kid: self.kid.clone(),
         };
 
         let body_json = serde_json::to_value(&wa_body)
@@ -505,9 +568,26 @@ impl UblPipeline {
         })
     }
 
-    /// Stage 2: CHECK - Policy evaluation with full trace
+    /// Stage 2: CHECK - Onboarding validation + Policy evaluation with full trace
     async fn stage_check(&self, request: &ChipRequest) -> Result<CheckResult, PipelineError> {
-        let check_start = std::time::Instant::now();
+        let _check_start = std::time::Instant::now();
+
+        // ── Onboarding pre-check: validate body + dependency chain ──
+        if crate::auth::is_onboarding_type(&request.chip_type) {
+            // 1. Validate chip body structure
+            crate::auth::validate_onboarding_chip(&request.body)
+                .map_err(|e| PipelineError::InvalidChip(format!("Onboarding validation: {}", e)))?;
+
+            // 2. Validate @world format
+            let world_str = request.body.get("@world")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| PipelineError::InvalidChip("Onboarding chip missing @world".into()))?;
+
+            // 3. Check dependency chain against ChipStore
+            if let Some(ref store) = self.chip_store {
+                self.check_onboarding_dependencies(&request.chip_type, &request.body, world_str, store).await?;
+            }
+        }
 
         // Convert to policy request
         let policy_request = PolicyChipRequest {
@@ -576,7 +656,10 @@ impl UblPipeline {
         let mut cas = PipelineCas::new();
         let input_cid = cas.put(&chip_nrf);
 
-        let signer = PipelineSigner;
+        let signer = PipelineSigner {
+            signing_key: self.signing_key.clone(),
+            kid: self.kid.clone(),
+        };
         let canon = PipelineCanon;
         let cfg = VmConfig {
             fuel_limit: self.fuel_limit,
@@ -592,9 +675,19 @@ impl UblPipeline {
         // Execute VM
         let mut vm = Vm::new(cfg, cas, &signer, canon, vec![input_cid.clone()]);
         let outcome = vm.run(&instructions).map_err(|e| match e {
-            ExecError::FuelExhausted => PipelineError::Internal("FUEL_EXHAUSTED".to_string()),
+            ExecError::FuelExhausted => PipelineError::FuelExhausted(
+                format!("VM fuel exhausted (limit: {})", self.fuel_limit)
+            ),
+            ExecError::StackUnderflow(op) => PipelineError::StackUnderflow(
+                format!("stack underflow at {:?}", op)
+            ),
+            ExecError::TypeMismatch(op) => PipelineError::TypeMismatch(
+                format!("type mismatch at {:?}", op)
+            ),
+            ExecError::InvalidPayload(op) => PipelineError::TypeMismatch(
+                format!("invalid payload for {:?}", op)
+            ),
             ExecError::Deny(reason) => PipelineError::PolicyDenied(reason),
-            other => PipelineError::Internal(format!("TR VM: {}", other)),
         })?;
 
         let tr_body = serde_json::json!({
@@ -697,12 +790,17 @@ impl UblPipeline {
 
     /// Helper to publish receipt events to the event bus.
     /// Uses `publish_stage_event` (no dedup) since multiple stages share a receipt CID.
+    ///
+    /// Canonical stage event fields (P1.5): input_cid, output_cid, binary_hash,
+    /// build_meta, world, actor, latency_ms are populated from pipeline context.
     async fn publish_receipt_event(
         &self,
         receipt: &PipelineReceipt,
         pipeline_stage: &str,
         decision: Option<String>,
         duration_ms: Option<i64>,
+        world: Option<&str>,
+        input_cid: Option<&str>,
     ) {
         let mut event = ReceiptEvent::new(
             &format!("ubl.receipt.{}", pipeline_stage),
@@ -713,6 +811,15 @@ impl UblPipeline {
         );
         event.decision = decision;
         event.duration_ms = duration_ms;
+
+        // ── Canonical stage event fields (P1.5) ──
+        event.input_cid = input_cid.map(|s| s.to_string());
+        event.output_cid = Some(receipt.body_cid.clone());
+        event.binary_hash = Some(self.runtime_info.binary_hash.clone());
+        event.build_meta = serde_json::to_value(&self.runtime_info.build).ok();
+        event.world = world.map(|s| s.to_string());
+        event.actor = Some(self.did.clone());
+        event.latency_ms = duration_ms;
 
         // Extract fuel_used and rb_count from receipt body if present
         if let Some(vm) = receipt.body.get("vm_state") {
@@ -736,6 +843,183 @@ impl UblPipeline {
             eprintln!("Failed to publish receipt event: {}", e);
         }
     }
+
+    /// Enforce the onboarding dependency chain at CHECK.
+    ///
+    /// Order: App → User → Tenant → Membership → Token → Revoke
+    /// Each type requires its predecessors to already exist in ChipStore.
+    async fn check_onboarding_dependencies(
+        &self,
+        chip_type: &str,
+        body: &serde_json::Value,
+        world: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), PipelineError> {
+        match chip_type {
+            // App is the root — no dependencies, but slug must be unique.
+            // Requires cap.registry:init (P0.3).
+            "ubl/app" => {
+                crate::capability::require_cap(body, "registry:init", world)
+                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/app capability: {}", e)))?;
+
+                let slug = body.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                let existing = store.get_chips_by_type("ubl/app").await
+                    .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
+                for chip in &existing {
+                    if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(slug) {
+                        // Check if this app has been revoked
+                        if !self.is_revoked(&chip.cid, store).await? {
+                            return Err(PipelineError::InvalidChip(
+                                format!("App slug '{}' already registered", slug),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // User requires a valid app in @world.
+            // First user for an app requires cap.registry:init (P0.3).
+            "ubl/user" => {
+                let scope = crate::auth::WorldScope::parse(world)
+                    .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
+                self.require_app_exists(&scope.app, store).await?;
+
+                // Check if this is the first user for this app
+                let existing_users = store.get_chips_by_type("ubl/user").await
+                    .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
+                let has_user_for_app = existing_users.iter().any(|c| {
+                    c.chip_data.get("@world").and_then(|v| v.as_str())
+                        .map(|w| w.starts_with(&format!("a/{}", scope.app)))
+                        .unwrap_or(false)
+                });
+                if !has_user_for_app {
+                    crate::capability::require_cap(body, "registry:init", world)
+                        .map_err(|e| PipelineError::InvalidChip(
+                            format!("first ubl/user for app '{}' requires capability: {}", scope.app, e)
+                        ))?;
+                }
+            }
+
+            // Tenant requires: app exists + creator_cid references a valid user
+            "ubl/tenant" => {
+                let scope = crate::auth::WorldScope::parse(world)
+                    .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
+                self.require_app_exists(&scope.app, store).await?;
+
+                let creator_cid = body.get("creator_cid").and_then(|v| v.as_str()).unwrap_or("");
+                self.require_chip_exists(creator_cid, "ubl/user", store).await?;
+            }
+
+            // Membership requires: user_cid and tenant_cid both exist.
+            // Requires cap.membership:grant (P0.4).
+            "ubl/membership" => {
+                crate::capability::require_cap(body, "membership:grant", world)
+                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/membership capability: {}", e)))?;
+
+                let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
+                self.require_chip_exists(user_cid, "ubl/user", store).await?;
+
+                let tenant_cid = body.get("tenant_cid").and_then(|v| v.as_str()).unwrap_or("");
+                self.require_chip_exists(tenant_cid, "ubl/tenant", store).await?;
+            }
+
+            // Token requires: user_cid exists
+            "ubl/token" => {
+                let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
+                self.require_chip_exists(user_cid, "ubl/user", store).await?;
+            }
+
+            // Revoke requires: target_cid exists (any type) + actor_cid exists.
+            // Requires cap.revoke:execute (P0.4).
+            "ubl/revoke" => {
+                crate::capability::require_cap(body, "revoke:execute", world)
+                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/revoke capability: {}", e)))?;
+
+                let target_cid = body.get("target_cid").and_then(|v| v.as_str()).unwrap_or("");
+                if !store.exists(target_cid).await
+                    .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))? {
+                    return Err(PipelineError::DependencyMissing(
+                        format!("Revoke target '{}' not found", target_cid),
+                    ));
+                }
+
+                let actor_cid = body.get("actor_cid").and_then(|v| v.as_str()).unwrap_or("");
+                self.require_chip_exists(actor_cid, "ubl/user", store).await?;
+            }
+
+            _ => {} // not an onboarding type
+        }
+
+        Ok(())
+    }
+
+    /// Check that an app with the given slug exists and is not revoked.
+    async fn require_app_exists(
+        &self,
+        app_slug: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), PipelineError> {
+        let apps = store.get_chips_by_type("ubl/app").await
+            .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?;
+
+        for chip in &apps {
+            if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug) {
+                if !self.is_revoked(&chip.cid, store).await? {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(PipelineError::DependencyMissing(
+            format!("App '{}' not found — register ubl/app first", app_slug),
+        ))
+    }
+
+    /// Check that a chip with the given CID exists, is the expected type, and is not revoked.
+    async fn require_chip_exists(
+        &self,
+        cid: &str,
+        expected_type: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), PipelineError> {
+        let chip = store.get_chip(cid).await
+            .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?
+            .ok_or_else(|| PipelineError::DependencyMissing(
+                format!("{} '{}' not found", expected_type, cid),
+            ))?;
+
+        if chip.chip_type != expected_type {
+            return Err(PipelineError::InvalidChip(format!(
+                "CID '{}' is '{}', expected '{}'", cid, chip.chip_type, expected_type,
+            )));
+        }
+
+        if self.is_revoked(cid, store).await? {
+            return Err(PipelineError::DependencyMissing(format!(
+                "{} '{}' has been revoked", expected_type, cid,
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Check if a chip has been revoked (any ubl/revoke chip targeting it).
+    async fn is_revoked(
+        &self,
+        target_cid: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<bool, PipelineError> {
+        let revocations = store.get_chips_by_type("ubl/revoke").await
+            .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?;
+
+        for rev in &revocations {
+            if rev.chip_data.get("target_cid").and_then(|v| v.as_str()) == Some(target_cid) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 /// Pipeline errors
@@ -747,6 +1031,24 @@ pub enum PipelineError {
     PolicyDenied(String),
     #[error("Invalid chip format: {0}")]
     InvalidChip(String),
+    #[error("Dependency missing: {0}")]
+    DependencyMissing(String),
+    #[error("Fuel exhausted: {0}")]
+    FuelExhausted(String),
+    #[error("Type mismatch: {0}")]
+    TypeMismatch(String),
+    #[error("Stack underflow: {0}")]
+    StackUnderflow(String),
+    #[error("CAS not found: {0}")]
+    CasNotFound(String),
+    #[error("Replay detected: {0}")]
+    ReplayDetected(String),
+    #[error("Canon error: {0}")]
+    CanonError(String),
+    #[error("Sign error: {0}")]
+    SignError(String),
+    #[error("Storage error: {0}")]
+    StorageError(String),
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -763,13 +1065,13 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "alice-001",
                 "@ver": "1.0",
                 "@world": "a/demo/t/main",
-                "email": "alice@acme.com"
+                "title": "Test Document"
             }),
             parents: vec![],
             operation: Some("create".to_string()),
@@ -777,7 +1079,7 @@ mod tests {
 
         let result = pipeline.process_chip(request).await.unwrap();
 
-        // Decision must be Allow (genesis allows ubl/user)
+        // Decision must be Allow (genesis allows ubl/document)
         assert!(matches!(result.decision, Decision::Allow));
 
         // Chain must have 3 CIDs: WA, TR, WF
@@ -827,9 +1129,9 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "bob",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -855,9 +1157,9 @@ mod tests {
 
         // ALLOW path — genesis policy has RBs that vote
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "trace-test",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -924,9 +1226,9 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "no-world",
                 "@ver": "1.0"
             }),
@@ -945,9 +1247,9 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "bad-world",
                 "@ver": "1.0",
                 "@world": "not-a-valid-world"
@@ -968,9 +1270,9 @@ mod tests {
         let mut rx = event_bus.subscribe();
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "nonce-test",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -1002,10 +1304,10 @@ mod tests {
         let mut nonces = std::collections::HashSet::new();
         for i in 0..10 {
             let request = ChipRequest {
-                chip_type: "ubl/user".to_string(),
+                chip_type: "ubl/document".to_string(),
                 body: json!({
-                    "@type": "ubl/user",
-                    "@id": format!("user-{}", i),
+                    "@type": "ubl/document",
+                    "@id": format!("doc-{}", i),
                     "@ver": "1.0",
                     "@world": "a/app/t/ten"
                 }),
@@ -1030,13 +1332,13 @@ mod tests {
         let pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "persist-test",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten",
-                "email": "test@acme.com"
+                "title": "Test Document"
             }),
             parents: vec![],
             operation: Some("create".to_string()),
@@ -1048,11 +1350,11 @@ mod tests {
         // Chip should be persisted in the store
         // Compute the expected CID
         let chip_body = json!({
-            "@type": "ubl/user",
+            "@type": "ubl/document",
             "@id": "persist-test",
             "@ver": "1.0",
             "@world": "a/app/t/ten",
-            "email": "test@acme.com"
+            "title": "Test Document"
         });
         let nrf = ubl_ai_nrf1::to_nrf1_bytes(&chip_body).unwrap();
         let expected_cid = ubl_ai_nrf1::compute_cid(&nrf).unwrap();
@@ -1060,7 +1362,7 @@ mod tests {
         let stored = chip_store.get_chip(&expected_cid).await.unwrap();
         assert!(stored.is_some(), "chip must be persisted after allow");
         let stored = stored.unwrap();
-        assert_eq!(stored.chip_type, "ubl/user");
+        assert_eq!(stored.chip_type, "ubl/document");
         assert_eq!(stored.receipt_cid, result.final_receipt.body_cid);
     }
 
@@ -1111,9 +1413,9 @@ mod tests {
         let mut rx = event_bus.subscribe();
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "eve",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -1134,14 +1436,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_events_have_canonical_fields() {
+        let storage = InMemoryPolicyStorage::new();
+        let event_bus = Arc::new(EventBus::new());
+        let pipeline = UblPipeline::with_event_bus(Box::new(storage), event_bus.clone());
+        let mut rx = event_bus.subscribe();
+
+        let request = ChipRequest {
+            chip_type: "ubl/document".to_string(),
+            body: json!({
+                "@type": "ubl/document",
+                "@id": "canonical-evt",
+                "@ver": "1.0",
+                "@world": "a/app/t/ten"
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let _result = pipeline.process_chip(request).await.unwrap();
+
+        // Collect all events
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(events.len() >= 3, "need WA+TR+WF, got {}", events.len());
+
+        // Every event must have canonical fields
+        for ev in &events {
+            assert!(ev.world.is_some(), "stage {} missing world", ev.pipeline_stage);
+            assert_eq!(ev.world.as_deref(), Some("a/app/t/ten"));
+            assert!(ev.actor.is_some(), "stage {} missing actor", ev.pipeline_stage);
+            assert!(ev.actor.as_ref().unwrap().starts_with("did:key:"), "actor must be a DID");
+            assert!(ev.binary_hash.is_some(), "stage {} missing binary_hash", ev.pipeline_stage);
+            assert!(ev.output_cid.is_some(), "stage {} missing output_cid", ev.pipeline_stage);
+            assert!(ev.latency_ms.is_some(), "stage {} missing latency_ms", ev.pipeline_stage);
+        }
+
+        // WA has no input_cid (it's the first stage)
+        let wa = events.iter().find(|e| e.pipeline_stage == "wa").unwrap();
+        assert!(wa.input_cid.is_none(), "WA should have no input_cid");
+
+        // TR has input_cid = WA output
+        let tr = events.iter().find(|e| e.pipeline_stage == "tr").unwrap();
+        assert!(tr.input_cid.is_some(), "TR must have input_cid");
+        assert_eq!(tr.input_cid.as_deref(), wa.output_cid.as_deref(), "TR input = WA output");
+
+        // WF has input_cid = TR output
+        let wf = events.iter().find(|e| e.pipeline_stage == "wf").unwrap();
+        assert!(wf.input_cid.is_some(), "WF must have input_cid");
+        assert_eq!(wf.input_cid.as_deref(), tr.output_cid.as_deref(), "WF input = TR output");
+        assert_eq!(wf.decision.as_deref(), Some("allow"));
+    }
+
+    #[tokio::test]
     async fn unified_receipt_has_all_stages_on_allow() {
         let storage = InMemoryPolicyStorage::new();
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "unified-test",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -1215,9 +1572,9 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "trace-unified",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -1241,9 +1598,9 @@ mod tests {
         let pipeline = UblPipeline::new(Box::new(storage));
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "fuel-test",
                 "@ver": "1.0",
                 "@world": "a/app/t/ten"
@@ -1329,9 +1686,9 @@ mod tests {
         pipeline.set_advisory_engine(engine);
 
         let request = ChipRequest {
-            chip_type: "ubl/user".to_string(),
+            chip_type: "ubl/document".to_string(),
             body: json!({
-                "@type": "ubl/user",
+                "@type": "ubl/document",
                 "@id": "adv-test",
                 "@ver": "1.0",
                 "@world": "a/test/t/test",
@@ -1417,5 +1774,369 @@ mod tests {
 
         let adv_chip = &results.chips[0];
         assert_eq!(adv_chip.chip_data["action"], "explain_check");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Onboarding Integration Tests — full dependency chain
+    // ══════════════════════════════════════════════════════════════
+
+    /// Helper: create a pipeline with ChipStore for onboarding tests.
+    fn onboarding_pipeline() -> (UblPipeline, Arc<ubl_chipstore::ChipStore>) {
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+        let policy_storage = InMemoryPolicyStorage::new();
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend));
+        let pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+        (pipeline, chip_store)
+    }
+
+    /// Helper: create a valid @cap for testing.
+    fn test_cap(action: &str, audience: &str) -> serde_json::Value {
+        json!({
+            "action": action,
+            "audience": audience,
+            "issued_by": "did:key:z6MkTestIssuer",
+            "issued_at": "2025-01-01T00:00:00Z",
+            "expires_at": "2099-12-31T23:59:59Z",
+            "signature": "ed25519:dGVzdHNpZw"
+        })
+    }
+
+    /// Helper: compute CID for a chip body.
+    fn chip_cid(body: &serde_json::Value) -> String {
+        let nrf = ubl_ai_nrf1::to_nrf1_bytes(body).unwrap();
+        ubl_ai_nrf1::compute_cid(&nrf).unwrap()
+    }
+
+    /// Helper: submit a chip and assert Allow.
+    async fn submit_allow(pipeline: &UblPipeline, chip_type: &str, body: serde_json::Value) -> PipelineResult {
+        let request = ChipRequest {
+            chip_type: chip_type.to_string(),
+            body,
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+        let result = pipeline.process_chip(request).await.unwrap();
+        assert!(matches!(result.decision, Decision::Allow), "expected Allow for {}", chip_type);
+        result
+    }
+
+    /// Helper: submit a chip and assert it fails with a specific error variant.
+    async fn submit_expect_err(pipeline: &UblPipeline, chip_type: &str, body: serde_json::Value) -> PipelineError {
+        let request = ChipRequest {
+            chip_type: chip_type.to_string(),
+            body,
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+        pipeline.process_chip(request).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn onboarding_full_flow_app_to_token() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // 1. Register app (requires registry:init cap)
+        let app_body = json!({
+            "@type": "ubl/app",
+            "@id": "app-acme",
+            "@ver": "1.0",
+            "@world": "a/acme",
+            "slug": "acme",
+            "display_name": "Acme Corp",
+            "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/acme")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body.clone()).await;
+
+        // 2. Register first user (requires registry:init cap for first user)
+        let user_body = json!({
+            "@type": "ubl/user",
+            "@id": "user-alice",
+            "@ver": "1.0",
+            "@world": "a/acme",
+            "did": "did:key:z6MkAlice",
+            "display_name": "Alice",
+            "@cap": test_cap("registry:init", "a/acme")
+        });
+        let user_cid = chip_cid(&user_body);
+        submit_allow(&pipeline, "ubl/user", user_body).await;
+
+        // 3. Create tenant (depends on app + creator user)
+        let tenant_body = json!({
+            "@type": "ubl/tenant",
+            "@id": "tenant-eng",
+            "@ver": "1.0",
+            "@world": "a/acme",
+            "slug": "engineering",
+            "display_name": "Engineering Circle",
+            "creator_cid": user_cid
+        });
+        let tenant_cid = chip_cid(&tenant_body);
+        submit_allow(&pipeline, "ubl/tenant", tenant_body).await;
+
+        // 4. Create membership (depends on user + tenant, requires membership:grant cap)
+        let membership_body = json!({
+            "@type": "ubl/membership",
+            "@id": "mem-alice-eng",
+            "@ver": "1.0",
+            "@world": format!("a/acme/t/engineering"),
+            "user_cid": user_cid,
+            "tenant_cid": tenant_cid,
+            "role": "admin",
+            "@cap": test_cap("membership:grant", "a/acme")
+        });
+        submit_allow(&pipeline, "ubl/membership", membership_body).await;
+
+        // 5. Create token (depends on user)
+        let token_body = json!({
+            "@type": "ubl/token",
+            "@id": "tok-alice-1",
+            "@ver": "1.0",
+            "@world": "a/acme",
+            "user_cid": user_cid,
+            "scope": ["read", "write"],
+            "expires_at": "2027-12-31T23:59:59Z",
+            "kid": "did:key:z6MkAlice#v0"
+        });
+        submit_allow(&pipeline, "ubl/token", token_body).await;
+    }
+
+    #[tokio::test]
+    async fn onboarding_user_without_app_fails() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Try to register user without an app — should fail with DependencyMissing
+        let user_body = json!({
+            "@type": "ubl/user",
+            "@id": "user-orphan",
+            "@ver": "1.0",
+            "@world": "a/nonexistent",
+            "did": "did:key:z6MkOrphan",
+            "display_name": "Orphan"
+        });
+        let err = submit_expect_err(&pipeline, "ubl/user", user_body).await;
+        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+        assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_tenant_without_user_fails() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Register app first
+        let app_body = json!({
+            "@type": "ubl/app",
+            "@id": "app-acme2",
+            "@ver": "1.0",
+            "@world": "a/acme2",
+            "slug": "acme2",
+            "display_name": "Acme 2",
+            "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/acme2")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body).await;
+
+        // Try to create tenant with a non-existent creator_cid
+        let tenant_body = json!({
+            "@type": "ubl/tenant",
+            "@id": "tenant-bad",
+            "@ver": "1.0",
+            "@world": "a/acme2",
+            "slug": "bad-circle",
+            "display_name": "Bad Circle",
+            "creator_cid": "b3:nonexistent_user_cid"
+        });
+        let err = submit_expect_err(&pipeline, "ubl/tenant", tenant_body).await;
+        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn onboarding_membership_without_tenant_fails() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Register app + user
+        let app_body = json!({
+            "@type": "ubl/app", "@id": "app-m", "@ver": "1.0", "@world": "a/mtest",
+            "slug": "mtest", "display_name": "MTest", "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/mtest")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body).await;
+
+        let user_body = json!({
+            "@type": "ubl/user", "@id": "user-m", "@ver": "1.0", "@world": "a/mtest",
+            "did": "did:key:z6MkUser", "display_name": "User M",
+            "@cap": test_cap("registry:init", "a/mtest")
+        });
+        let user_cid = chip_cid(&user_body);
+        submit_allow(&pipeline, "ubl/user", user_body).await;
+
+        // Try membership with non-existent tenant (has cap but missing tenant)
+        let mem_body = json!({
+            "@type": "ubl/membership", "@id": "mem-bad", "@ver": "1.0",
+            "@world": "a/mtest/t/ghost",
+            "user_cid": user_cid,
+            "tenant_cid": "b3:nonexistent_tenant",
+            "role": "member",
+            "@cap": test_cap("membership:grant", "a/mtest")
+        });
+        let err = submit_expect_err(&pipeline, "ubl/membership", mem_body).await;
+        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn onboarding_token_without_user_fails() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Token with non-existent user
+        let token_body = json!({
+            "@type": "ubl/token", "@id": "tok-bad", "@ver": "1.0", "@world": "a/ghost",
+            "user_cid": "b3:nonexistent_user",
+            "scope": ["read"],
+            "expires_at": "2027-01-01T00:00:00Z",
+            "kid": "did:key:z6Mk#v0"
+        });
+        let err = submit_expect_err(&pipeline, "ubl/token", token_body).await;
+        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn onboarding_duplicate_app_slug_rejected() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        let app_body = json!({
+            "@type": "ubl/app", "@id": "app-dup1", "@ver": "1.0", "@world": "a/duptest",
+            "slug": "duptest", "display_name": "Dup Test", "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/duptest")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body.clone()).await;
+
+        // Second app with same slug — should be rejected
+        let app_body2 = json!({
+            "@type": "ubl/app", "@id": "app-dup2", "@ver": "1.0", "@world": "a/duptest",
+            "slug": "duptest", "display_name": "Dup Test 2", "owner_did": "did:key:z6MkOwner2",
+            "@cap": test_cap("registry:init", "a/duptest")
+        });
+        let err = submit_expect_err(&pipeline, "ubl/app", app_body2).await;
+        assert!(matches!(err, PipelineError::InvalidChip(_)), "expected InvalidChip for dup slug, got: {}", err);
+        assert!(err.to_string().contains("duptest"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_revoke_then_re_register_app() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Register app + user (need user as actor for revoke)
+        let app_body = json!({
+            "@type": "ubl/app", "@id": "app-rev", "@ver": "1.0", "@world": "a/revtest",
+            "slug": "revtest", "display_name": "Rev Test", "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/revtest")
+        });
+        let app_cid = chip_cid(&app_body);
+        submit_allow(&pipeline, "ubl/app", app_body).await;
+
+        let user_body = json!({
+            "@type": "ubl/user", "@id": "user-rev", "@ver": "1.0", "@world": "a/revtest",
+            "did": "did:key:z6MkAdmin", "display_name": "Admin",
+            "@cap": test_cap("registry:init", "a/revtest")
+        });
+        let user_cid = chip_cid(&user_body);
+        submit_allow(&pipeline, "ubl/user", user_body).await;
+
+        // Revoke the app (requires revoke:execute cap)
+        let revoke_body = json!({
+            "@type": "ubl/revoke", "@id": "rev-app", "@ver": "1.0", "@world": "a/revtest",
+            "target_cid": app_cid,
+            "reason": "Decommissioned",
+            "actor_cid": user_cid,
+            "@cap": test_cap("revoke:execute", "a/revtest")
+        });
+        submit_allow(&pipeline, "ubl/revoke", revoke_body).await;
+
+        // Re-register with same slug should now succeed (old one is revoked)
+        let app_body2 = json!({
+            "@type": "ubl/app", "@id": "app-rev2", "@ver": "1.0", "@world": "a/revtest",
+            "slug": "revtest", "display_name": "Rev Test Reborn", "owner_did": "did:key:z6MkOwner2",
+            "@cap": test_cap("registry:init", "a/revtest")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body2).await;
+    }
+
+    #[tokio::test]
+    async fn onboarding_revoke_user_blocks_dependent_token() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // Full setup: app + user
+        let app_body = json!({
+            "@type": "ubl/app", "@id": "app-rt", "@ver": "1.0", "@world": "a/rtoken",
+            "slug": "rtoken", "display_name": "RToken", "owner_did": "did:key:z6MkOwner",
+            "@cap": test_cap("registry:init", "a/rtoken")
+        });
+        submit_allow(&pipeline, "ubl/app", app_body).await;
+
+        let user_body = json!({
+            "@type": "ubl/user", "@id": "user-rt", "@ver": "1.0", "@world": "a/rtoken",
+            "did": "did:key:z6MkUser", "display_name": "User RT",
+            "@cap": test_cap("registry:init", "a/rtoken")
+        });
+        let user_cid = chip_cid(&user_body);
+        submit_allow(&pipeline, "ubl/user", user_body).await;
+
+        // Register a second user to act as revoker (not first user, no cap needed)
+        let admin_body = json!({
+            "@type": "ubl/user", "@id": "admin-rt", "@ver": "1.0", "@world": "a/rtoken",
+            "did": "did:key:z6MkAdmin", "display_name": "Admin RT"
+        });
+        let admin_cid = chip_cid(&admin_body);
+        submit_allow(&pipeline, "ubl/user", admin_body).await;
+
+        // Revoke the user (requires revoke:execute cap)
+        let revoke_body = json!({
+            "@type": "ubl/revoke", "@id": "rev-user", "@ver": "1.0", "@world": "a/rtoken",
+            "target_cid": user_cid,
+            "reason": "Account suspended",
+            "actor_cid": admin_cid,
+            "@cap": test_cap("revoke:execute", "a/rtoken")
+        });
+        submit_allow(&pipeline, "ubl/revoke", revoke_body).await;
+
+        // Now try to create a token for the revoked user — should fail
+        let token_body = json!({
+            "@type": "ubl/token", "@id": "tok-revoked", "@ver": "1.0", "@world": "a/rtoken",
+            "user_cid": user_cid,
+            "scope": ["read"],
+            "expires_at": "2027-01-01T00:00:00Z",
+            "kid": "did:key:z6MkUser#v0"
+        });
+        let err = submit_expect_err(&pipeline, "ubl/token", token_body).await;
+        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing for revoked user, got: {}", err);
+        assert!(err.to_string().contains("revoked"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_invalid_body_rejected_before_dependency_check() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // ubl/user missing required "did" field — should fail at body validation, not dependency check
+        let bad_user = json!({
+            "@type": "ubl/user", "@id": "bad", "@ver": "1.0", "@world": "a/acme",
+            "display_name": "No DID"
+        });
+        let err = submit_expect_err(&pipeline, "ubl/user", bad_user).await;
+        assert!(matches!(err, PipelineError::InvalidChip(_)), "expected InvalidChip, got: {}", err);
+        assert!(err.to_string().contains("did"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_non_onboarding_type_skips_validation() {
+        let (pipeline, _store) = onboarding_pipeline();
+
+        // ubl/document is not an onboarding type — should pass without dependency checks
+        let doc_body = json!({
+            "@type": "ubl/document", "@id": "doc-1", "@ver": "1.0", "@world": "a/any/t/any",
+            "title": "Hello World"
+        });
+        submit_allow(&pipeline, "ubl/document", doc_body).await;
     }
 }

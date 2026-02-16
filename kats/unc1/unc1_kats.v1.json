@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "name": "dec_0_1_plus_0_2",
+      "input": [
+        {
+          "@num": "dec/1",
+          "m": "1",
+          "s": 1
+        },
+        {
+          "@num": "dec/1",
+          "m": "2",
+          "s": 1
+        }
+      ],
+      "op": "add",
+      "expect": {
+        "@num": "dec/1",
+        "m": "3",
+        "s": 1
+      }
+    },
+    {
+      "name": "rat_one_third_to_dec_down_2",
+      "input": [
+        {
+          "@num": "rat/1",
+          "p": "1",
+          "q": "3"
+        }
+      ],
+      "op": "to_dec",
+      "args": {
+        "scale": 2,
+        "rm": "DOWN"
+      },
+      "expect": {
+        "@num": "dec/1",
+        "m": "33",
+        "s": 2
+      }
+    },
+    {
+      "name": "f64_import_0_1_to_bnd",
+      "input_bits": "0x3fb999999999999a",
+      "op": "from_f64_bits",
+      "expect_kind": "bnd/1"
+    }
+  ]
+}

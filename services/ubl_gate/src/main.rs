@@ -6,7 +6,8 @@
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -16,14 +17,18 @@ use ubl_chipstore::{ChipStore, InMemoryBackend};
 use ubl_runtime::advisory::AdvisoryEngine;
 use ubl_runtime::error_response::UblError;
 use ubl_runtime::event_bus::EventBus;
+use ubl_runtime::manifest::GateManifest;
 use ubl_runtime::policy_loader::InMemoryPolicyStorage;
 use ubl_runtime::UblPipeline;
+
+mod metrics;
 
 /// Shared application state.
 #[derive(Clone)]
 struct AppState {
     pipeline: Arc<UblPipeline>,
     chip_store: Arc<ChipStore>,
+    manifest: Arc<GateManifest>,
 }
 
 #[tokio::main]
@@ -54,9 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("FATAL: Genesis bootstrap failed: {}", e),
     }
 
+    let manifest = Arc::new(GateManifest::default());
+
     let state = AppState {
         pipeline,
         chip_store,
+        manifest,
     };
 
     let app = Router::new()
@@ -64,11 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
-        .route("/v1/users", post(register_user))
-        .route("/v1/tokens", post(create_token))
-        .route("/v1/passports", post(register_passport))
         .route("/v1/passports/:cid/advisories", get(get_passport_advisories))
         .route("/v1/advisories/:cid/verify", get(verify_advisory))
+        .route("/v1/chips/:cid/verify", get(verify_chip))
+        .route("/metrics", get(metrics_handler))
+        .route("/openapi.json", get(openapi_spec))
+        .route("/mcp/manifest", get(mcp_manifest))
+        .route("/.well-known/webmcp.json", get(webmcp_manifest))
+        .route("/mcp/rpc", post(mcp_rpc))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await?;
@@ -87,15 +98,25 @@ async fn create_chip(
     State(state): State<AppState>,
     body: Bytes,
 ) -> (StatusCode, Json<Value>) {
+    metrics::inc_chips_total();
+    let t0 = std::time::Instant::now();
+
     match state.pipeline.process_raw(&body).await {
         Ok(result) => {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
+            let decision_str = format!("{:?}", result.decision);
+            if decision_str.contains("Allow") {
+                metrics::inc_allow();
+            } else {
+                metrics::inc_deny();
+            }
             let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
             (
                 StatusCode::OK,
                 Json(json!({
                     "@type": "ubl/response",
                     "status": "success",
-                    "decision": format!("{:?}", result.decision),
+                    "decision": decision_str,
                     "receipt_cid": result.receipt.receipt_cid,
                     "chain": result.chain,
                     "receipt": receipt_json,
@@ -103,7 +124,13 @@ async fn create_chip(
             )
         }
         Err(e) => {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
             let ubl_err = UblError::from_pipeline_error(&e);
+            let code_str = format!("{:?}", ubl_err.code);
+            if code_str.contains("Knock") {
+                metrics::inc_knock_reject();
+            }
+            metrics::inc_error(&code_str);
             let status = StatusCode::from_u16(ubl_err.code.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(ubl_err.to_json()))
@@ -111,8 +138,12 @@ async fn create_chip(
     }
 }
 
-/// GET /v1/chips/:cid — retrieve a stored chip by CID.
-async fn get_chip(
+async fn metrics_handler() -> String {
+    metrics::encode_metrics()
+}
+
+/// GET /v1/chips/:cid/verify — recompute CID from stored chip content and verify integrity.
+async fn verify_chip(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> (StatusCode, Json<Value>) {
@@ -123,190 +154,120 @@ async fn get_chip(
         );
     }
 
-    match state.chip_store.get_chip(&cid).await {
-        Ok(Some(chip)) => (
-            StatusCode::OK,
-            Json(json!({
-                "@type": "ubl/chip",
-                "cid": chip.cid,
-                "chip_type": chip.chip_type,
-                "chip_data": chip.chip_data,
-                "receipt_cid": chip.receipt_cid,
-                "created_at": chip.created_at,
-                "tags": chip.tags,
-            })),
+    let chip = match state.chip_store.get_chip(&cid).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)})),
         ),
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
+        ),
+    };
+
+    // Recompute CID from chip_data via NRF-1 canonical encoding → BLAKE3
+    let (computed_cid, encoding_ok) = match ubl_ai_nrf1::to_nrf1_bytes(&chip.chip_data) {
+        Ok(nrf_bytes) => match ubl_ai_nrf1::compute_cid(&nrf_bytes) {
+            Ok(c) => (c, true),
+            Err(_) => (String::new(), false),
+        },
+        Err(_) => (String::new(), false),
+    };
+
+    let cid_matches = encoding_ok && computed_cid == cid;
+
+    // Check receipt exists
+    let receipt_cid = &chip.receipt_cid;
+    let receipt_exists = if receipt_cid.is_empty() {
+        false
+    } else {
+        // Scan for receipt (same pattern as get_receipt_trace)
+        let query = ubl_chipstore::ChipQuery {
+            chip_type: None, tags: vec![], created_after: None,
+            created_before: None, executor_did: None, limit: Some(1000), offset: None,
+        };
+        state.chip_store.query(&query).await
+            .map(|r| r.chips.iter().any(|c| c.receipt_cid == *receipt_cid))
+            .unwrap_or(false)
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/chip.verification",
+            "cid": cid,
+            "verified": cid_matches,
+            "cid_matches": cid_matches,
+            "computed_cid": computed_cid,
+            "encoding_ok": encoding_ok,
+            "chip_type": chip.chip_type,
+            "receipt_cid": chip.receipt_cid,
+            "receipt_exists": receipt_exists,
+            "created_at": chip.created_at,
+        })),
+    )
+}
+
+/// GET /v1/chips/:cid — retrieve a stored chip by CID.
+///
+/// ETag support (P1.6): The chip CID is the ETag (content-addressed).
+/// If `If-None-Match` header matches the CID, returns 304 Not Modified.
+async fn get_chip(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !cid.starts_with("b3:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"})),
+        );
+    }
+
+    // ETag: If-None-Match → 304 (P1.6)
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(inm_str) = inm.to_str() {
+            let etag = format!("\"{}\"" , cid);
+            if inm_str == etag || inm_str.trim_matches('"') == cid {
+                let mut h = HeaderMap::new();
+                h.insert(header::ETAG, etag.parse().unwrap());
+                return (StatusCode::NOT_MODIFIED, h, Json(json!(null)));
+            }
+        }
+    }
+
+    match state.chip_store.get_chip(&cid).await {
+        Ok(Some(chip)) => {
+            let mut h = HeaderMap::new();
+            let etag = format!("\"{}\"" , chip.cid);
+            h.insert(header::ETAG, etag.parse().unwrap());
+            h.insert(header::CACHE_CONTROL, "public, max-age=31536000, immutable".parse().unwrap());
+            (
+                StatusCode::OK,
+                h,
+                Json(json!({
+                    "@type": "ubl/chip",
+                    "cid": chip.cid,
+                    "chip_type": chip.chip_type,
+                    "chip_data": chip.chip_data,
+                    "receipt_cid": chip.receipt_cid,
+                    "created_at": chip.created_at,
+                    "tags": chip.tags,
+                })),
+            )
+        },
         Ok(None) => (
             StatusCode::NOT_FOUND,
+            HeaderMap::new(),
             Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)})),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
         ),
-    }
-}
-
-/// POST /v1/users — register a human user identity through the pipeline.
-async fn register_user(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> (StatusCode, Json<Value>) {
-    let chip_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
-        ),
-    };
-
-    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
-    if chip_type != "ubl/user" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/user"})),
-        );
-    }
-
-    if let Err(e) = ubl_runtime::auth::UserIdentity::from_chip_body(&chip_json) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_USER", "message": e.to_string()})),
-        );
-    }
-
-    match state.pipeline.process_raw(&body).await {
-        Ok(result) => {
-            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "@type": "ubl/user.registered",
-                    "status": "success",
-                    "decision": format!("{:?}", result.decision),
-                    "user_cid": result.chain.first().unwrap_or(&String::new()),
-                    "receipt_cid": result.receipt.receipt_cid,
-                    "chain": result.chain,
-                    "receipt": receipt_json,
-                })),
-            )
-        }
-        Err(e) => {
-            let ubl_err = UblError::from_pipeline_error(&e);
-            let status = StatusCode::from_u16(ubl_err.code.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(ubl_err.to_json()))
-        }
-    }
-}
-
-/// POST /v1/tokens — create a session token through the pipeline.
-async fn create_token(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> (StatusCode, Json<Value>) {
-    let chip_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
-        ),
-    };
-
-    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
-    if chip_type != "ubl/token" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/token"})),
-        );
-    }
-
-    if let Err(e) = ubl_runtime::auth::SessionToken::from_chip_body(&chip_json) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_TOKEN", "message": e.to_string()})),
-        );
-    }
-
-    match state.pipeline.process_raw(&body).await {
-        Ok(result) => {
-            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "@type": "ubl/token.created",
-                    "status": "success",
-                    "decision": format!("{:?}", result.decision),
-                    "token_cid": result.chain.first().unwrap_or(&String::new()),
-                    "receipt_cid": result.receipt.receipt_cid,
-                    "chain": result.chain,
-                    "receipt": receipt_json,
-                })),
-            )
-        }
-        Err(e) => {
-            let ubl_err = UblError::from_pipeline_error(&e);
-            let status = StatusCode::from_u16(ubl_err.code.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(ubl_err.to_json()))
-        }
-    }
-}
-
-/// POST /v1/passports — register an AI Passport identity through the pipeline.
-async fn register_passport(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> (StatusCode, Json<Value>) {
-    // Parse the incoming JSON and ensure it's an ai.passport chip
-    let chip_json: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
-        ),
-    };
-
-    // Validate it's an ai.passport type
-    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
-    if chip_type != "ubl/ai.passport" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/ai.passport"})),
-        );
-    }
-
-    // Validate the passport fields
-    if let Err(e) = ubl_runtime::ai_passport::AiPassport::from_chip_body(&chip_json) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_PASSPORT", "message": e.to_string()})),
-        );
-    }
-
-    // Process through the full pipeline
-    match state.pipeline.process_raw(&body).await {
-        Ok(result) => {
-            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-            (
-                StatusCode::CREATED,
-                Json(json!({
-                    "@type": "ubl/passport.registered",
-                    "status": "success",
-                    "decision": format!("{:?}", result.decision),
-                    "passport_cid": result.chain.first().unwrap_or(&String::new()),
-                    "receipt_cid": result.receipt.receipt_cid,
-                    "chain": result.chain,
-                    "receipt": receipt_json,
-                })),
-            )
-        }
-        Err(e) => {
-            let ubl_err = UblError::from_pipeline_error(&e);
-            let status = StatusCode::from_u16(ubl_err.code.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(ubl_err.to_json()))
-        }
     }
 }
 
@@ -490,5 +451,164 @@ async fn get_receipt_trace(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
         ),
+    }
+}
+
+// ── Manifest endpoints (P2.8 + P2.9) ──
+
+/// GET /openapi.json — OpenAPI 3.1 specification.
+async fn openapi_spec(State(state): State<AppState>) -> Json<Value> {
+    Json(state.manifest.to_openapi())
+}
+
+/// GET /mcp/manifest — MCP tool manifest for AI agents.
+async fn mcp_manifest(State(state): State<AppState>) -> Json<Value> {
+    Json(state.manifest.to_mcp_manifest())
+}
+
+/// GET /.well-known/webmcp.json — WebMCP discovery manifest.
+async fn webmcp_manifest(State(state): State<AppState>) -> Json<Value> {
+    Json(state.manifest.to_webmcp_manifest())
+}
+
+/// POST /mcp/rpc — MCP JSON-RPC 2.0 proxy (P2.9).
+///
+/// Dispatches MCP tool calls to the same pipeline:
+/// - ubl.deliver → process_raw
+/// - ubl.query → ChipStore get
+/// - ubl.verify → CID recomputation
+/// - registry.listTypes → manifest chip types
+async fn mcp_rpc(
+    State(state): State<AppState>,
+    Json(rpc): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let id = rpc.get("id").cloned().unwrap_or(json!(null));
+    let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let params = rpc.get("params").cloned().unwrap_or(json!({}));
+
+    if rpc.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32600, "message": "Invalid Request: missing jsonrpc 2.0" }
+        })));
+    }
+
+    match method {
+        "tools/list" => {
+            let manifest = state.manifest.to_mcp_manifest();
+            (StatusCode::OK, Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "tools": manifest["tools"] }
+            })))
+        }
+
+        "tools/call" => {
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            dispatch_tool_call(&state, tool_name, &arguments, id).await
+        }
+
+        _ => (StatusCode::OK, Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": format!("Method not found: {}", method) }
+        }))),
+    }
+}
+
+/// Dispatch an MCP tools/call to the appropriate handler.
+async fn dispatch_tool_call(
+    state: &AppState,
+    tool_name: &str,
+    arguments: &Value,
+    id: Value,
+) -> (StatusCode, Json<Value>) {
+    match tool_name {
+        "ubl.deliver" => {
+            let chip = arguments.get("chip").cloned().unwrap_or(json!({}));
+            let bytes = serde_json::to_vec(&chip).unwrap_or_default();
+            match state.pipeline.process_raw(&bytes).await {
+                Ok(result) => {
+                    let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+                    (StatusCode::OK, Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                            "decision": format!("{:?}", result.decision),
+                            "receipt_cid": result.receipt.receipt_cid,
+                            "chain": result.chain,
+                            "receipt": receipt_json,
+                        })).unwrap_or_default() }] }
+                    })))
+                }
+                Err(e) => {
+                    let ubl_err = UblError::from_pipeline_error(&e);
+                    (StatusCode::OK, Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": ubl_err.code.mcp_code(), "message": ubl_err.message, "data": ubl_err.to_json() }
+                    })))
+                }
+            }
+        }
+
+        "ubl.query" => {
+            let cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            match state.chip_store.get_chip(cid).await {
+                Ok(Some(chip)) => (StatusCode::OK, Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                        "cid": chip.cid, "chip_type": chip.chip_type,
+                        "chip_data": chip.chip_data, "receipt_cid": chip.receipt_cid,
+                    })).unwrap_or_default() }] }
+                }))),
+                Ok(None) => (StatusCode::OK, Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
+                }))),
+                Err(e) => (StatusCode::OK, Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": e.to_string() }
+                }))),
+            }
+        }
+
+        "ubl.verify" => {
+            let cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            match state.chip_store.get_chip(cid).await {
+                Ok(Some(chip)) => {
+                    let verified = match ubl_ai_nrf1::to_nrf1_bytes(&chip.chip_data) {
+                        Ok(nrf) => ubl_ai_nrf1::compute_cid(&nrf).map(|c| c == cid).unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    (StatusCode::OK, Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                            "cid": cid, "verified": verified
+                        })).unwrap_or_default() }] }
+                    })))
+                }
+                Ok(None) => (StatusCode::OK, Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
+                }))),
+                Err(e) => (StatusCode::OK, Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": e.to_string() }
+                }))),
+            }
+        }
+
+        "registry.listTypes" => {
+            let types: Vec<Value> = state.manifest.chip_types.iter().map(|ct| json!({
+                "type": ct.chip_type, "description": ct.description, "required_cap": ct.required_cap,
+            })).collect();
+            (StatusCode::OK, Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "content": [{ "type": "text", "text": serde_json::to_string(&types).unwrap_or_default() }] }
+            })))
+        }
+
+        _ => (StatusCode::OK, Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": format!("Tool not found: {}", tool_name) }
+        }))),
     }
 }

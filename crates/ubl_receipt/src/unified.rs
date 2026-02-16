@@ -9,6 +9,7 @@
 
 use crate::pipeline_types::{Decision, PolicyTraceEntry};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Pipeline stages in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +51,100 @@ pub struct StageExecution {
     pub policy_trace: Vec<PolicyTraceEntry>,
     pub auth_token: String,
     pub duration_ms: i64,
+}
+
+/// Build provenance metadata — collected at compile time and startup.
+/// Supports PF-01 invariant I-03: every receipt carries build provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildMeta {
+    /// Rust compiler version (from `rustc --version` or `RUSTC_VERSION` env)
+    pub rustc: String,
+    /// Operating system
+    pub os: String,
+    /// Architecture (e.g. "x86_64", "aarch64")
+    pub arch: String,
+    /// Build profile ("debug" or "release")
+    pub profile: String,
+    /// Git commit hash (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+    /// Whether the working tree was dirty at build time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+}
+
+impl BuildMeta {
+    /// Capture build metadata from compile-time and runtime environment.
+    pub fn capture() -> Self {
+        Self {
+            rustc: option_env!("RUSTC_VERSION")
+                .or(option_env!("CARGO_PKG_RUST_VERSION"))
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
+            git_commit: option_env!("GIT_COMMIT").map(|s| s.to_string()),
+            git_dirty: option_env!("GIT_DIRTY").map(|s| s == "true"),
+        }
+    }
+}
+
+/// Runtime information captured at startup and embedded in every receipt.
+/// Supports PF-01: binary_hash is observability for forensic auditing, not a trust anchor.
+/// Trust comes from the Ed25519 signature chain via ubl_kms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    /// BLAKE3 hash of the running binary (hex-encoded, "b3:..." prefix)
+    pub binary_hash: String,
+    /// Crate version from Cargo.toml
+    pub version: String,
+    /// Build provenance (compiler, OS, git commit, etc.)
+    pub build: BuildMeta,
+    /// Arbitrary environment labels (e.g. "cluster": "us-east-1")
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl RuntimeInfo {
+    /// Capture runtime info by hashing the current executable binary.
+    /// Call once at startup and reuse for all receipts.
+    pub fn capture() -> Self {
+        let binary_hash = match std::env::current_exe() {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let hash = blake3::hash(&bytes);
+                    format!("b3:{}", hex::encode(hash.as_bytes()))
+                }
+                Err(_) => "b3:unavailable".to_string(),
+            },
+            Err(_) => "b3:unavailable".to_string(),
+        };
+
+        Self {
+            binary_hash,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: BuildMeta::capture(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Create a RuntimeInfo with explicit values (for testing or remote attestation).
+    pub fn new(binary_hash: &str, version: &str) -> Self {
+        Self {
+            binary_hash: binary_hash.to_string(),
+            version: version.to_string(),
+            build: BuildMeta::capture(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Add an environment label.
+    pub fn with_env(mut self, key: &str, value: &str) -> Self {
+        self.env.insert(key.to_string(), value.to_string());
+        self
+    }
 }
 
 /// The unified receipt — a single evolving document that grows through the pipeline.
@@ -99,6 +194,10 @@ pub struct UnifiedReceipt {
     pub receipt_cid: String,
     /// Ed25519 JWS detached signature (empty until finalized)
     pub sig: String,
+
+    /// Runtime that produced this receipt (binary hash, version, env)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rt: Option<RuntimeInfo>,
 }
 
 /// Secret used for HMAC auth tokens between stages.
@@ -130,7 +229,14 @@ impl UnifiedReceipt {
             prev_receipt_cid: None,
             receipt_cid: String::new(),
             sig: String::new(),
+            rt: None,
         }
+    }
+
+    /// Attach runtime info to this receipt.
+    pub fn with_runtime_info(mut self, rt: RuntimeInfo) -> Self {
+        self.rt = Some(rt);
+        self
     }
 
     /// Append a stage execution and recompute the receipt CID.
@@ -481,5 +587,92 @@ mod tests {
 
         r.append_stage(tr_stage).unwrap();
         assert_eq!(r.stages[1].fuel_used, Some(42));
+    }
+
+    // ── RuntimeInfo / BuildMeta / PF-01 tests ──────────────────
+
+    #[test]
+    fn runtime_info_capture_has_valid_fields() {
+        let rt = RuntimeInfo::capture();
+        assert!(rt.binary_hash.starts_with("b3:"), "binary_hash must be b3: prefixed");
+        assert!(!rt.version.is_empty());
+        assert!(!rt.build.arch.is_empty());
+        assert!(!rt.build.os.is_empty());
+        assert!(rt.build.profile == "debug" || rt.build.profile == "release");
+    }
+
+    #[test]
+    fn runtime_info_new_sets_explicit_hash() {
+        let rt = RuntimeInfo::new("b3:deadbeef", "0.1.0");
+        assert_eq!(rt.binary_hash, "b3:deadbeef");
+        assert_eq!(rt.version, "0.1.0");
+    }
+
+    #[test]
+    fn runtime_info_with_env_labels() {
+        let rt = RuntimeInfo::new("b3:abc", "1.0.0")
+            .with_env("cluster", "us-east-1")
+            .with_env("deploy", "canary");
+        assert_eq!(rt.env.len(), 2);
+        assert_eq!(rt.env["cluster"], "us-east-1");
+        assert_eq!(rt.env["deploy"], "canary");
+    }
+
+    #[test]
+    fn receipt_with_runtime_info_includes_rt_in_json() {
+        let rt = RuntimeInfo::new("b3:test-hash", "0.1.0");
+        let mut r = UnifiedReceipt::new(
+            "a/acme/t/prod",
+            "did:key:z123",
+            "did:key:z123#v0",
+            "aabbccdd",
+        ).with_runtime_info(rt);
+
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+
+        let json = r.to_json().unwrap();
+        assert!(json.get("rt").is_some(), "receipt JSON must include rt field");
+        assert_eq!(json["rt"]["binary_hash"], "b3:test-hash");
+        assert_eq!(json["rt"]["version"], "0.1.0");
+        assert!(json["rt"]["build"]["arch"].is_string());
+        assert!(json["rt"]["build"]["os"].is_string());
+    }
+
+    #[test]
+    fn receipt_without_runtime_info_omits_rt() {
+        let mut r = make_receipt();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+
+        let json = r.to_json().unwrap();
+        assert!(json.get("rt").is_none(), "rt should be omitted when None");
+    }
+
+    #[test]
+    fn build_meta_capture_has_fields() {
+        let bm = BuildMeta::capture();
+        assert!(!bm.os.is_empty());
+        assert!(!bm.arch.is_empty());
+        assert!(!bm.rustc.is_empty(), "rustc must be non-empty (at least 'unknown')");
+        assert!(bm.profile == "debug" || bm.profile == "release");
+    }
+
+    #[test]
+    fn runtime_info_changes_receipt_cid() {
+        let mut r1 = make_receipt();
+        r1.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        let cid_without_rt = r1.receipt_cid.clone();
+
+        let rt = RuntimeInfo::new("b3:some-binary", "0.1.0");
+        let mut r2 = UnifiedReceipt::new(
+            "a/acme/t/prod",
+            "did:key:z123",
+            "did:key:z123#v0",
+            "deadbeef01020304",
+        ).with_runtime_info(rt);
+        r2.t = r1.t.clone(); // same timestamp
+        r2.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+
+        assert_ne!(cid_without_rt, r2.receipt_cid,
+            "RuntimeInfo must affect receipt CID (different content = different CID)");
     }
 }

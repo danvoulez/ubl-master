@@ -153,6 +153,11 @@ impl ChipStore {
         self.backend.query_chips(query).await
     }
 
+    /// Get all chips of a specific type
+    pub async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.backend.get_chips_by_type(chip_type).await
+    }
+
     /// Get all customers (example business logic)
     pub async fn get_customers(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
         self.backend.get_chips_by_type("ubl/customer.register").await

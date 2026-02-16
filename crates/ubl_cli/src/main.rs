@@ -72,6 +72,14 @@ enum Commands {
         #[arg(long, default_value = "https://ubl.example.com")]
         host: String,
     },
+    /// Disassemble RB-VM bytecode to human-readable listing
+    Disasm {
+        /// Path to bytecode file (binary) or hex string
+        input: String,
+        /// Treat input as hex string instead of file path
+        #[arg(long)]
+        hex: bool,
+    },
 }
 
 #[tokio::main]
@@ -88,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Fixture { output_dir, count } => cmd_fixture(&output_dir, count)?,
         Commands::Url { receipt_cid, host } => cmd_url(&receipt_cid, &host)?,
+        Commands::Disasm { input, hex } => cmd_disasm(&input, hex)?,
     }
 
     Ok(())
@@ -350,5 +359,23 @@ fn cmd_url(receipt_cid: &str, host: &str) -> Result<(), Box<dyn std::error::Erro
     println!("  {}", String::from_utf8_lossy(&url.signing_payload()));
     println!("\nNote: Replace placeholder DID, RT, and SIG with real values for production.");
 
+    Ok(())
+}
+
+// ── disasm ──────────────────────────────────────────────────────
+
+fn cmd_disasm(input: &str, is_hex: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let bytecode = if is_hex {
+        let clean = input.replace([' ', '\n', '\t'], "");
+        hex::decode(&clean)?
+    } else {
+        std::fs::read(input)?
+    };
+
+    println!("=== RB-VM Disassembly ({} bytes) ===\n", bytecode.len());
+    match rb_vm::disassemble(&bytecode) {
+        Ok(listing) => print!("{}", listing),
+        Err(e) => eprintln!("Disassembly error: {}", e),
+    }
     Ok(())
 }

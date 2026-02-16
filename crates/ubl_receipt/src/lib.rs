@@ -17,6 +17,7 @@ pub use pipeline_types::{
 };
 pub use unified::{
     UnifiedReceipt, StageExecution, PipelineStage, ReceiptError,
+    RuntimeInfo, BuildMeta,
 };
 
 lazy_static! {
@@ -59,7 +60,7 @@ pub async fn issue_receipt(cid: &Cid, bytes_len: usize) -> Result<String> {
         receipt_version: "1".into(),
         cid: cid.to_string(),
         cid_codec: "raw".into(),
-        mh: "sha2-256".into(),
+        mh: "blake3".into(),
         size: bytes_len,
         issued_at: Utc::now().to_rfc3339(),
         issuer: ISSUER_DID.clone(),

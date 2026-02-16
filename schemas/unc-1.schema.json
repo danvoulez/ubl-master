@@ -1,0 +1,168 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/schemas/unc-1.schema.json",
+  "title": "UNC-1 — UBL Numeric Canon v1",
+  "description": "Canonical numeric atoms: int/1, dec/1, rat/1, bnd/1 with optional unit 'u'.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "@num": {
+          "const": "int/1"
+        },
+        "v": {
+          "type": "string",
+          "pattern": "^-?[0-9]+$"
+        },
+        "u": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "@num",
+        "v"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "@num": {
+          "const": "dec/1"
+        },
+        "m": {
+          "type": "string",
+          "pattern": "^-?[0-9]+$"
+        },
+        "s": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "u": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "@num",
+        "m",
+        "s"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "@num": {
+          "const": "rat/1"
+        },
+        "p": {
+          "type": "string",
+          "pattern": "^-?[0-9]+$"
+        },
+        "q": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "u": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "@num",
+        "p",
+        "q"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "@num": {
+          "const": "bnd/1"
+        },
+        "lo": {
+          "$ref": "#/definitions/Num"
+        },
+        "hi": {
+          "$ref": "#/definitions/Num"
+        },
+        "u": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "@num",
+        "lo",
+        "hi"
+      ]
+    }
+  ],
+  "definitions": {
+    "Num": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "@num": {
+              "const": "int/1"
+            },
+            "v": {
+              "type": "string",
+              "pattern": "^-?[0-9]+$"
+            }
+          },
+          "required": [
+            "@num",
+            "v"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "@num": {
+              "const": "dec/1"
+            },
+            "m": {
+              "type": "string",
+              "pattern": "^-?[0-9]+$"
+            },
+            "s": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "@num",
+            "m",
+            "s"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "@num": {
+              "const": "rat/1"
+            },
+            "p": {
+              "type": "string",
+              "pattern": "^-?[0-9]+$"
+            },
+            "q": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]*$"
+            }
+          },
+          "required": [
+            "@num",
+            "p",
+            "q"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

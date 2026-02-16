@@ -10,6 +10,7 @@
 //! 4. No duplicate keys
 //! 5. Valid UTF-8 (enforced by serde_json, but we check raw bytes too)
 //! 6. Required anchors: @type, @world
+//! 7. No raw floats (UNC-1 §3/§6: use @num atoms instead)
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -34,6 +35,8 @@ pub enum KnockError {
     MissingAnchor(&'static str),
     #[error("KNOCK-007: body is not a JSON object")]
     NotObject,
+    #[error("KNOCK-008: raw float in payload violates UNC-1 — use @num atoms: {0}")]
+    RawFloat(String),
 }
 
 /// Validate raw bytes before JSON parsing.
@@ -68,6 +71,9 @@ pub fn knock_parsed(value: &Value) -> Result<(), KnockError> {
     check_depth(value, 0)?;
     check_arrays(value)?;
 
+    // UNC-1 §6: reject raw floats — must use @num atoms
+    check_no_floats(value)?;
+
     Ok(())
 }
 
@@ -101,6 +107,30 @@ fn check_depth(value: &Value, depth: usize) -> Result<(), KnockError> {
         Value::Array(arr) => {
             for v in arr {
                 check_depth(v, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// UNC-1 §3/§6: raw JSON floats are never canonical.
+/// Numbers must be i64/u64 integers or @num atoms (objects).
+fn check_no_floats(value: &Value) -> Result<(), KnockError> {
+    match value {
+        Value::Number(n) => {
+            if !n.is_i64() && !n.is_u64() {
+                return Err(KnockError::RawFloat(format!("{}", n)));
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                check_no_floats(v)?;
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                check_no_floats(v)?;
             }
         }
         _ => {}
@@ -347,5 +377,39 @@ mod tests {
         // Body exactly at limit should pass raw check
         let padding = vec![b' '; MAX_BODY_BYTES];
         assert!(knock_raw(&padding).is_ok());
+    }
+
+    #[test]
+    fn knock_rejects_raw_float_unc1() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "amount": 12.34
+        })).unwrap();
+        let err = knock(&bytes).unwrap_err();
+        assert!(matches!(err, KnockError::RawFloat(_)));
+    }
+
+    #[test]
+    fn knock_rejects_nested_float_unc1() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "data": {"price": 9.99}
+        })).unwrap();
+        let err = knock(&bytes).unwrap_err();
+        assert!(matches!(err, KnockError::RawFloat(_)));
+    }
+
+    #[test]
+    fn knock_accepts_integers_and_num_atoms() {
+        // Integers are fine; @num objects are fine (they're objects, not floats)
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "count": 42,
+            "price": {"@num": "dec/1", "m": "1234", "s": 2}
+        })).unwrap();
+        assert!(knock(&bytes).is_ok());
     }
 }

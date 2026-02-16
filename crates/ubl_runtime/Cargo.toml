@@ -26,6 +26,7 @@ rb_vm = { path = "../rb_vm" }
 
 # Property testing
 proptest = { workspace = true, optional = true }
+ubl_kms = { version = "0.1.0", path = "../ubl_kms" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -71,16 +71,16 @@ impl UblEnvelope {
         Ok(())
     }
 
-    /// Validate @world format: must be `a/{app}/t/{tenant}` where app and tenant are non-empty.
+    /// Validate @world format: `a/{app}` or `a/{app}/t/{tenant}` where segments are non-empty.
     pub fn validate_world(world: &str) -> Result<(), EnvelopeError> {
         let parts: Vec<&str> = world.split('/').collect();
-        if parts.len() != 4 || parts[0] != "a" || parts[2] != "t" {
-            return Err(EnvelopeError::InvalidWorld(world.to_string()));
+        match parts.len() {
+            // a/{app}
+            2 if parts[0] == "a" && !parts[1].is_empty() => Ok(()),
+            // a/{app}/t/{tenant}
+            4 if parts[0] == "a" && parts[2] == "t" && !parts[1].is_empty() && !parts[3].is_empty() => Ok(()),
+            _ => Err(EnvelopeError::InvalidWorld(world.to_string())),
         }
-        if parts[1].is_empty() || parts[3].is_empty() {
-            return Err(EnvelopeError::InvalidWorld(world.to_string()));
-        }
-        Ok(())
     }
 
     /// Extract (app, tenant) from a valid @world string.
@@ -315,6 +315,12 @@ mod tests {
         assert!(UblEnvelope::validate_world("a/myapp/t/default").is_ok());
         assert!(UblEnvelope::validate_world("a/lab512/t/dev").is_ok());
         assert!(UblEnvelope::validate_world("a/prod/t/acme-corp").is_ok());
+    }
+
+    #[test]
+    fn world_valid_app_level() {
+        assert!(UblEnvelope::validate_world("a/myapp").is_ok());
+        assert!(UblEnvelope::validate_world("a/lab512").is_ok());
     }
 
     #[test]

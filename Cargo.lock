@@ -1294,6 +1294,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-integer"
+version = "0.1.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1478,6 +1508,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot 0.12.5",
+ "protobuf",
+ "thiserror",
+]
+
+[[package]]
 name = "proptest"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1495,6 +1540,12 @@ dependencies = [
  "tempfile",
  "unarray",
 ]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "quick-error"
@@ -1596,6 +1647,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2284,6 +2336,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "rb_vm",
  "reqwest",
  "serde",
  "serde_json",
@@ -2318,6 +2371,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "once_cell",
+ "prometheus",
  "serde",
  "serde_json",
  "tokio",
@@ -2325,6 +2380,21 @@ dependencies = [
  "ubl_chipstore",
  "ubl_receipt",
  "ubl_runtime",
+]
+
+[[package]]
+name = "ubl_kms"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "bs58",
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde_json",
+ "thiserror",
+ "ubl_ai_nrf1",
 ]
 
 [[package]]
@@ -2385,7 +2455,20 @@ dependencies = [
  "tokio",
  "ubl_ai_nrf1",
  "ubl_chipstore",
+ "ubl_kms",
  "ubl_receipt",
+]
+
+[[package]]
+name = "ubl_unc1"
+version = "0.1.0"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
