@@ -13,6 +13,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 use ubl_chipstore::{ChipStore, InMemoryBackend};
+use ubl_runtime::advisory::AdvisoryEngine;
 use ubl_runtime::error_response::UblError;
 use ubl_runtime::event_bus::EventBus;
 use ubl_runtime::policy_loader::InMemoryPolicyStorage;
@@ -35,10 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chip_store = Arc::new(ChipStore::new(backend));
 
     let storage = InMemoryPolicyStorage::new();
-    let pipeline = UblPipeline::with_chip_store(Box::new(storage), chip_store.clone());
-    // Attach event bus (rebuild with both)
-    // For now, use the with_chip_store constructor which doesn't take event_bus.
-    // The event bus is set separately if needed.
+    let mut pipeline = UblPipeline::with_chip_store(Box::new(storage), chip_store.clone());
+
+    // Wire AdvisoryEngine for post-CHECK / post-WF advisory chips
+    let advisory_engine = Arc::new(AdvisoryEngine::new(
+        "b3:gate-passport".to_string(),
+        "ubl-gate/0.1".to_string(),
+        "a/system/t/gate".to_string(),
+    ));
+    pipeline.set_advisory_engine(advisory_engine);
+
     let pipeline = Arc::new(pipeline);
 
     // Bootstrap genesis chip — self-signed root of all policy
@@ -57,6 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
+        .route("/v1/passports", post(register_passport))
+        .route("/v1/passports/:cid/advisories", get(get_passport_advisories))
+        .route("/v1/advisories/:cid/verify", get(verify_advisory))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await?;
@@ -133,6 +143,195 @@ async fn get_chip(
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
         ),
     }
+}
+
+/// POST /v1/passports — register an AI Passport identity through the pipeline.
+async fn register_passport(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    // Parse the incoming JSON and ensure it's an ai.passport chip
+    let chip_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
+        ),
+    };
+
+    // Validate it's an ai.passport type
+    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+    if chip_type != "ubl/ai.passport" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/ai.passport"})),
+        );
+    }
+
+    // Validate the passport fields
+    if let Err(e) = ubl_runtime::ai_passport::AiPassport::from_chip_body(&chip_json) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_PASSPORT", "message": e.to_string()})),
+        );
+    }
+
+    // Process through the full pipeline
+    match state.pipeline.process_raw(&body).await {
+        Ok(result) => {
+            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "@type": "ubl/passport.registered",
+                    "status": "success",
+                    "decision": format!("{:?}", result.decision),
+                    "passport_cid": result.chain.first().unwrap_or(&String::new()),
+                    "receipt_cid": result.receipt.receipt_cid,
+                    "chain": result.chain,
+                    "receipt": receipt_json,
+                })),
+            )
+        }
+        Err(e) => {
+            let ubl_err = UblError::from_pipeline_error(&e);
+            let status = StatusCode::from_u16(ubl_err.code.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(ubl_err.to_json()))
+        }
+    }
+}
+
+/// GET /v1/passports/:cid/advisories — query advisory history for a passport.
+async fn get_passport_advisories(
+    State(state): State<AppState>,
+    Path(passport_cid): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    // Query ChipStore for advisory chips that reference this passport
+    let query = ubl_chipstore::ChipQuery {
+        chip_type: Some("ubl/advisory".to_string()),
+        tags: vec![],
+        created_after: None,
+        created_before: None,
+        executor_did: None,
+        limit: Some(100),
+        offset: None,
+    };
+
+    match state.chip_store.query(&query).await {
+        Ok(result) => {
+            // Filter by passport_cid in chip_data
+            let advisories: Vec<Value> = result.chips.iter()
+                .filter(|c| c.chip_data.get("passport_cid")
+                    .and_then(|v| v.as_str()) == Some(passport_cid.as_str()))
+                .map(|c| json!({
+                    "cid": c.cid,
+                    "action": c.chip_data.get("action").unwrap_or(&json!("unknown")),
+                    "hook": c.chip_data.get("hook").unwrap_or(&json!("unknown")),
+                    "confidence": c.chip_data.get("confidence").unwrap_or(&json!(0)),
+                    "model": c.chip_data.get("model").unwrap_or(&json!("unknown")),
+                    "input_cid": c.chip_data.get("input_cid").unwrap_or(&json!("")),
+                    "created_at": c.created_at,
+                }))
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "@type": "ubl/advisory.list",
+                    "passport_cid": passport_cid,
+                    "count": advisories.len(),
+                    "advisories": advisories,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
+        ),
+    }
+}
+
+/// GET /v1/advisories/:cid/verify — verify an advisory chip's integrity.
+async fn verify_advisory(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    // Fetch the advisory chip
+    let chip = match state.chip_store.get_chip(&cid).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Advisory {} not found", cid)})),
+        ),
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
+        ),
+    };
+
+    if chip.chip_type != "ubl/advisory" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Chip is not an advisory"})),
+        );
+    }
+
+    // Parse the advisory
+    let advisory = match ubl_runtime::advisory::Advisory::from_chip_body(&chip.chip_data) {
+        Ok(a) => a,
+        Err(e) => return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_ADVISORY", "message": e.to_string()})),
+        ),
+    };
+
+    // Recompute CID to verify integrity
+    let nrf_bytes = match ubl_ai_nrf1::to_nrf1_bytes(&chip.chip_data) {
+        Ok(b) => b,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"@type": "ubl/error", "code": "ENCODING_ERROR", "message": e.to_string()})),
+        ),
+    };
+    let computed_cid = match ubl_ai_nrf1::compute_cid(&nrf_bytes) {
+        Ok(c) => c,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"@type": "ubl/error", "code": "CID_ERROR", "message": e.to_string()})),
+        ),
+    };
+
+    let cid_valid = computed_cid == cid;
+
+    // Check if the passport exists
+    let passport_exists = state.chip_store.get_chip(&advisory.passport_cid).await
+        .map(|r| r.is_some()).unwrap_or(false);
+
+    // Check if the input chip exists
+    let input_exists = state.chip_store.get_chip(&advisory.input_cid).await
+        .map(|r| r.is_some()).unwrap_or(false);
+
+    let verified = cid_valid;
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/advisory.verification",
+            "advisory_cid": cid,
+            "verified": verified,
+            "cid_valid": cid_valid,
+            "computed_cid": computed_cid,
+            "passport_cid": advisory.passport_cid,
+            "passport_exists": passport_exists,
+            "input_cid": advisory.input_cid,
+            "input_exists": input_exists,
+            "action": advisory.action,
+            "model": advisory.model,
+            "hook": format!("{:?}", advisory.hook),
+            "confidence": advisory.confidence,
+        })),
+    )
 }
 
 /// GET /v1/receipts/:cid/trace — retrieve the policy trace for a receipt.
