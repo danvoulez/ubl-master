@@ -14,6 +14,9 @@ pub mod error_response;
 pub mod ledger;
 pub mod event_bus;
 pub mod llm_observer;
+pub mod ai_passport;
+pub mod advisory;
+pub mod wasm_adapter;
 
 pub use reasoning_bit::{ReasoningBit, Decision, Expression};
 pub use circuit::{Circuit, CompositionMode, AggregationMode};
@@ -24,3 +27,6 @@ pub use pipeline::{UblPipeline, PipelineResult};
 pub use ubl_receipt::{
     WaReceiptBody, WfReceiptBody, PolicyTraceEntry, RbResult
 };
+pub use ai_passport::AiPassport;
+pub use advisory::{Advisory, AdvisoryEngine, AdvisoryHook};
+pub use wasm_adapter::{AdapterRegistry, AdapterRegistration, WasmExecutor, SandboxConfig};

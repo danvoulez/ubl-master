@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use ubl_chipstore::{ChipStore, ExecutionMetadata};
+use crate::advisory::AdvisoryEngine;
 
 /// The UBL Pipeline processor
 pub struct UblPipeline {
@@ -23,6 +24,7 @@ pub struct UblPipeline {
     pub event_bus: Arc<EventBus>,
     seen_nonces: Arc<RwLock<HashSet<String>>>,
     chip_store: Option<Arc<ChipStore>>,
+    advisory_engine: Option<Arc<AdvisoryEngine>>,
 }
 
 const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
@@ -163,6 +165,7 @@ impl UblPipeline {
             event_bus: Arc::new(EventBus::new()),
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: None,
+            advisory_engine: None,
         }
     }
 
@@ -174,6 +177,7 @@ impl UblPipeline {
             event_bus,
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: None,
+            advisory_engine: None,
         }
     }
 
@@ -188,7 +192,13 @@ impl UblPipeline {
             event_bus: Arc::new(EventBus::new()),
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
             chip_store: Some(chip_store),
+            advisory_engine: None,
         }
+    }
+
+    /// Attach an AdvisoryEngine for LLM hook points (post-CHECK, post-WF).
+    pub fn set_advisory_engine(&mut self, engine: Arc<AdvisoryEngine>) {
+        self.advisory_engine = Some(engine);
     }
 
     /// Bootstrap the genesis chip: materialize it as a real stored chip in ChipStore.
@@ -306,6 +316,31 @@ impl UblPipeline {
             duration_ms: check_ms,
         }).map_err(|e| PipelineError::Internal(format!("Receipt CHECK: {}", e)))?;
 
+        // Post-CHECK advisory hook (non-blocking) — explain denial
+        if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
+            let adv = engine.post_check_advisory(
+                &wa_receipt.body_cid,
+                if matches!(check.decision, Decision::Deny) { "deny" } else { "allow" },
+                &check.reason,
+                &check.trace.iter().map(|t| serde_json::to_value(t).unwrap_or_default()).collect::<Vec<_>>(),
+            );
+            let body = engine.advisory_to_chip_body(&adv);
+            let store = store.clone();
+            tokio::spawn(async move {
+                let metadata = ExecutionMetadata {
+                    runtime_version: "advisory/post-check".to_string(),
+                    execution_time_ms: 0,
+                    fuel_consumed: 0,
+                    policies_applied: vec![],
+                    executor_did: "did:key:advisory".to_string(),
+                    reproducible: false,
+                };
+                if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
+                    eprintln!("Advisory post-CHECK store failed (non-fatal): {}", e);
+                }
+            });
+        }
+
         // Short-circuit if denied
         if matches!(check.decision, Decision::Deny) {
             receipt.deny(&check.reason);
@@ -384,6 +419,31 @@ impl UblPipeline {
             ).await {
                 eprintln!("ChipStore persist failed (non-fatal): {}", e);
             }
+        }
+
+        // Post-WF advisory hook (non-blocking) — classify and summarize
+        if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
+            let adv = engine.post_wf_advisory(
+                &wf_receipt.body_cid,
+                &request.chip_type,
+                "allow",
+                total_ms,
+            );
+            let body = engine.advisory_to_chip_body(&adv);
+            let store = store.clone();
+            tokio::spawn(async move {
+                let metadata = ExecutionMetadata {
+                    runtime_version: "advisory/post-wf".to_string(),
+                    execution_time_ms: 0,
+                    fuel_consumed: 0,
+                    policies_applied: vec![],
+                    executor_did: "did:key:advisory".to_string(),
+                    reproducible: false,
+                };
+                if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
+                    eprintln!("Advisory post-WF store failed (non-fatal): {}", e);
+                }
+            });
         }
 
         Ok(PipelineResult {
@@ -1232,5 +1292,113 @@ mod tests {
         // Even without ChipStore, bootstrap should return the genesis CID
         let genesis_cid = pipeline.bootstrap_genesis().await.unwrap();
         assert!(genesis_cid.starts_with("b3:"));
+    }
+
+    #[tokio::test]
+    async fn advisory_engine_produces_post_wf_chip() {
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
+        use crate::advisory::AdvisoryEngine;
+
+        let policy_storage = InMemoryPolicyStorage::new();
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend.clone()));
+        let mut pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+
+        let engine = Arc::new(AdvisoryEngine::new(
+            "b3:test-passport".to_string(),
+            "test-model".to_string(),
+            "a/test/t/test".to_string(),
+        ));
+        pipeline.set_advisory_engine(engine);
+
+        let request = ChipRequest {
+            chip_type: "ubl/user".to_string(),
+            body: json!({
+                "@type": "ubl/user",
+                "@id": "adv-test",
+                "@ver": "1.0",
+                "@world": "a/test/t/test",
+                "id": "adv-test"
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let result = pipeline.process_chip(request).await.unwrap();
+        assert!(matches!(result.decision, Decision::Allow));
+
+        // Give the spawned advisory task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Query ChipStore for advisory chips
+        let query = ubl_chipstore::ChipQuery {
+            chip_type: Some("ubl/advisory".to_string()),
+            tags: vec![],
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(10),
+            offset: None,
+        };
+        let results = chip_store.query(&query).await.unwrap();
+        assert!(results.total_count >= 1, "At least one advisory chip should be stored (post-CHECK or post-WF)");
+
+        let adv_chip = &results.chips[0];
+        assert_eq!(adv_chip.chip_type, "ubl/advisory");
+        assert_eq!(adv_chip.chip_data["passport_cid"], "b3:test-passport");
+    }
+
+    #[tokio::test]
+    async fn advisory_engine_fires_on_deny() {
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
+        use crate::advisory::AdvisoryEngine;
+
+        let policy_storage = InMemoryPolicyStorage::new();
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend.clone()));
+        let mut pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+
+        let engine = Arc::new(AdvisoryEngine::new(
+            "b3:test-passport".to_string(),
+            "test-model".to_string(),
+            "a/test/t/test".to_string(),
+        ));
+        pipeline.set_advisory_engine(engine);
+
+        // This should be denied by genesis (evil type)
+        let request = ChipRequest {
+            chip_type: "evil/hack".to_string(),
+            body: json!({
+                "@type": "evil/hack",
+                "@id": "bad",
+                "@ver": "1.0",
+                "@world": "a/test/t/test",
+                "id": "bad"
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let result = pipeline.process_chip(request).await.unwrap();
+        assert!(matches!(result.decision, Decision::Deny));
+
+        // Give the spawned advisory task time to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Post-CHECK advisory should fire even on deny
+        let query = ubl_chipstore::ChipQuery {
+            chip_type: Some("ubl/advisory".to_string()),
+            tags: vec![],
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(10),
+            offset: None,
+        };
+        let results = chip_store.query(&query).await.unwrap();
+        assert!(results.total_count >= 1, "Post-CHECK advisory should fire on deny");
+
+        let adv_chip = &results.chips[0];
+        assert_eq!(adv_chip.chip_data["action"], "explain_check");
     }
 }

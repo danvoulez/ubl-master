@@ -14,6 +14,7 @@ chrono = { version = "0.4", features = ["serde"] }
 blake3 = { workspace = true }
 hex = "0.4"
 rand = "0.8"
+ring = { workspace = true }
 
 # Other crates in workspace
 ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }

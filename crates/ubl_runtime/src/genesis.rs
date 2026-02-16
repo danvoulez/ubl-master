@@ -67,6 +67,8 @@ fn create_type_validation_rb() -> ReasoningBit {
             Expression::TypeEquals("ubl/ai.passport".to_string()),
             Expression::TypeEquals("ubl/wasm.module".to_string()),
             Expression::TypeEquals("ubl/verification".to_string()),
+            Expression::TypeEquals("ubl/advisory".to_string()),
+            Expression::TypeEquals("ubl/adapter".to_string()),
         ]),
         on_true: Decision::Allow,
         on_false: Decision::Deny,
