@@ -795,18 +795,56 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests.
 | **PS2** — Auth as Pipeline | Auth IS the pipeline — no separate auth system | `auth.rs` with 8 chip types, onboarding dependency chain, `validate_onboarding_chip` at CHECK, drift endpoints removed | 34 + 10 integration |
 | **Onboarding** | Full lifecycle | `ubl/app` → `ubl/user` → `ubl/tenant` → `ubl/membership` → `ubl/token` → `ubl/revoke`. Dependency chain enforced. `DependencyMissing` (409) error code. | 141 total (ubl_runtime) |
 
-### Current — Hardening the Base
+### Completed — Hardening
+
+| Item | Deliverables | Tests |
+|---|---|---|
+| **H1** Signing key from env | `ubl_kms` crate, `signing_key_from_env()`, domain separation | 13 |
+| **H2** Real DID resolution | All placeholder DIDs replaced, `did:key:z...` derived from Ed25519 via `ubl_kms` | — |
+| **H3** `NaiveCanon` → full ρ | `RhoCanon` in `rb_vm/src/canon.rs`, NFC, BOM rejection, null stripping, key sorting, idempotent | 19 |
+| **H7** Signature domain separation | `domain::RECEIPT`, `RB_VM`, `CAPSULE`, `CHIP` in `ubl_kms` | — |
+| **H8** Rate limiting | Sliding-window per-key, `GateRateLimiter` (IP/tenant/DID), `prune()` | 13 |
+| **H9** UNC-1 core ops | `ubl_unc1` crate: add/sub/mul/div with promotion, `to_dec`, `to_rat`, `from_f64_bits`, BND intervals | 33 |
+| **H10** Policy lockfile | `PolicyLock` with YAML parse/serialize, `pin()`, `verify()` | 11 |
+| **H11** RuntimeInfo + BuildMeta | `RuntimeInfo::capture()`, BLAKE3 binary hash, `BuildMeta`, wired into every receipt | 7 |
+| **H13** ρ test vectors | 14 JSON edge-case files in `kats/rho_vectors/`, 16 integration tests | 16 |
+| **H14** `ubl_kms` crate | `sign_canonical`, `verify_canonical`, DID/KID derivation | 13 |
+| **H15** Prometheus `/metrics` | Counters + histogram on gate | — |
+
+### Completed — PR-A/B/C (Security, Observability, API Surface)
+
+| Item | Deliverables | Tests |
+|---|---|---|
+| **PR-A P0.1** Rigid idempotency | `IdempotencyStore` keyed by `(@type,@ver,@world,@id)`, replay returns cached receipt, wired into `process_chip` | 10 |
+| **PR-A P0.2** Canon-aware rate limit | `CanonFingerprint` (BLAKE3 of NRF-1 bytes) + `CanonRateLimiter`, cosmetic JSON variations hit same bucket | 7 |
+| **PR-A P0.3** Secure bootstrap | `capability.rs` — `Capability` struct, `ubl/app` + first `ubl/user` require `cap.registry:init`, wired into CHECK | 15 |
+| **PR-A P0.4** Receipts-as-AuthZ | `ubl/membership` requires `cap.membership:grant`, `ubl/revoke` requires `cap.revoke:execute`, audience/scope/expiration validation | — |
+| **PR-B P1.5** Canonical stage events | `ReceiptEvent` extended with `input_cid`, `output_cid`, `binary_hash`, `build_meta`, `world`, `actor`, `latency_ms` | 1 |
+| **PR-B P1.6** ETag/cache | `GET /v1/chips/:cid` returns `ETag`=CID, `Cache-Control: immutable`, `If-None-Match` → 304 | — |
+| **PR-B P1.7** Unified error taxonomy | 4 new `ErrorCode` variants (401/404/429/503), `category()` → 8 categories, `mcp_code()` → JSON-RPC | 7 |
+| **PR-C P2.8** Manifest generator | `GateManifest` → OpenAPI 3.1, MCP tool manifest, WebMCP manifest. Gate serves `/openapi.json`, `/mcp/manifest`, `/.well-known/webmcp.json` | 14 |
+| **PR-C P2.9** MCP server proxy | `POST /mcp/rpc` — JSON-RPC 2.0 with `tools/list` + `tools/call` dispatching `ubl.deliver`, `ubl.query`, `ubl.verify`, `registry.listTypes` | — |
+| **PR-C P2.10** Meta-chips | `ubl/meta.register` (mandatory KATs, reserved prefix check), `ubl/meta.describe`, `ubl/meta.deprecate` | 16 |
+
+### Current Test Counts
+
+| Crate | Tests |
+|---|---|
+| `rb_vm` | 60 |
+| `ubl_receipt` | 18 |
+| `ubl_runtime` | 250 |
+| `ubl_ai_nrf1` | 85 |
+| `ubl_kms` | 13 |
+| `ubl_unc1` | 33 |
+| **Total** | **459** |
+
+### Open — Hardening (3 remaining)
 
 | Item | Priority | Status |
 |---|---|---|
-| **PS3** — Runtime certification (`RuntimeInfo`, `SelfAttestation`, `runtime_hash`) | Medium | Pending |
-| **PS4** — Enhanced observability (structured tracing, metrics, LLM narration) | Medium | Pending |
-| SHA2-256 → BLAKE3 migration in `ubl_ai_nrf1` | Critical | Open |
-| Real DID resolution (replace placeholder DIDs) | Medium | Open |
-| `NaiveCanon` → full ρ delegation in rb_vm | Medium | Open |
-| Signing key from env (not hardcoded) | Medium | Open |
-| Property-based testing (proptest) for canon edge cases | Low | Open |
-| P0→P1 rollout automation (see `ROLLOUT_P0_to_P1.md`) | Medium | Designed |
+| **H4** P0→P1 rollout automation (see `ROLLOUT_P0_to_P1.md`) | Medium | Designed, not automated |
+| **H5** Newtype pattern (`Cid`, `Did`, `ChipBody` newtypes) | Low | Open |
+| **H6** Parse, Don't Validate (progressive adoption beyond `auth.rs`) | Low | Open |
 
 ### Next — Protocol Horizons
 
@@ -829,20 +867,22 @@ The pattern is always the same: define `@type`s, write policies, maybe add a WAS
 | SHA2-256 used instead of BLAKE3 | `ubl_ai_nrf1::compute_cid` | 🔴 Critical — CID mismatch with rb_vm | **OPEN** |
 | ~~Two `Decision` enums~~ | ~~`ubl_runtime` vs `ubl_receipt`~~ | ~~🟡 Confusing~~ | ✅ Fixed S2.2 — unified to `ubl_receipt::Decision` |
 | ~~TR stage is placeholder~~ | ~~`pipeline.rs`~~ | ~~🔴 Critical~~ | ✅ Fixed S2.1 — real rb_vm execution |
-| Hardcoded signing key | `ubl_receipt::SIGNING_KEY` | 🟡 Dev only — must load from env | **OPEN** |
+| ~~Hardcoded signing key~~ | ~~`ubl_receipt::SIGNING_KEY`~~ | ~~🟡 Dev only~~ | ✅ Fixed H1/H14 — `ubl_kms`, `signing_key_from_env()` |
 | ~~`ubl_ledger` is all no-ops~~ | ~~`ubl_ledger::lib.rs`~~ | ~~🔴 Critical~~ | ✅ Fixed S3.4 — `NdjsonLedger` + `InMemoryLedger` |
 | ~~ChipStore not in pipeline~~ | ~~`UblPipeline`~~ | ~~🔴 Critical~~ | ✅ Fixed S3.3 — `Arc<ChipStore>` persists at WF |
-| ~~No nonce/anti-replay~~ | ~~WA receipts~~ | ~~🟡 Replay possible~~ | ✅ Fixed S2.3 — 16-byte hex nonce |
-| Placeholder DIDs | `"did:key:placeholder"` in WA stage | 🟡 Must come from auth | **OPEN** |
-| `NaiveCanon` in rb_vm | Sorts keys but doesn't do full ρ | 🟡 Must delegate to `ubl_ai_nrf1` | **OPEN** |
+| ~~No nonce/anti-replay~~ | ~~WA receipts~~ | ~~🟡 Replay possible~~ | ✅ Fixed S2.3 — 16-byte hex nonce + PR-A P0.1 rigid idempotency |
+| ~~Placeholder DIDs~~ | ~~`"did:key:placeholder"` in WA stage~~ | ~~🟡 Must come from auth~~ | ✅ Fixed H2 — real `did:key:z...` from Ed25519 via `ubl_kms` |
+| ~~`NaiveCanon` in rb_vm~~ | ~~Sorts keys but doesn't do full ρ~~ | ~~🟡 Must delegate~~ | ✅ Fixed H3 — `RhoCanon` with full ρ rules (19 tests) |
 | ~~Hardcoded duration_ms~~ | ~~`50` in WF stage~~ | ~~🟢 Minor~~ | ✅ Fixed S3.7 — real `Instant::now()` timing |
 | ~~Separate WA/WF receipts~~ | ~~`ubl_receipt`~~ | ~~🔴 Critical~~ | ✅ Fixed S3.1 — `UnifiedReceipt` with HMAC chain |
 | ~~KNOCK implicit~~ | ~~`pipeline.rs`~~ | ~~🟡 Missing validation~~ | ✅ Fixed S3.5 — explicit `knock.rs` (11 tests) |
 | ~~Gate GET stubs~~ | ~~`ubl_gate`~~ | ~~🟡 Non-functional~~ | ✅ Fixed S3.3 — real ChipStore lookups |
-| ~~No canonical errors~~ | ~~HTTP responses~~ | ~~🟡 Inconsistent~~ | ✅ Fixed S3.6 — `UblError` with Universal Envelope |
-| 4 pre-existing chip_format test failures | `ubl_ai_nrf1::chip_format` | 🟡 Tests exist but fail | **OPEN** |
-| No runtime self-attestation | `ubl_runtime` | 🟡 Needed for PS3 | **OPEN** |
-| No structured tracing | All crates | 🟡 `eprintln!` only | **OPEN** (PS4) |
+| ~~No canonical errors~~ | ~~HTTP responses~~ | ~~🟡 Inconsistent~~ | ✅ Fixed S3.6 + PR-B P1.7 — `UblError` with 8-category taxonomy |
+| ~~4 pre-existing chip_format test failures~~ | ~~`ubl_ai_nrf1::chip_format`~~ | ~~🟡 Tests exist but fail~~ | ✅ Fixed C2 — tests were already passing |
+| ~~No runtime self-attestation~~ | ~~`ubl_runtime`~~ | ~~🟡 Needed for PS3~~ | ✅ Fixed H11 — `RuntimeInfo::capture()`, BLAKE3 binary hash, `BuildMeta` |
+| No structured tracing | All crates | 🟡 `eprintln!` only | **OPEN** (F2) |
+| Newtype pattern needed | All crates | 🟢 Minor | **OPEN** (H5) |
+| Parse, Don't Validate | Pipeline + chip types | 🟢 Minor | **OPEN** (H6) |
 
 ---
 
