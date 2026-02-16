@@ -17,3 +17,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 
 ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
+ubl_runtime = { path = "../ubl_runtime" }
+ubl_chipstore = { path = "../ubl_chipstore" }
+ubl_receipt = { path = "../ubl_receipt" }
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = { workspace = true }
+hex = "0.4"

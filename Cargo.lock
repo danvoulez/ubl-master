@@ -2280,13 +2280,19 @@ name = "ubl_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "chrono",
  "clap",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
  "ubl_ai_nrf1",
+ "ubl_chipstore",
+ "ubl_receipt",
+ "ubl_runtime",
 ]
 
 [[package]]
