@@ -64,6 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
+        .route("/v1/users", post(register_user))
+        .route("/v1/tokens", post(create_token))
         .route("/v1/passports", post(register_passport))
         .route("/v1/passports/:cid/advisories", get(get_passport_advisories))
         .route("/v1/advisories/:cid/verify", get(verify_advisory))
@@ -142,6 +144,112 @@ async fn get_chip(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
         ),
+    }
+}
+
+/// POST /v1/users — register a human user identity through the pipeline.
+async fn register_user(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    let chip_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
+        ),
+    };
+
+    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+    if chip_type != "ubl/user" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/user"})),
+        );
+    }
+
+    if let Err(e) = ubl_runtime::auth::UserIdentity::from_chip_body(&chip_json) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_USER", "message": e.to_string()})),
+        );
+    }
+
+    match state.pipeline.process_raw(&body).await {
+        Ok(result) => {
+            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "@type": "ubl/user.registered",
+                    "status": "success",
+                    "decision": format!("{:?}", result.decision),
+                    "user_cid": result.chain.first().unwrap_or(&String::new()),
+                    "receipt_cid": result.receipt.receipt_cid,
+                    "chain": result.chain,
+                    "receipt": receipt_json,
+                })),
+            )
+        }
+        Err(e) => {
+            let ubl_err = UblError::from_pipeline_error(&e);
+            let status = StatusCode::from_u16(ubl_err.code.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(ubl_err.to_json()))
+        }
+    }
+}
+
+/// POST /v1/tokens — create a session token through the pipeline.
+async fn create_token(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    let chip_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_JSON", "message": e.to_string()})),
+        ),
+    };
+
+    let chip_type = chip_json.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+    if chip_type != "ubl/token" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Expected @type: ubl/token"})),
+        );
+    }
+
+    if let Err(e) = ubl_runtime::auth::SessionToken::from_chip_body(&chip_json) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"@type": "ubl/error", "code": "INVALID_TOKEN", "message": e.to_string()})),
+        );
+    }
+
+    match state.pipeline.process_raw(&body).await {
+        Ok(result) => {
+            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "@type": "ubl/token.created",
+                    "status": "success",
+                    "decision": format!("{:?}", result.decision),
+                    "token_cid": result.chain.first().unwrap_or(&String::new()),
+                    "receipt_cid": result.receipt.receipt_cid,
+                    "chain": result.chain,
+                    "receipt": receipt_json,
+                })),
+            )
+        }
+        Err(e) => {
+            let ubl_err = UblError::from_pipeline_error(&e);
+            let status = StatusCode::from_u16(ubl_err.code.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(ubl_err.to_json()))
+        }
     }
 }
 
