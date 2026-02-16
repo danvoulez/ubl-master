@@ -17,6 +17,7 @@ pub mod llm_observer;
 pub mod ai_passport;
 pub mod advisory;
 pub mod wasm_adapter;
+pub mod rich_url;
 
 pub use reasoning_bit::{ReasoningBit, Decision, Expression};
 pub use circuit::{Circuit, CompositionMode, AggregationMode};

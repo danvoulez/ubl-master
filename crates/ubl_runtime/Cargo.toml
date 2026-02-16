@@ -15,6 +15,8 @@ blake3 = { workspace = true }
 hex = "0.4"
 rand = "0.8"
 ring = { workspace = true }
+base64 = "0.22"
+flate2 = "1.0"
 
 # Other crates in workspace
 ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
