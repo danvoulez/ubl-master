@@ -19,6 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }  # Date/time handling
 # Other crates in workspace
 ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
 ubl_receipt = { path = "../ubl_receipt" }
+ubl_types = { path = "../ubl_types" }
 
 # Property testing
 proptest = { workspace = true, optional = true }

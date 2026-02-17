@@ -20,6 +20,9 @@ pub use unified::{
     RuntimeInfo, BuildMeta,
 };
 
+// Re-export leaf newtypes for downstream crates
+pub use ubl_types;
+
 lazy_static! {
     static ref SIGNING_KEY: SigningKey = {
         let mut bytes = [0u8; 32];

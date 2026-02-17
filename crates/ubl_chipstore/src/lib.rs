@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use ubl_types::{Cid as TypedCid, Did as TypedDid};
 
 pub mod backends;
 pub mod indexing;
@@ -15,10 +16,10 @@ pub mod query;
 /// A stored chip with its metadata and receipt
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredChip {
-    pub cid: String,
+    pub cid: TypedCid,
     pub chip_type: String,
     pub chip_data: serde_json::Value,
-    pub receipt_cid: String,
+    pub receipt_cid: TypedCid,
     pub created_at: String,
     pub execution_metadata: ExecutionMetadata,
     pub tags: Vec<String>,
@@ -32,7 +33,7 @@ pub struct ExecutionMetadata {
     pub execution_time_ms: i64,
     pub fuel_consumed: u64,
     pub policies_applied: Vec<String>,
-    pub executor_did: String,
+    pub executor_did: TypedDid,
     pub reproducible: bool,
 }
 
@@ -106,8 +107,10 @@ impl ChipStore {
         // Compute CID for the chip data
         let nrf1_bytes = ubl_ai_nrf1::to_nrf1_bytes(&chip_data)
             .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
-        let cid = ubl_ai_nrf1::compute_cid(&nrf1_bytes)
+        let cid_str = ubl_ai_nrf1::compute_cid(&nrf1_bytes)
             .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        let cid = TypedCid::new_unchecked(&cid_str);
+        let receipt_cid = TypedCid::new_unchecked(receipt_cid);
 
         // Extract chip type and tags
         let chip_type = chip_data.get("@type")
@@ -119,7 +122,7 @@ impl ChipStore {
         let related_chips = self.extract_relationships(&chip_data);
 
         let stored_chip = StoredChip {
-            cid: cid.clone(),
+            cid,
             chip_type,
             chip_data,
             receipt_cid,
@@ -135,7 +138,7 @@ impl ChipStore {
         // Update indexes
         self.indexer.index_chip(&stored_chip).await?;
 
-        Ok(cid)
+        Ok(cid_str)
     }
 
     /// Retrieve a chip by CID

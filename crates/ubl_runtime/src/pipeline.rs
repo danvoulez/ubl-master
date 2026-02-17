@@ -271,7 +271,7 @@ impl UblPipeline {
                     execution_time_ms: 0,
                     fuel_consumed: 0,
                     policies_applied: vec![],
-                    executor_did: "did:key:genesis".to_string(),
+                    executor_did: ubl_types::Did::new_unchecked("did:key:genesis"),
                     reproducible: true,
                 };
 
@@ -410,7 +410,7 @@ impl UblPipeline {
                     execution_time_ms: 0,
                     fuel_consumed: 0,
                     policies_applied: vec![],
-                    executor_did: "did:key:advisory".to_string(),
+                    executor_did: ubl_types::Did::new_unchecked("did:key:advisory"),
                     reproducible: false,
                 };
                 if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
@@ -488,7 +488,7 @@ impl UblPipeline {
                 execution_time_ms: total_ms,
                 fuel_consumed: self.fuel_limit,
                 policies_applied: check.trace.iter().map(|t| t.policy_id.clone()).collect(),
-                executor_did: self.did.clone(),
+                executor_did: ubl_types::Did::new_unchecked(&self.did),
                 reproducible: true,
             };
             if let Err(e) = store.store_executed_chip(
@@ -537,7 +537,7 @@ impl UblPipeline {
                     execution_time_ms: 0,
                     fuel_consumed: 0,
                     policies_applied: vec![],
-                    executor_did: "did:key:advisory".to_string(),
+                    executor_did: ubl_types::Did::new_unchecked("did:key:advisory"),
                     reproducible: false,
                 };
                 if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
@@ -919,7 +919,7 @@ impl UblPipeline {
                 for chip in &existing {
                     if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(slug) {
                         // Check if this app has been revoked
-                        if !self.is_revoked(&chip.cid, store).await? {
+                        if !self.is_revoked(chip.cid.as_str(), store).await? {
                             return Err(PipelineError::InvalidChip(
                                 format!("App slug '{}' already registered", slug),
                             ));
@@ -1015,7 +1015,7 @@ impl UblPipeline {
 
         for chip in &apps {
             if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug) {
-                if !self.is_revoked(&chip.cid, store).await? {
+                if !self.is_revoked(chip.cid.as_str(), store).await? {
                     return Ok(());
                 }
             }
@@ -1414,7 +1414,7 @@ mod tests {
         assert!(stored.is_some(), "chip must be persisted after allow");
         let stored = stored.unwrap();
         assert_eq!(stored.chip_type, "ubl/document");
-        assert_eq!(stored.receipt_cid, result.final_receipt.body_cid);
+        assert_eq!(stored.receipt_cid.as_str(), result.final_receipt.body_cid);
     }
 
     #[tokio::test]
@@ -1689,8 +1689,8 @@ mod tests {
 
         let chip = stored.unwrap();
         assert_eq!(chip.chip_type, "ubl/policy.genesis");
-        assert_eq!(chip.receipt_cid, genesis_cid, "Genesis is self-signed: receipt_cid == chip_cid");
-        assert_eq!(chip.execution_metadata.executor_did, "did:key:genesis");
+        assert_eq!(chip.receipt_cid.as_str(), genesis_cid, "Genesis is self-signed: receipt_cid == chip_cid");
+        assert_eq!(chip.execution_metadata.executor_did.as_str(), "did:key:genesis");
         assert!(chip.execution_metadata.reproducible);
     }
 

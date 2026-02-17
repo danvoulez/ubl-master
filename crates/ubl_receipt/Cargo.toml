@@ -18,6 +18,7 @@ cid = { version = "0.11", features = ["serde-codec", "std"] }
 hex = "0.4"
 blake3 = { workspace = true }
 ubl_ledger = { path = "../ubl_ledger" }
+ubl_types = { path = "../ubl_types" }
 
 # Property testing
 proptest = { workspace = true, optional = true }

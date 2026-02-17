@@ -189,7 +189,7 @@ impl ChipQueryBuilder {
 
         // Check executor
         if let Some(ref executor_did) = self.executor_did {
-            if chip.execution_metadata.executor_did != *executor_did {
+            if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
                 return false;
             }
         }

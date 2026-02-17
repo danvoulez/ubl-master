@@ -2325,6 +2325,7 @@ dependencies = [
  "tokio",
  "ubl_ai_nrf1",
  "ubl_receipt",
+ "ubl_types",
 ]
 
 [[package]]
@@ -2431,6 +2432,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ubl_ledger",
+ "ubl_types",
 ]
 
 [[package]]
@@ -2457,6 +2459,7 @@ dependencies = [
  "ubl_chipstore",
  "ubl_kms",
  "ubl_receipt",
+ "ubl_types",
 ]
 
 [[package]]

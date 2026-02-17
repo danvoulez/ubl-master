@@ -4,14 +4,15 @@ use crate::{ChipStoreBackend, ChipStoreError, StoredChip};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use ubl_types::Cid as TypedCid;
 
 /// Index for efficient chip lookups
 pub struct ChipIndexer {
     backend: Arc<dyn ChipStoreBackend>,
     // In-memory indexes for fast lookups
-    type_index: Arc<RwLock<HashMap<String, HashSet<String>>>>, // chip_type -> CIDs
-    tag_index: Arc<RwLock<HashMap<String, HashSet<String>>>>,  // tag -> CIDs
-    executor_index: Arc<RwLock<HashMap<String, HashSet<String>>>>, // executor_did -> CIDs
+    type_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // chip_type -> CIDs
+    tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>,  // tag -> CIDs
+    executor_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // executor_did -> CIDs
 }
 
 impl ChipIndexer {
@@ -50,7 +51,7 @@ impl ChipIndexer {
         {
             let mut executor_index = self.executor_index.write().await;
             executor_index
-                .entry(chip.execution_metadata.executor_did.clone())
+                .entry(chip.execution_metadata.executor_did.as_str().to_string())
                 .or_insert_with(HashSet::new)
                 .insert(chip.cid.clone());
         }
@@ -59,7 +60,7 @@ impl ChipIndexer {
     }
 
     /// Get CIDs for chips of a specific type
-    pub async fn get_cids_by_type(&self, chip_type: &str) -> Result<Vec<String>, ChipStoreError> {
+    pub async fn get_cids_by_type(&self, chip_type: &str) -> Result<Vec<TypedCid>, ChipStoreError> {
         let type_index = self.type_index.read().await;
         Ok(type_index
             .get(chip_type)
@@ -68,7 +69,7 @@ impl ChipIndexer {
     }
 
     /// Get CIDs for chips with a specific tag
-    pub async fn get_cids_by_tag(&self, tag: &str) -> Result<Vec<String>, ChipStoreError> {
+    pub async fn get_cids_by_tag(&self, tag: &str) -> Result<Vec<TypedCid>, ChipStoreError> {
         let tag_index = self.tag_index.read().await;
         Ok(tag_index
             .get(tag)
@@ -77,7 +78,7 @@ impl ChipIndexer {
     }
 
     /// Get CIDs for chips executed by a specific executor
-    pub async fn get_cids_by_executor(&self, executor_did: &str) -> Result<Vec<String>, ChipStoreError> {
+    pub async fn get_cids_by_executor(&self, executor_did: &str) -> Result<Vec<TypedCid>, ChipStoreError> {
         let executor_index = self.executor_index.read().await;
         Ok(executor_index
             .get(executor_did)
@@ -91,13 +92,13 @@ impl ChipIndexer {
         chip_type: Option<&str>,
         tags: &[String],
         executor_did: Option<&str>,
-    ) -> Result<Vec<String>, ChipStoreError> {
-        let mut result_cids: Option<HashSet<String>> = None;
+    ) -> Result<Vec<TypedCid>, ChipStoreError> {
+        let mut result_cids: Option<HashSet<TypedCid>> = None;
 
         // Filter by chip type
         if let Some(chip_type) = chip_type {
             let type_cids = self.get_cids_by_type(chip_type).await?;
-            let type_cids_set: HashSet<String> = type_cids.into_iter().collect();
+            let type_cids_set: HashSet<TypedCid> = type_cids.into_iter().collect();
 
             result_cids = Some(match result_cids {
                 None => type_cids_set,
@@ -108,7 +109,7 @@ impl ChipIndexer {
         // Filter by tags
         for tag in tags {
             let tag_cids = self.get_cids_by_tag(tag).await?;
-            let tag_cids_set: HashSet<String> = tag_cids.into_iter().collect();
+            let tag_cids_set: HashSet<TypedCid> = tag_cids.into_iter().collect();
 
             result_cids = Some(match result_cids {
                 None => tag_cids_set,
@@ -119,7 +120,7 @@ impl ChipIndexer {
         // Filter by executor
         if let Some(executor_did) = executor_did {
             let executor_cids = self.get_cids_by_executor(executor_did).await?;
-            let executor_cids_set: HashSet<String> = executor_cids.into_iter().collect();
+            let executor_cids_set: HashSet<TypedCid> = executor_cids.into_iter().collect();
 
             result_cids = Some(match result_cids {
                 None => executor_cids_set,
@@ -159,10 +160,11 @@ impl ChipIndexer {
         // Remove from executor index
         {
             let mut executor_index = self.executor_index.write().await;
-            if let Some(cids) = executor_index.get_mut(&chip.execution_metadata.executor_did) {
+            let did_key = chip.execution_metadata.executor_did.as_str().to_string();
+            if let Some(cids) = executor_index.get_mut(&did_key) {
                 cids.remove(&chip.cid);
                 if cids.is_empty() {
-                    executor_index.remove(&chip.execution_metadata.executor_did);
+                    executor_index.remove(&did_key);
                 }
             }
         }

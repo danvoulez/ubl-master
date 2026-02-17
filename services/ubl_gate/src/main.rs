@@ -193,7 +193,7 @@ async fn verify_chip(
 
     // Check receipt exists
     let receipt_cid = &chip.receipt_cid;
-    let receipt_exists = if receipt_cid.is_empty() {
+    let receipt_exists = if receipt_cid.as_str().is_empty() {
         false
     } else {
         // Scan for receipt (same pattern as get_receipt_trace)
@@ -437,7 +437,7 @@ async fn get_receipt_trace(
 
     match state.chip_store.query(&query).await {
         Ok(result) => {
-            if let Some(chip) = result.chips.iter().find(|c| c.receipt_cid == cid) {
+            if let Some(chip) = result.chips.iter().find(|c| c.receipt_cid.as_str() == cid) {
                 (
                     StatusCode::OK,
                     Json(json!({

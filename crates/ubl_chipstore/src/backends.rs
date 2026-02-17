@@ -6,10 +6,11 @@ use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use ubl_types::Cid as TypedCid;
 
 /// In-memory backend for development and testing
 pub struct InMemoryBackend {
-    chips: Arc<RwLock<HashMap<String, StoredChip>>>,
+    chips: Arc<RwLock<HashMap<TypedCid, StoredChip>>>,
 }
 
 impl InMemoryBackend {
@@ -36,12 +37,14 @@ impl ChipStoreBackend for InMemoryBackend {
 
     async fn get_chip(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
         let chips = self.chips.read().await;
-        Ok(chips.get(cid).cloned())
+        let key = TypedCid::new_unchecked(cid);
+        Ok(chips.get(&key).cloned())
     }
 
     async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
         let chips = self.chips.read().await;
-        Ok(chips.contains_key(cid))
+        let key = TypedCid::new_unchecked(cid);
+        Ok(chips.contains_key(&key))
     }
 
     async fn query_chips(&self, query: &ChipQuery) -> Result<QueryResult, ChipStoreError> {
@@ -87,11 +90,13 @@ impl ChipStoreBackend for InMemoryBackend {
 
     async fn get_related_chips(&self, cid: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
         let chips = self.chips.read().await;
+        let key = TypedCid::new_unchecked(cid);
 
-        if let Some(chip) = chips.get(cid) {
+        if let Some(chip) = chips.get(&key) {
             let mut related = Vec::new();
             for related_cid in &chip.related_chips {
-                if let Some(related_chip) = chips.get(related_cid) {
+                let rkey = TypedCid::new_unchecked(related_cid);
+                if let Some(related_chip) = chips.get(&rkey) {
                     related.push(related_chip.clone());
                 }
             }
@@ -103,7 +108,8 @@ impl ChipStoreBackend for InMemoryBackend {
 
     async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError> {
         let mut chips = self.chips.write().await;
-        chips.remove(cid);
+        let key = TypedCid::new_unchecked(cid);
+        chips.remove(&key);
         Ok(())
     }
 }
@@ -140,7 +146,7 @@ impl InMemoryBackend {
 
         // Check executor
         if let Some(ref executor_did) = query.executor_did {
-            if chip.execution_metadata.executor_did != *executor_did {
+            if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
                 return false;
             }
         }
@@ -177,7 +183,7 @@ impl ChipStoreBackend for SledBackend {
             .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
 
         self.db
-            .insert(chip.cid.as_bytes(), serialized)
+            .insert(chip.cid.as_str().as_bytes(), serialized)
             .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
 
         Ok(())
@@ -309,7 +315,7 @@ impl SledBackend {
 
         // Check executor
         if let Some(ref executor_did) = query.executor_did {
-            if chip.execution_metadata.executor_did != *executor_did {
+            if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
                 return false;
             }
         }
