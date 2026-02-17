@@ -1,7 +1,7 @@
 # UBL MASTER — Unified Task List
 
 **Status**: Single source of truth for all work — done, in progress, and planned
-**Date**: February 16, 2026
+**Date**: February 17, 2026
 **Spec**: [ARCHITECTURE.md](./ARCHITECTURE.md) — engineering source of truth
 
 ---
@@ -23,17 +23,17 @@
 - [x] **ARCHITECTURE.md rev 2**: Added §0 Protocol Stack (8-layer table), updated §1 evolution table, rewrote §2 crate map, removed BLOCKERs from §5.2/§5.3, rewrote §16 as Build History & Roadmap with Protocol Horizons, updated §17 tech debt
 - [x] **Policy documents**: `P0_genesis_policy.json`, `P1_policy_update.json`, `ROLLOUT_P0_to_P1.md`
 
-### Test Counts (current — post PR-A/B/C)
+### Test Counts (current — post wiring session)
 
 | Crate | Tests |
 |---|---|
 | `rb_vm` | 60 (33 exec + 8 disasm + 19 canon) |
 | `ubl_receipt` | 18 |
-| `ubl_runtime` | 250 (was 180; +10 idempotency, +7 canon rate_limit, +15 capability, +1 stage events, +7 error taxonomy, +14 manifest, +16 meta_chip) |
+| `ubl_runtime` | 252 (was 250; +2 idempotent replay) |
 | `ubl_ai_nrf1` | 85 (69 unit + 16 rho_vectors) |
 | `ubl_kms` | 13 |
 | `ubl_unc1` | 33 |
-| **Total** | **~459** |
+| **Total** | **461** |
 
 ---
 
@@ -76,6 +76,10 @@
 | PR-C P2.8 | **Manifest generator** | `manifest.rs` — `GateManifest` produces OpenAPI 3.1, MCP tool manifest, WebMCP manifest from registered chip types. Gate serves `/openapi.json`, `/mcp/manifest`, `/.well-known/webmcp.json`. 14 tests. |
 | PR-C P2.9 | **MCP server proxy** | `POST /mcp/rpc` — JSON-RPC 2.0 handler with `tools/list` + `tools/call`. Dispatches to `ubl.deliver`, `ubl.query`, `ubl.verify`, `registry.listTypes`. Uses `mcp_code()` for error mapping. |
 | PR-C P2.10 | **Meta-chips for type registration** | `meta_chip.rs` — `ubl/meta.register` (mandatory KATs, reserved prefix check, KAT @type validation), `ubl/meta.describe`, `ubl/meta.deprecate`. 16 tests. |
+| W1 | **SledBackend wired into gate** | Gate uses `SledBackend` at `./data/chips` instead of `InMemoryBackend`. Persistent chip storage across restarts. |
+| W2 | **NdjsonLedger wired into pipeline** | `NdjsonLedger` at `./data/ledger` appended after WF. Audit trail per `{app}/{tenant}/receipts.ndjson`. |
+| W3 | **Idempotent replay returns 200** | `process_chip` returns `Ok(PipelineResult { replayed: true })` with cached receipt instead of `Err(ReplayDetected)`. Gate returns `X-UBL-Replay: true` header. `UnifiedReceipt::from_json()` added. 2 new tests. |
+| PF-02 | **Determinism boundary codified** | ARCHITECTURE.md §15.1: chip CID = deterministic (canonical content), receipt CID = contextually unique (time, nonce, RuntimeInfo). Never compare receipt CIDs for content equality. |
 
 ---
 
