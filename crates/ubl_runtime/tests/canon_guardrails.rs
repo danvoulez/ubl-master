@@ -20,9 +20,17 @@ fn cid_equivalence_nrf_across_components() {
 #[test]
 fn no_custom_sort_key_paths() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let pipeline_file = {
+        let legacy = root.join("src/pipeline.rs");
+        if legacy.exists() {
+            legacy
+        } else {
+            root.join("src/pipeline/mod.rs")
+        }
+    };
     let files = [
         root.join("src/rich_url.rs"),
-        root.join("src/pipeline.rs"),
+        pipeline_file,
         root.join("../ubl_receipt/src/unified.rs"),
     ];
 

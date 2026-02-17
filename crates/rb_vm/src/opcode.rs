@@ -23,6 +23,17 @@ pub enum Opcode {
     Dup = 0x14,        // duplicate top of stack
     Swap = 0x15,       // swap top two stack values
     VerifySig = 0x16,  // pop (pubkey_bytes, sig_bytes, msg_bytes) → push Bool
+    NumFromDecimalStr = 0x17, // pop string bytes -> push unc1 num
+    NumFromF64Bits = 0x18, // pop i64 bits -> push unc1 bnd
+    NumAdd = 0x19,     // pop b,a (num) -> push num
+    NumSub = 0x1A,     // pop b,a (num) -> push num
+    NumMul = 0x1B,     // pop b,a (num) -> push num
+    NumDiv = 0x1C,     // pop b,a (num) -> push num
+    NumToDec = 0x1D,   // payload: u32 scale + u8 rounding mode; pop num -> push dec
+    NumToRat = 0x1E,   // payload: u64 limit_den; pop num -> push rat
+    NumWithUnit = 0x1F, // payload: utf8 unit; pop num -> push num
+    NumAssertUnit = 0x20, // payload: utf8 unit; pop num -> push same num
+    NumCompare = 0x21, // pop b,a (num) -> push int/1 as num
 }
 
 impl TryFrom<u8> for Opcode {
@@ -52,6 +63,17 @@ impl TryFrom<u8> for Opcode {
             0x14 => Dup,
             0x15 => Swap,
             0x16 => VerifySig,
+            0x17 => NumFromDecimalStr,
+            0x18 => NumFromF64Bits,
+            0x19 => NumAdd,
+            0x1A => NumSub,
+            0x1B => NumMul,
+            0x1C => NumDiv,
+            0x1D => NumToDec,
+            0x1E => NumToRat,
+            0x1F => NumWithUnit,
+            0x20 => NumAssertUnit,
+            0x21 => NumCompare,
             _ => return Err(()),
         })
     }

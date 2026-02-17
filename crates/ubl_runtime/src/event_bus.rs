@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+use ubl_receipt::{
+    Decision as ReceiptDecision, PipelineStage as ReceiptPipelineStage, UnifiedReceipt,
+};
 
 const CHANNEL_CAPACITY: usize = 1024;
 
@@ -81,6 +84,17 @@ pub struct ReceiptEvent {
     pub latency_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StageEventContext {
+    pub decision: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub world: Option<String>,
+    pub input_cid: Option<String>,
+    pub binary_hash: Option<String>,
+    pub build_meta: Option<serde_json::Value>,
+    pub actor: Option<String>,
+}
+
 impl ReceiptEvent {
     /// Create a new event with Universal Envelope defaults.
     pub fn new(
@@ -113,6 +127,125 @@ impl ReceiptEvent {
             actor: None,
             latency_ms: None,
         }
+    }
+
+    /// Build a stage event from raw receipt data and stage context.
+    pub fn from_stage_receipt(
+        receipt_cid: &str,
+        receipt_type: &str,
+        metadata: serde_json::Value,
+        pipeline_stage: &str,
+        ctx: StageEventContext,
+    ) -> Self {
+        let mut event = Self::new(
+            &format!("ubl.receipt.{}", pipeline_stage),
+            receipt_cid,
+            receipt_type,
+            pipeline_stage,
+            metadata.clone(),
+        );
+        event.decision = ctx.decision;
+        event.duration_ms = ctx.duration_ms;
+        event.input_cid = ctx.input_cid;
+        event.output_cid = Some(receipt_cid.to_string());
+        event.binary_hash = ctx.binary_hash;
+        event.build_meta = ctx.build_meta;
+        event.world = ctx.world;
+        event.actor = ctx.actor;
+        event.latency_ms = event.duration_ms;
+
+        // Extract fuel_used and rb_count from receipt body if present.
+        if let Some(vm) = metadata.get("vm_state") {
+            event.fuel_used = vm.get("fuel_used").and_then(|v| v.as_u64());
+        }
+        if let Some(trace) = metadata.get("policy_trace").and_then(|v| v.as_array()) {
+            event.rb_count = Some(
+                trace
+                    .iter()
+                    .flat_map(|p| {
+                        p.get("rb_results")
+                            .and_then(|r| r.as_array())
+                            .map(|a| a.len() as u64)
+                    })
+                    .sum(),
+            );
+        }
+
+        // Collect artifact CIDs from the receipt body if present.
+        if let Some(cid) = metadata.get("body_cid").and_then(|v| v.as_str()) {
+            event.artifact_cids.push(cid.to_string());
+        }
+
+        event
+    }
+}
+
+impl From<&UnifiedReceipt> for ReceiptEvent {
+    fn from(receipt: &UnifiedReceipt) -> Self {
+        let (pipeline_stage, input_cid, output_cid, duration_ms, fuel_used, rb_count) = receipt
+            .stages
+            .last()
+            .map(|last| {
+                let rb_count = if last.policy_trace.is_empty() {
+                    None
+                } else {
+                    Some(
+                        last.policy_trace
+                            .iter()
+                            .map(|p| p.rb_results.len() as u64)
+                            .sum(),
+                    )
+                };
+                (
+                    stage_to_wire(last.stage).to_string(),
+                    Some(last.input_cid.clone()),
+                    last.output_cid.clone(),
+                    Some(last.duration_ms),
+                    last.fuel_used,
+                    rb_count,
+                )
+            })
+            .unwrap_or_else(|| ("wf".to_string(), None, None, None, None, None));
+
+        let mut event = ReceiptEvent::new(
+            &format!("ubl.receipt.{}", pipeline_stage),
+            receipt.receipt_cid.as_str(),
+            &receipt.receipt_type,
+            &pipeline_stage,
+            receipt.to_json().unwrap_or_default(),
+        );
+        event.decision = Some(decision_to_wire(&receipt.decision).to_string());
+        event.duration_ms = duration_ms;
+        event.input_cid = input_cid;
+        event.output_cid = output_cid.or_else(|| Some(receipt.receipt_cid.as_str().to_string()));
+        event.fuel_used = fuel_used;
+        event.rb_count = rb_count;
+        event.world = Some(receipt.world.as_str().to_string());
+        event.actor = Some(receipt.did.as_str().to_string());
+        event.latency_ms = duration_ms;
+        if let Some(rt) = &receipt.rt {
+            event.binary_hash = Some(rt.binary_hash.clone());
+            event.build_meta = serde_json::to_value(&rt.build).ok();
+        }
+        event
+    }
+}
+
+fn stage_to_wire(stage: ReceiptPipelineStage) -> &'static str {
+    match stage {
+        ReceiptPipelineStage::Knock => "knock",
+        ReceiptPipelineStage::WriteAhead => "wa",
+        ReceiptPipelineStage::Check => "check",
+        ReceiptPipelineStage::Transition => "tr",
+        ReceiptPipelineStage::WriteFinished => "wf",
+    }
+}
+
+fn decision_to_wire(decision: &ReceiptDecision) -> &'static str {
+    match decision {
+        ReceiptDecision::Allow => "allow",
+        ReceiptDecision::Deny => "deny",
+        ReceiptDecision::Require => "require",
     }
 }
 
@@ -193,6 +326,7 @@ pub enum EventBusError {
 mod tests {
     use super::*;
     use serde_json::json;
+    use ubl_receipt::{PipelineStage, StageExecution, UnifiedReceipt};
 
     #[tokio::test]
     async fn event_has_universal_envelope() {
@@ -269,5 +403,69 @@ mod tests {
         assert_eq!(event.rb_count, Some(3));
         assert_eq!(event.artifact_cids.len(), 2);
         assert_eq!(event.decision.as_deref(), Some("allow"));
+    }
+
+    #[test]
+    fn from_stage_receipt_extracts_metrics() {
+        let metadata = json!({
+            "vm_state": { "fuel_used": 12345 },
+            "policy_trace": [
+                { "rb_results": [{}, {}] },
+                { "rb_results": [{}] }
+            ],
+            "body_cid": "b3:artifact"
+        });
+        let event = ReceiptEvent::from_stage_receipt(
+            "b3:tr",
+            "ubl/transition",
+            metadata,
+            "tr",
+            StageEventContext {
+                decision: None,
+                duration_ms: Some(42),
+                world: Some("a/app/t/ten".to_string()),
+                input_cid: Some("b3:wa".to_string()),
+                binary_hash: Some("b3:bin".to_string()),
+                build_meta: Some(json!({"rustc":"x"})),
+                actor: Some("did:key:zX".to_string()),
+            },
+        );
+
+        assert_eq!(event.pipeline_stage, "tr");
+        assert_eq!(event.fuel_used, Some(12345));
+        assert_eq!(event.rb_count, Some(3));
+        assert_eq!(event.artifact_cids, vec!["b3:artifact"]);
+        assert_eq!(event.input_cid.as_deref(), Some("b3:wa"));
+        assert_eq!(event.output_cid.as_deref(), Some("b3:tr"));
+    }
+
+    #[test]
+    fn from_unified_receipt_maps_last_stage() {
+        let mut receipt =
+            UnifiedReceipt::new("a/app/t/ten", "did:key:zDid", "did:key:zDid#k1", "nonce-1");
+        receipt.receipt_cid = ubl_types::Cid::new_unchecked("b3:receipt");
+        receipt.id = receipt.receipt_cid.as_str().to_string();
+        receipt.decision = ubl_receipt::Decision::Allow;
+        receipt.stages.push(StageExecution {
+            stage: PipelineStage::WriteFinished,
+            timestamp: "2026-02-17T00:00:00Z".to_string(),
+            input_cid: "b3:tr".to_string(),
+            output_cid: Some("b3:wf".to_string()),
+            fuel_used: None,
+            policy_trace: vec![],
+            vm_sig: None,
+            vm_sig_payload_cid: None,
+            auth_token: "token".to_string(),
+            duration_ms: 99,
+        });
+
+        let event: ReceiptEvent = (&receipt).into();
+        assert_eq!(event.pipeline_stage, "wf");
+        assert_eq!(event.event_type, "ubl.receipt.wf");
+        assert_eq!(event.receipt_cid, "b3:receipt");
+        assert_eq!(event.decision.as_deref(), Some("allow"));
+        assert_eq!(event.input_cid.as_deref(), Some("b3:tr"));
+        assert_eq!(event.output_cid.as_deref(), Some("b3:wf"));
+        assert_eq!(event.duration_ms, Some(99));
     }
 }

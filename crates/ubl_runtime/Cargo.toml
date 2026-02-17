@@ -31,9 +31,11 @@ ubl_types = { path = "../ubl_types" }
 ubl_canon = { path = "../ubl_canon" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 tracing = { workspace = true }
+wasmtime = "41.0.3"
 
 [dev-dependencies]
 tempfile = "3"
+wat = "1.240"
 
 [features]
 default = []

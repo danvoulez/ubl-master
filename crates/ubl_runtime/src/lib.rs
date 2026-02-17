@@ -40,10 +40,12 @@ pub use reasoning_bit::{Decision, Expression, ReasoningBit};
 pub use advisory::{Advisory, AdvisoryEngine, AdvisoryHook};
 pub use ai_passport::AiPassport;
 pub use auth::{
-    is_onboarding_type, validate_onboarding_chip, AppRegistration, AuthError, Membership,
-    PermissionContext, Revocation, Role, SessionToken, TenantCircle, UserIdentity, WorldScope,
-    ONBOARDING_TYPES,
+    is_onboarding_type, validate_onboarding_chip, AppRegistration, AuthEngine, AuthError,
+    AuthValidationError, Membership, PermissionContext, Revocation, Role, SessionToken,
+    TenantCircle, UserIdentity, WorldScope, ONBOARDING_TYPES,
 };
 pub use runtime_cert::SelfAttestation;
 pub use ubl_receipt::{PolicyTraceEntry, RbResult, WaReceiptBody, WfReceiptBody};
-pub use wasm_adapter::{AdapterRegistration, AdapterRegistry, SandboxConfig, WasmExecutor};
+pub use wasm_adapter::{
+    AdapterRegistration, AdapterRegistry, SandboxConfig, WasmExecutor, WasmtimeExecutor,
+};

@@ -71,6 +71,18 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
             Ok(s) => format!("(\"{}\")", s),
             Err(_) => format!("({} bytes, non-utf8)", payload.len()),
         },
+        Opcode::NumToDec if payload.len() == 5 => {
+            let scale = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            format!("(scale={}, rm={})", scale, payload[4])
+        }
+        Opcode::NumToRat if payload.len() == 8 => {
+            let limit = u64::from_be_bytes(payload.try_into().unwrap());
+            format!("(limit_den={})", limit)
+        }
+        Opcode::NumWithUnit | Opcode::NumAssertUnit => match std::str::from_utf8(payload) {
+            Ok(s) => format!("(\"{}\")", s),
+            Err(_) => format!("({} bytes, non-utf8)", payload.len()),
+        },
         _ if !payload.is_empty() => {
             format!("({} bytes)", payload.len())
         }

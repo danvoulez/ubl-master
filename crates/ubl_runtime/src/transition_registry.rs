@@ -14,6 +14,7 @@ use std::collections::HashMap;
 pub enum TrBytecodeProfile {
     PassV1,
     AuditV1,
+    NumericV1,
 }
 
 impl TrBytecodeProfile {
@@ -21,6 +22,7 @@ impl TrBytecodeProfile {
         match self {
             Self::PassV1 => "pass_v1",
             Self::AuditV1 => "audit_v1",
+            Self::NumericV1 => "numeric_v1",
         }
     }
 
@@ -28,6 +30,7 @@ impl TrBytecodeProfile {
         match raw.trim().to_ascii_lowercase().as_str() {
             "pass_v1" | "pass" => Some(Self::PassV1),
             "audit_v1" | "audit" => Some(Self::AuditV1),
+            "numeric_v1" | "numeric" | "num_v1" | "num" => Some(Self::NumericV1),
             _ => None,
         }
     }
@@ -124,6 +127,10 @@ impl TransitionRegistry {
             // Onboarding/security-sensitive flows use explicit audit profile.
             "ubl/app" | "ubl/user" | "ubl/tenant" | "ubl/membership" | "ubl/token"
             | "ubl/revoke" | "ubl/key.rotate" => TrBytecodeProfile::AuditV1,
+            // Money-like flows default to numeric profile.
+            "ubl/payment" | "ubl/invoice" | "ubl/settlement" | "ubl/quote" => {
+                TrBytecodeProfile::NumericV1
+            }
             _ => TrBytecodeProfile::PassV1,
         }
     }
@@ -141,6 +148,21 @@ impl TransitionRegistry {
                 code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
                 code.extend(tlv_instr(0x14, &[])); // Dup
                 code.extend(tlv_instr(0x11, &[])); // Drop
+                code.extend(tlv_instr(0x10, &[])); // EmitRc
+                code
+            }
+            TrBytecodeProfile::NumericV1 => {
+                let mut code = Vec::new();
+                code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+                code.extend(tlv_instr(0x0C, &[])); // CasGet
+                code.extend(tlv_instr(0x03, &[])); // JsonNormalize
+                code.extend(tlv_instr(0x04, &[])); // JsonValidate
+                code.extend(tlv_instr(0x13, b"amount")); // JsonGetKey("amount")
+                code.extend(tlv_instr(0x1E, &1_000_000u64.to_be_bytes())); // NumToRat(limit_den=1e6)
+                code.extend(tlv_instr(0x1D, &[0, 0, 0, 2, 0])); // NumToDec(scale=2, HALF_EVEN)
+                code.extend(tlv_instr(0x0D, &[])); // SetRcBody
+                code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+                code.extend(tlv_instr(0x0E, &[])); // AttachProof
                 code.extend(tlv_instr(0x10, &[])); // EmitRc
                 code
             }
@@ -252,6 +274,10 @@ mod tests {
             TransitionRegistry::default_profile_for("ubl/key.rotate"),
             TrBytecodeProfile::AuditV1
         );
+        assert_eq!(
+            TransitionRegistry::default_profile_for("ubl/payment"),
+            TrBytecodeProfile::NumericV1
+        );
     }
 
     #[test]
@@ -276,6 +302,22 @@ mod tests {
         let resolved = registry.resolve("ubl/document", &body).unwrap();
         assert_eq!(resolved.profile, TrBytecodeProfile::PassV1);
         assert!(resolved.source.starts_with("profile:"));
+    }
+
+    #[test]
+    fn resolve_defaults_to_numeric_profile_for_payment() {
+        let registry = TransitionRegistry::default();
+        let body = json!({"@type":"ubl/payment","amount":{"@num":"dec/1","m":"123","s":2}});
+        let resolved = registry.resolve("ubl/payment", &body).unwrap();
+        assert_eq!(resolved.profile, TrBytecodeProfile::NumericV1);
+        assert!(
+            resolved.bytecode.contains(&0x1D),
+            "NumToDec opcode expected"
+        );
+        assert!(
+            resolved.bytecode.contains(&0x1E),
+            "NumToRat opcode expected"
+        );
     }
 
     #[test]

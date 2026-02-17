@@ -5,6 +5,7 @@ pub enum Value {
     I64(i64),
     Bytes(Vec<u8>),
     Json(serde_json::Value),
+    Num(ubl_unc1::Num),
     Cid(Cid),
     Bool(bool),
     Unit,

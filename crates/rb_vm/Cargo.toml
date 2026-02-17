@@ -15,6 +15,7 @@ blake3 = "1"
 hex = "0.4"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 unicode-normalization = "0.1.25"
+ubl_unc1 = { path = "../ubl_unc1" }
 
 [features]
 default = []

@@ -132,6 +132,159 @@ pub trait WasmExecutor: Send + Sync {
     ) -> Result<WasmOutput, WasmError>;
 }
 
+const WASM_ENTRYPOINT_V1: &str = "ubl_adapter_v1";
+
+#[derive(Default)]
+pub struct WasmtimeExecutor;
+
+struct WasmtimeStoreState {
+    limits: wasmtime::StoreLimits,
+}
+
+impl WasmtimeExecutor {
+    fn engine() -> Result<wasmtime::Engine, WasmError> {
+        let mut cfg = wasmtime::Config::new();
+        cfg.consume_fuel(true);
+        wasmtime::Engine::new(&cfg).map_err(|e| WasmError::CompileError(e.to_string()))
+    }
+}
+
+impl WasmExecutor for WasmtimeExecutor {
+    fn execute(
+        &self,
+        module_bytes: &[u8],
+        input: &WasmInput,
+        sandbox: &SandboxConfig,
+    ) -> Result<WasmOutput, WasmError> {
+        if sandbox.allow_fs || sandbox.allow_network || sandbox.allow_clock {
+            return Err(WasmError::Runtime(
+                "unsafe sandbox flags are not supported for WASM adapters".to_string(),
+            ));
+        }
+
+        let engine = Self::engine()?;
+        let module = wasmtime::Module::new(&engine, module_bytes)
+            .map_err(|e| WasmError::CompileError(e.to_string()))?;
+
+        // Explicitly reject WASI imports: adapters are pure NRF-1 transforms.
+        if module.imports().any(|import| {
+            import.module() == "wasi_snapshot_preview1" || import.module().starts_with("wasi:")
+        }) {
+            return Err(WasmError::Runtime(
+                "WASI imports are not allowed in adapter modules".to_string(),
+            ));
+        }
+
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(sandbox.memory_limit)
+            .build();
+        let mut store = wasmtime::Store::new(&engine, WasmtimeStoreState { limits });
+        store.limiter(|state| &mut state.limits);
+        store
+            .set_fuel(sandbox.fuel_limit)
+            .map_err(|e| WasmError::Runtime(format!("set_fuel: {}", e)))?;
+
+        let linker = wasmtime::Linker::new(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| WasmError::Runtime(e.to_string()))?;
+
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            WasmError::InvalidOutput("module must export linear memory as `memory`".to_string())
+        })?;
+
+        let func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, WASM_ENTRYPOINT_V1)
+            .map_err(|e| WasmError::AbiMismatch {
+                expected: format!("export fn {}(i32, i32) -> i32", WASM_ENTRYPOINT_V1),
+                got: e.to_string(),
+            })?;
+
+        if input.nrf1_bytes.len() > sandbox.memory_limit {
+            return Err(WasmError::MemoryExceeded {
+                limit: sandbox.memory_limit,
+            });
+        }
+        if input.nrf1_bytes.len() > i32::MAX as usize {
+            return Err(WasmError::InvalidOutput(
+                "input too large for ABI i32 length".to_string(),
+            ));
+        }
+
+        let current_size = memory.data_size(&store);
+        let required_size = input.nrf1_bytes.len();
+        if current_size < required_size {
+            let growth_bytes = required_size - current_size;
+            let pages = growth_bytes.div_ceil(65_536);
+            memory
+                .grow(&mut store, pages as u64)
+                .map_err(|_| WasmError::MemoryExceeded {
+                    limit: sandbox.memory_limit,
+                })?;
+        }
+
+        let post_grow_size = memory.data_size(&store);
+        if post_grow_size > sandbox.memory_limit {
+            return Err(WasmError::MemoryExceeded {
+                limit: sandbox.memory_limit,
+            });
+        }
+
+        memory
+            .write(&mut store, 0, &input.nrf1_bytes)
+            .map_err(|e| WasmError::Runtime(format!("memory write: {}", e)))?;
+
+        let output_len = match func.call(&mut store, (0, input.nrf1_bytes.len() as i32)) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Ok(remaining) = store.get_fuel() {
+                    if remaining == 0 {
+                        return Err(WasmError::FuelExhausted {
+                            limit: sandbox.fuel_limit,
+                            consumed: sandbox.fuel_limit,
+                        });
+                    }
+                }
+                return Err(WasmError::Runtime(e.to_string()));
+            }
+        };
+
+        if output_len < 0 {
+            return Err(WasmError::InvalidOutput(
+                "module returned negative output length".to_string(),
+            ));
+        }
+        let output_len = output_len as usize;
+        if output_len > memory.data_size(&store) {
+            return Err(WasmError::InvalidOutput(format!(
+                "module returned output length {} beyond memory size {}",
+                output_len,
+                memory.data_size(&store)
+            )));
+        }
+
+        let mut out = vec![0u8; output_len];
+        memory
+            .read(&mut store, 0, &mut out)
+            .map_err(|e| WasmError::Runtime(format!("memory read: {}", e)))?;
+
+        ubl_ai_nrf1::nrf::decode_from_slice(&out)
+            .map_err(|e| WasmError::InvalidOutput(format!("not valid NRF-1: {}", e)))?;
+        let output_cid =
+            ubl_ai_nrf1::compute_cid(&out).map_err(|e| WasmError::InvalidOutput(e.to_string()))?;
+
+        let fuel_remaining = store.get_fuel().unwrap_or(0);
+        let fuel_consumed = sandbox.fuel_limit.saturating_sub(fuel_remaining);
+
+        Ok(WasmOutput {
+            nrf1_bytes: out,
+            output_cid,
+            effects: Vec::new(),
+            fuel_consumed,
+        })
+    }
+}
+
 /// A registered WASM adapter — a chip of type `ubl/adapter`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterRegistration {
@@ -435,5 +588,125 @@ mod tests {
         let b = sha256_hex(b"hello");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64); // 32 bytes = 64 hex chars
+    }
+
+    #[test]
+    fn wasmtime_executor_roundtrip_identity_module() {
+        let module = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1 1)
+              (func (export "ubl_adapter_v1") (param i32 i32) (result i32)
+                local.get 1))
+            "#,
+        )
+        .unwrap();
+
+        let input_json = json!({
+            "@type": "ubl/payment",
+            "amount": {"@num":"dec/1","m":"1250","s":2}
+        });
+        let input_bytes = ubl_ai_nrf1::to_nrf1_bytes(&input_json).unwrap();
+        let input = WasmInput {
+            nrf1_bytes: input_bytes.clone(),
+            chip_cid: "b3:input".into(),
+            frozen_timestamp: "2026-02-17T00:00:00Z".into(),
+            fuel_limit: 10_000,
+        };
+        let sandbox = SandboxConfig {
+            fuel_limit: 10_000,
+            ..Default::default()
+        };
+
+        let exec = WasmtimeExecutor;
+        let out = exec.execute(&module, &input, &sandbox).unwrap();
+
+        assert_eq!(out.nrf1_bytes, input_bytes);
+        assert_eq!(
+            out.output_cid,
+            ubl_ai_nrf1::compute_cid(&input_bytes).unwrap()
+        );
+        assert!(out.fuel_consumed > 0);
+    }
+
+    #[test]
+    fn wasmtime_executor_rejects_invalid_nrf_output() {
+        let module = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1 1)
+              (func (export "ubl_adapter_v1") (param i32 i32) (result i32)
+                i32.const 0
+                i32.const 0
+                i32.store8
+                i32.const 1))
+            "#,
+        )
+        .unwrap();
+        let input = WasmInput {
+            nrf1_bytes: ubl_ai_nrf1::to_nrf1_bytes(&json!({"ok":true})).unwrap(),
+            chip_cid: "b3:input".into(),
+            frozen_timestamp: "2026-02-17T00:00:00Z".into(),
+            fuel_limit: 10_000,
+        };
+        let exec = WasmtimeExecutor;
+        let err = exec
+            .execute(&module, &input, &SandboxConfig::default())
+            .unwrap_err();
+        assert!(matches!(err, WasmError::InvalidOutput(_)));
+    }
+
+    #[test]
+    fn wasmtime_executor_reports_fuel_exhaustion() {
+        let module = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1 1)
+              (func (export "ubl_adapter_v1") (param i32 i32) (result i32)
+                (loop
+                  br 0)
+                i32.const 0))
+            "#,
+        )
+        .unwrap();
+        let input = WasmInput {
+            nrf1_bytes: ubl_ai_nrf1::to_nrf1_bytes(&json!({"ok":true})).unwrap(),
+            chip_cid: "b3:input".into(),
+            frozen_timestamp: "2026-02-17T00:00:00Z".into(),
+            fuel_limit: 50,
+        };
+        let sandbox = SandboxConfig {
+            fuel_limit: 50,
+            ..Default::default()
+        };
+
+        let exec = WasmtimeExecutor;
+        let err = exec.execute(&module, &input, &sandbox).unwrap_err();
+        assert!(matches!(err, WasmError::FuelExhausted { .. }));
+    }
+
+    #[test]
+    fn wasmtime_executor_rejects_missing_entrypoint() {
+        let module = wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1 1)
+              (func (export "not_adapter") (param i32 i32) (result i32)
+                i32.const 0))
+            "#,
+        )
+        .unwrap();
+        let input = WasmInput {
+            nrf1_bytes: ubl_ai_nrf1::to_nrf1_bytes(&json!({"ok":true})).unwrap(),
+            chip_cid: "b3:input".into(),
+            frozen_timestamp: "2026-02-17T00:00:00Z".into(),
+            fuel_limit: 10_000,
+        };
+
+        let exec = WasmtimeExecutor;
+        let err = exec
+            .execute(&module, &input, &SandboxConfig::default())
+            .unwrap_err();
+        assert!(matches!(err, WasmError::AbiMismatch { .. }));
     }
 }

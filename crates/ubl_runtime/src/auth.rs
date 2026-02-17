@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 // ── Errors ──────────────────────────────────────────────────────
 
@@ -669,6 +670,250 @@ pub fn parse_onboarding_chip(body: &Value) -> Result<Option<OnboardingChip>, Aut
 pub fn validate_onboarding_chip(body: &Value) -> Result<(), AuthError> {
     let _ = parse_onboarding_chip(body)?;
     Ok(())
+}
+
+// ── Auth Engine ────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct AuthEngine;
+
+#[derive(Debug, Clone)]
+pub enum AuthValidationError {
+    InvalidChip(String),
+    DependencyMissing(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for AuthValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthValidationError::InvalidChip(s) => write!(f, "{}", s),
+            AuthValidationError::DependencyMissing(s) => write!(f, "{}", s),
+            AuthValidationError::Internal(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl std::error::Error for AuthValidationError {}
+
+impl AuthEngine {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub async fn validate_onboarding_dependencies(
+        &self,
+        onboarding: &OnboardingChip,
+        body: &Value,
+        world: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), AuthValidationError> {
+        match onboarding {
+            // App is the root — no dependencies, but slug must be unique.
+            // Requires cap.registry:init (P0.3).
+            OnboardingChip::App(app) => {
+                crate::capability::require_cap(body, "registry:init", world).map_err(|e| {
+                    AuthValidationError::InvalidChip(format!("ubl/app capability: {}", e))
+                })?;
+                let existing = store
+                    .query(&ubl_chipstore::ChipQuery {
+                        chip_type: Some("ubl/app".to_string()),
+                        tags: vec![format!("slug:{}", app.slug)],
+                        created_after: None,
+                        created_before: None,
+                        executor_did: None,
+                        limit: None,
+                        offset: None,
+                    })
+                    .await
+                    .map_err(|e| {
+                        AuthValidationError::Internal(format!("ChipStore query: {}", e))
+                    })?;
+                for chip in &existing.chips {
+                    if chip.chip_data.get("slug").and_then(|v| v.as_str())
+                        == Some(app.slug.as_str())
+                    {
+                        // Check if this app has been revoked.
+                        if !self.is_revoked(chip.cid.as_str(), store).await? {
+                            return Err(AuthValidationError::InvalidChip(format!(
+                                "App slug '{}' already registered",
+                                app.slug
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // User requires a valid app in @world.
+            // First user for an app requires cap.registry:init (P0.3).
+            OnboardingChip::User(_) => {
+                let scope = WorldScope::parse(world)
+                    .map_err(|e| AuthValidationError::InvalidChip(format!("@world: {}", e)))?;
+                self.require_app_exists(&scope.app, store).await?;
+
+                // Check if this is the first user for this app.
+                let existing_users = store
+                    .query(&ubl_chipstore::ChipQuery {
+                        chip_type: Some("ubl/user".to_string()),
+                        tags: vec![format!("app:{}", scope.app)],
+                        created_after: None,
+                        created_before: None,
+                        executor_did: None,
+                        limit: Some(1),
+                        offset: None,
+                    })
+                    .await
+                    .map_err(|e| {
+                        AuthValidationError::Internal(format!("ChipStore query: {}", e))
+                    })?;
+                let has_user_for_app = !existing_users.chips.is_empty();
+                if !has_user_for_app {
+                    crate::capability::require_cap(body, "registry:init", world).map_err(|e| {
+                        AuthValidationError::InvalidChip(format!(
+                            "first ubl/user for app '{}' requires capability: {}",
+                            scope.app, e
+                        ))
+                    })?;
+                }
+            }
+
+            // Tenant requires: app exists + creator_cid references a valid user.
+            OnboardingChip::Tenant(tenant) => {
+                let scope = WorldScope::parse(world)
+                    .map_err(|e| AuthValidationError::InvalidChip(format!("@world: {}", e)))?;
+                self.require_app_exists(&scope.app, store).await?;
+                self.require_chip_exists(&tenant.creator_cid, "ubl/user", store)
+                    .await?;
+            }
+
+            // Membership requires: user_cid and tenant_cid both exist.
+            // Requires cap.membership:grant (P0.4).
+            OnboardingChip::Membership(membership) => {
+                crate::capability::require_cap(body, "membership:grant", world).map_err(|e| {
+                    AuthValidationError::InvalidChip(format!("ubl/membership capability: {}", e))
+                })?;
+                self.require_chip_exists(&membership.user_cid, "ubl/user", store)
+                    .await?;
+                self.require_chip_exists(&membership.tenant_cid, "ubl/tenant", store)
+                    .await?;
+            }
+
+            // Token requires: user_cid exists.
+            OnboardingChip::Token(token) => {
+                self.require_chip_exists(&token.user_cid, "ubl/user", store)
+                    .await?;
+            }
+
+            // Revoke requires: target_cid exists (any type) + actor_cid exists.
+            // Requires cap.revoke:execute (P0.4).
+            OnboardingChip::Revoke(revoke) => {
+                crate::capability::require_cap(body, "revoke:execute", world).map_err(|e| {
+                    AuthValidationError::InvalidChip(format!("ubl/revoke capability: {}", e))
+                })?;
+                if !store
+                    .exists(&revoke.target_cid)
+                    .await
+                    .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?
+                {
+                    return Err(AuthValidationError::DependencyMissing(format!(
+                        "Revoke target '{}' not found",
+                        revoke.target_cid
+                    )));
+                }
+                self.require_chip_exists(&revoke.actor_cid, "ubl/user", store)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn require_app_exists(
+        &self,
+        app_slug: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), AuthValidationError> {
+        let apps = store
+            .query(&ubl_chipstore::ChipQuery {
+                chip_type: Some("ubl/app".to_string()),
+                tags: vec![format!("slug:{}", app_slug)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: None,
+                offset: None,
+            })
+            .await
+            .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?;
+
+        for chip in &apps.chips {
+            if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug) {
+                if !self.is_revoked(chip.cid.as_str(), store).await? {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(AuthValidationError::DependencyMissing(format!(
+            "App '{}' not found — register ubl/app first",
+            app_slug
+        )))
+    }
+
+    async fn require_chip_exists(
+        &self,
+        cid: &str,
+        expected_type: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<(), AuthValidationError> {
+        let chip = store
+            .get_chip(cid)
+            .await
+            .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?
+            .ok_or_else(|| {
+                AuthValidationError::DependencyMissing(format!(
+                    "{} '{}' not found",
+                    expected_type, cid
+                ))
+            })?;
+
+        if chip.chip_type != expected_type {
+            return Err(AuthValidationError::InvalidChip(format!(
+                "CID '{}' is '{}', expected '{}'",
+                cid, chip.chip_type, expected_type,
+            )));
+        }
+
+        if self.is_revoked(cid, store).await? {
+            return Err(AuthValidationError::DependencyMissing(format!(
+                "{} '{}' has been revoked",
+                expected_type, cid,
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn is_revoked(
+        &self,
+        target_cid: &str,
+        store: &Arc<ubl_chipstore::ChipStore>,
+    ) -> Result<bool, AuthValidationError> {
+        let revocations = store
+            .query(&ubl_chipstore::ChipQuery {
+                chip_type: Some("ubl/revoke".to_string()),
+                tags: vec![format!("target_cid:{}", target_cid)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: Some(1),
+                offset: None,
+            })
+            .await
+            .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?;
+
+        Ok(!revocations.chips.is_empty())
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────

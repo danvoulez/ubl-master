@@ -6,6 +6,7 @@ use crate::{
 };
 use base64::Engine;
 use serde_json::json;
+use ubl_unc1 as unc1;
 
 pub type Fuel = u64;
 
@@ -107,6 +108,20 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
 
     fn push(&mut self, v: Value) {
         self.stack.push(v);
+    }
+
+    fn pop_num_for(&mut self, op: Opcode) -> Result<unc1::Num, ExecError> {
+        match self.pop()? {
+            Value::Num(n) => Ok(n),
+            Value::I64(v) => Ok(unc1::Num::Int {
+                v: v.to_string(),
+                u: None,
+            }),
+            Value::Json(v) => {
+                serde_json::from_value::<unc1::Num>(v).map_err(|_| ExecError::TypeMismatch(op))
+            }
+            _ => Err(ExecError::TypeMismatch(op)),
+        }
     }
 
     pub fn run(&mut self, code: &[Instr<'_>]) -> Result<VmOutcome, ExecError> {
@@ -236,11 +251,18 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         Value::Json(v) => v,
                         _ => return Err(ExecError::TypeMismatch(Opcode::JsonGetKey)),
                     };
-                    let n = v
+                    let extracted = v
                         .get(key)
-                        .and_then(|x| x.as_i64())
                         .ok_or(ExecError::Deny("json_key_missing_or_not_i64".into()))?;
-                    self.push(Value::I64(n));
+                    if let Some(n) = extracted.as_i64() {
+                        self.push(Value::I64(n));
+                    } else if extracted.get("@num").is_some() {
+                        let num = serde_json::from_value::<unc1::Num>(extracted.clone())
+                            .map_err(|_| ExecError::Deny("json_key_missing_or_not_i64".into()))?;
+                        self.push(Value::Num(num));
+                    } else {
+                        return Err(ExecError::Deny("json_key_missing_or_not_i64".into()));
+                    }
                 }
                 Opcode::HashBlake3 => {
                     let bytes = match self.pop()? {
@@ -253,6 +275,8 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                 Opcode::SetRcBody => {
                     let v = match self.pop()? {
                         Value::Json(v) => v,
+                        Value::Num(n) => serde_json::to_value(n)
+                            .map_err(|_| ExecError::Deny("num_serialize_error".into()))?,
                         _ => return Err(ExecError::TypeMismatch(Opcode::SetRcBody)),
                     };
                     self.rc_body = v;
@@ -306,6 +330,102 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         false
                     };
                     self.push(Value::Bool(valid));
+                }
+                Opcode::NumFromDecimalStr => {
+                    let raw = match self.pop()? {
+                        Value::Bytes(b) => b,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::NumFromDecimalStr)),
+                    };
+                    let decimal = std::str::from_utf8(&raw)
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::NumFromDecimalStr))?;
+                    let num = unc1::from_decimal_str(decimal)
+                        .map_err(|e| ExecError::Deny(format!("num_from_decimal_str: {}", e)))?;
+                    self.push(Value::Num(num));
+                }
+                Opcode::NumFromF64Bits => {
+                    let bits_i64 = match self.pop()? {
+                        Value::I64(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::NumFromF64Bits)),
+                    };
+                    if bits_i64 < 0 {
+                        return Err(ExecError::InvalidPayload(Opcode::NumFromF64Bits));
+                    }
+                    let num = unc1::from_f64_bits(bits_i64 as u64)
+                        .map_err(|e| ExecError::Deny(format!("num_from_f64_bits: {}", e)))?;
+                    self.push(Value::Num(num));
+                }
+                Opcode::NumAdd | Opcode::NumSub | Opcode::NumMul | Opcode::NumDiv => {
+                    let b = self.pop_num_for(ins.op)?;
+                    let a = self.pop_num_for(ins.op)?;
+                    let result = match ins.op {
+                        Opcode::NumAdd => unc1::add(&a, &b),
+                        Opcode::NumSub => unc1::sub(&a, &b),
+                        Opcode::NumMul => unc1::mul(&a, &b),
+                        Opcode::NumDiv => unc1::div(&a, &b),
+                        _ => unreachable!(),
+                    }
+                    .map_err(|e| ExecError::Deny(format!("num_op_error: {}", e)))?;
+                    self.push(Value::Num(result));
+                }
+                Opcode::NumToDec => {
+                    if ins.payload.len() != 5 {
+                        return Err(ExecError::InvalidPayload(Opcode::NumToDec));
+                    }
+                    let scale = u32::from_be_bytes([
+                        ins.payload[0],
+                        ins.payload[1],
+                        ins.payload[2],
+                        ins.payload[3],
+                    ]);
+                    let rm = unc1::RoundingMode::from_u8(ins.payload[4])
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::NumToDec))?;
+                    let a = self.pop_num_for(ins.op)?;
+                    let result = unc1::to_dec(&a, scale, rm)
+                        .map_err(|e| ExecError::Deny(format!("num_to_dec: {}", e)))?;
+                    self.push(Value::Num(result));
+                }
+                Opcode::NumToRat => {
+                    if ins.payload.len() != 8 {
+                        return Err(ExecError::InvalidPayload(Opcode::NumToRat));
+                    }
+                    let limit_den = u64::from_be_bytes([
+                        ins.payload[0],
+                        ins.payload[1],
+                        ins.payload[2],
+                        ins.payload[3],
+                        ins.payload[4],
+                        ins.payload[5],
+                        ins.payload[6],
+                        ins.payload[7],
+                    ]);
+                    let a = self.pop_num_for(ins.op)?;
+                    let result = unc1::to_rat(&a, limit_den)
+                        .map_err(|e| ExecError::Deny(format!("num_to_rat: {}", e)))?;
+                    self.push(Value::Num(result));
+                }
+                Opcode::NumWithUnit => {
+                    let unit = std::str::from_utf8(ins.payload)
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::NumWithUnit))?;
+                    let a = self.pop_num_for(ins.op)?;
+                    let result = a
+                        .with_unit(unit)
+                        .map_err(|e| ExecError::Deny(format!("num_with_unit: {}", e)))?;
+                    self.push(Value::Num(result));
+                }
+                Opcode::NumAssertUnit => {
+                    let unit = std::str::from_utf8(ins.payload)
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::NumAssertUnit))?;
+                    let a = self.pop_num_for(ins.op)?;
+                    a.assert_unit(unit)
+                        .map_err(|e| ExecError::Deny(format!("num_assert_unit: {}", e)))?;
+                    self.push(Value::Num(a));
+                }
+                Opcode::NumCompare => {
+                    let b = self.pop_num_for(ins.op)?;
+                    let a = self.pop_num_for(ins.op)?;
+                    let result = unc1::compare(&a, &b)
+                        .map_err(|e| ExecError::Deny(format!("num_compare: {}", e)))?;
+                    self.push(Value::Num(result));
                 }
                 Opcode::EmitRc => {
                     if self.cfg.trace {

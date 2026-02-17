@@ -30,6 +30,20 @@ Este pacote contém:
 - 0x11 Drop
 - 0x12 PushInput
 - 0x13 JsonGetKey
+- 0x14 Dup
+- 0x15 Swap
+- 0x16 VerifySig
+- 0x17 NumFromDecimalStr
+- 0x18 NumFromF64Bits
+- 0x19 NumAdd
+- 0x1A NumSub
+- 0x1B NumMul
+- 0x1C NumDiv
+- 0x1D NumToDec
+- 0x1E NumToRat
+- 0x1F NumWithUnit
+- 0x20 NumAssertUnit
+- 0x21 NumCompare
 
 ## Próximos passos
 - Implementar executor em `crates/rb_vm`
