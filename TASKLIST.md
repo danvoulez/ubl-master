@@ -29,11 +29,12 @@
 |---|---|
 | `rb_vm` | 60 (33 exec + 8 disasm + 19 canon) |
 | `ubl_receipt` | 18 |
+| `ubl_types` | 24 |
 | `ubl_runtime` | 252 (was 250; +2 idempotent replay) |
 | `ubl_ai_nrf1` | 85 (69 unit + 16 rho_vectors) |
 | `ubl_kms` | 13 |
 | `ubl_unc1` | 33 |
-| **Total** | **461** |
+| **Total** | **485** |
 
 ---
 
@@ -83,12 +84,12 @@
 
 ---
 
-## Open — Hardening the Base (3 remaining)
+## Open — Hardening the Base (2 remaining)
 
 | # | Task | Location | Notes |
 |---|---|---|---|
 | H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_to_P1.md` | Sequence designed, not yet automated. Need: runtime_hash validation, activation_time window, break-glass. |
-| H5 | **Newtype pattern** | All crates | `String` and `Vec<u8>` used directly for CIDs, DIDs, etc. Should adopt `Cid`, `Did`, `ChipBody` newtypes. |
+| H5 | **Newtype pattern** | All crates | ✅ Done. `ubl_types` crate with `Cid`, `Did`, `Kid`, `Nonce`, `ChipType`, `World` newtypes (24 tests). Migrated `StoredChip.cid`/`receipt_cid` → `TypedCid`, `ExecutionMetadata.executor_did` → `TypedDid`, `UnifiedReceipt` fields (`world`/`did`/`kid`/`nonce`/`receipt_cid`/`prev_receipt_cid`), `PipelineReceipt.body_cid` → `TypedCid`. Serde-transparent wire compat preserved. |
 | H6 | **Parse, Don't Validate** | Pipeline + chip types | `auth.rs` does this well (`from_chip_body`). Rest of pipeline still uses raw `serde_json::Value`. Adopt progressively. |
 
 ---
