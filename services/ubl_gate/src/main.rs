@@ -13,7 +13,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
-use ubl_chipstore::{ChipStore, InMemoryBackend};
+use ubl_chipstore::{ChipStore, SledBackend};
 use ubl_runtime::advisory::AdvisoryEngine;
 use ubl_runtime::error_response::UblError;
 use ubl_runtime::event_bus::EventBus;
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize shared components
     let _event_bus = Arc::new(EventBus::new());
-    let backend = Arc::new(InMemoryBackend::new());
+    let backend = Arc::new(SledBackend::new("./data/chips")?);
     let chip_store = Arc::new(ChipStore::new(backend));
 
     let storage = InMemoryPolicyStorage::new();
@@ -50,6 +50,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "a/system/t/gate".to_string(),
     ));
     pipeline.set_advisory_engine(advisory_engine);
+
+    // Wire NDJSON audit ledger — append-only log alongside Sled CAS
+    let ledger = Arc::new(ubl_runtime::ledger::NdjsonLedger::new("./data/ledger"));
+    pipeline.set_ledger(ledger);
 
     let pipeline = Arc::new(pipeline);
 

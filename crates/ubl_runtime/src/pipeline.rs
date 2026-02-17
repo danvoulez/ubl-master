@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use ubl_chipstore::{ChipStore, ExecutionMetadata};
 use crate::advisory::AdvisoryEngine;
 use crate::idempotency::{IdempotencyKey, IdempotencyStore, CachedResult};
+use crate::ledger::{LedgerWriter, NullLedger};
 use ubl_kms::{did_from_verifying_key, kid_from_verifying_key, Ed25519SigningKey as SigningKey};
 
 /// The UBL Pipeline processor
@@ -35,6 +36,8 @@ pub struct UblPipeline {
     pub kid: String,
     /// Ed25519 signing key for receipts and JWS
     signing_key: Arc<SigningKey>,
+    /// Audit ledger — append-only log of pipeline events
+    ledger: Arc<dyn LedgerWriter>,
 }
 
 const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
@@ -185,6 +188,7 @@ impl UblPipeline {
             did,
             kid,
             signing_key: Arc::new(key),
+            ledger: Arc::new(NullLedger),
         }
     }
 
@@ -206,6 +210,7 @@ impl UblPipeline {
             did,
             kid,
             signing_key: Arc::new(key),
+            ledger: Arc::new(NullLedger),
         }
     }
 
@@ -230,7 +235,13 @@ impl UblPipeline {
             did,
             kid,
             signing_key: Arc::new(key),
+            ledger: Arc::new(NullLedger),
         }
+    }
+
+    /// Attach a LedgerWriter for audit logging.
+    pub fn set_ledger(&mut self, ledger: Arc<dyn LedgerWriter>) {
+        self.ledger = ledger;
     }
 
     /// Attach an AdvisoryEngine for LLM hook points (post-CHECK, post-WF).
@@ -468,6 +479,27 @@ impl UblPipeline {
                 metadata,
             ).await {
                 eprintln!("ChipStore persist failed (non-fatal): {}", e);
+            }
+        }
+
+        // Append to audit ledger (best-effort — never blocks pipeline)
+        {
+            let (app, tenant) = ubl_ai_nrf1::UblEnvelope::parse_world(world)
+                .map(|(a, t)| (a.to_string(), t.to_string()))
+                .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+            let entry = crate::ledger::LedgerEntry {
+                ts: chrono::Utc::now().to_rfc3339(),
+                event: crate::ledger::LedgerEvent::ReceiptCreated,
+                app,
+                tenant,
+                chip_cid: wf_receipt.body_cid.clone(),
+                receipt_cid: wf_receipt.body_cid.clone(),
+                decision: "Allow".to_string(),
+                did: Some(self.did.clone()),
+                kid: Some(self.kid.clone()),
+            };
+            if let Err(e) = self.ledger.append(&entry).await {
+                eprintln!("Ledger append failed (non-fatal): {}", e);
             }
         }
 
