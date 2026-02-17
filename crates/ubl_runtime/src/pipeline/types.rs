@@ -46,6 +46,8 @@ impl AdapterRuntimeInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ParsedChipRequest<'a> {
+    pub(super) chip_type: &'a str,
+    pub(super) chip_id: Option<&'a str>,
     pub(super) world: &'a str,
 }
 
@@ -71,7 +73,17 @@ impl<'a> ParsedChipRequest<'a> {
         ubl_ai_nrf1::UblEnvelope::validate_world(world)
             .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
 
-        Ok(Self { world })
+        let chip_id = request
+            .body
+            .get("@id")
+            .and_then(|v| v.as_str())
+            .or_else(|| request.body.get("id").and_then(|v| v.as_str()));
+
+        Ok(Self {
+            chip_type,
+            chip_id,
+            world,
+        })
     }
 }
 

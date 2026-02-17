@@ -6,15 +6,8 @@ impl UblPipeline {
         &self,
         request: &ChipRequest,
     ) -> Result<PipelineReceipt, PipelineError> {
-        // Validate @world format before freezing
-        if let Some(world) = request.body.get("@world").and_then(|v| v.as_str()) {
-            ubl_ai_nrf1::UblEnvelope::validate_world(world)
-                .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
-        } else {
-            return Err(PipelineError::InvalidChip(
-                "missing @world anchor".to_string(),
-            ));
-        }
+        // Parse and validate envelope anchors used by WA.
+        let _parsed = ParsedChipRequest::parse(request)?;
 
         // Generate nonce and check for replay
         let nonce = Self::generate_nonce();

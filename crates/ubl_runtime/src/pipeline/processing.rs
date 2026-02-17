@@ -29,13 +29,9 @@ impl UblPipeline {
     ) -> Result<PipelineResult, PipelineError> {
         let pipeline_start = std::time::Instant::now();
         let parsed_request = ParsedChipRequest::parse(&request)?;
-        let chip_id = request
-            .body
-            .get("@id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
+        let chip_id = parsed_request.chip_id.unwrap_or("-");
         info!(
-            chip_type = %request.chip_type,
+            chip_type = %parsed_request.chip_type,
             world = %parsed_request.world,
             chip_id = %chip_id,
             "pipeline request accepted"

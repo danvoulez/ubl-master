@@ -7,6 +7,7 @@ impl UblPipeline {
         request: &ChipRequest,
     ) -> Result<CheckResult, PipelineError> {
         let _check_start = std::time::Instant::now();
+        let parsed_request = ParsedChipRequest::parse(request)?;
 
         // ── Onboarding pre-check: validate body + dependency chain ──
         if crate::auth::is_onboarding_type(&request.chip_type) {
@@ -21,13 +22,7 @@ impl UblPipeline {
             })?;
 
             // 2. Validate @world format
-            let world_str = request
-                .body
-                .get("@world")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    PipelineError::InvalidChip("Onboarding chip missing @world".into())
-                })?;
+            let world_str = parsed_request.world;
 
             // 3. Check dependency chain against ChipStore
             if let Some(ref store) = self.chip_store {
@@ -52,11 +47,7 @@ impl UblPipeline {
         if request.chip_type == "ubl/key.rotate" {
             let parsed = KeyRotateRequest::parse(&request.body)
                 .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
-            let world_str = request
-                .body
-                .get("@world")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| PipelineError::InvalidChip("Key rotation missing @world".into()))?;
+            let world_str = parsed_request.world;
 
             crate::capability::require_cap(&request.body, "key:rotate", world_str).map_err(
                 |e| PipelineError::InvalidChip(format!("ubl/key.rotate capability: {}", e)),
@@ -107,11 +98,12 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("Body serialization: {}", e)))?;
 
         let mut variables = HashMap::new();
-        if let Some(chip_type) = request.body.get("@type") {
-            variables.insert("chip.@type".to_string(), chip_type.clone());
-        }
-        if let Some(chip_id) = request.body.get("@id").or_else(|| request.body.get("id")) {
-            variables.insert("chip.id".to_string(), chip_id.clone());
+        variables.insert(
+            "chip.@type".to_string(),
+            serde_json::json!(parsed_request.chip_type),
+        );
+        if let Some(chip_id) = parsed_request.chip_id {
+            variables.insert("chip.id".to_string(), serde_json::json!(chip_id));
         }
 
         let context = EvalContext {
