@@ -97,10 +97,10 @@ The four Laws remain **inviolable**. Everything else is implementation detail th
 
 | Crate | Role | Status |
 |---|---|---|
-| `ubl_ai_nrf1` | NRF-1.1 canonical encoding, CID, Universal Envelope, chip format | ✅ Working (64 tests). **Bug**: SHA2-256 with `b3:` prefix — must migrate to BLAKE3 |
+| `ubl_ai_nrf1` | NRF-1.1 canonical encoding, CID (BLAKE3), Universal Envelope, chip format | ✅ Working (85 tests) |
 | `rb_vm` | Deterministic stack VM, TLV bytecode, fuel metering | ✅ Working (33 tests, 10 Laws verified) |
-| `ubl_runtime` | Full pipeline: KNOCK→WA→CHECK→TR→WF, auth, onboarding, genesis, advisory, event bus | ✅ Working (141 tests) |
-| `ubl_receipt` | UnifiedReceipt with stage evolution, HMAC-BLAKE3 auth chain, Decision enum | ✅ Working (11 tests) |
+| `ubl_runtime` | Full pipeline: KNOCK→WA→CHECK→TR→WF, auth, onboarding, genesis, advisory, event bus | ✅ Working (290 tests + 2 guardrails) |
+| `ubl_receipt` | UnifiedReceipt with stage evolution, HMAC-BLAKE3 auth chain, Decision enum | ✅ Working (22 tests) |
 | `ubl_chipstore` | CAS storage, InMemory + Sled backends, indexing, query builder | ✅ Wired into pipeline WF stage |
 | `ubl_ledger` | `NdjsonLedger` (filesystem), `InMemoryLedger` (testing) | ✅ Working (6 tests) |
 | `ubl_did` | DID document generation, `did:cid:` resolution | ✅ Minimal but functional |
@@ -113,7 +113,7 @@ The four Laws remain **inviolable**. Everything else is implementation detail th
 
 | Module | Role |
 |---|---|
-| `pipeline.rs` | KNOCK→WA→CHECK→TR→WF orchestration, real rb_vm execution at TR |
+| `pipeline/mod.rs` + `pipeline/processing.rs` + `pipeline/stages/*` | Modular KNOCK→WA→CHECK→TR→WF orchestration, real rb_vm execution at TR |
 | `auth.rs` | 8 onboarding chip types (`ubl/app`, `ubl/user`, `ubl/tenant`, `ubl/membership`, `ubl/token`, `ubl/revoke`, `ubl/worldscope`, `ubl/role`), body validation, dependency chain enforcement (34 unit + 10 integration tests) |
 | `genesis.rs` | Bootstrap genesis chip in ChipStore at startup, idempotent, self-signed |
 | `knock.rs` | Input validation: size ≤1MB, depth ≤32, array ≤10K, no dup keys, valid UTF-8, required `@type`/`@world` (11 tests) |
@@ -225,11 +225,11 @@ Different types add fields on top (`body`, `stages`, `decision`, `error`, `trace
 
 One format. Always anchored. Always parseable by the same code. An LLM reading any UBL artifact always sees the same four fields first and immediately knows what it is, what version, and where it belongs.
 
-### 3.3 CID Migration: SHA2-256 → BLAKE3
+### 3.3 CID Contract (BLAKE3)
 
-**Current state**: `ubl_ai_nrf1::compute_cid` uses SHA2-256 multihash but returns `b3:` prefix — **this is a bug**.
+**Current state**: `ubl_ai_nrf1::compute_cid` and `rb_vm` both use BLAKE3. CID is derived from NRF bytes and encoded as `b3:<hex>`.
 
-**Fix**: Replace SHA2-256 with BLAKE3 in `compute_cid`. The `rb_vm` already uses BLAKE3 via `blake3::hash()`. After migration, one hash function everywhere.
+**Contract**: one hash function everywhere in the trust path.
 
 ```
 cid = "b3:" + hex::encode(blake3::hash(nrf1_bytes).as_bytes())
@@ -335,7 +335,7 @@ struct UnifiedReceipt {
     t: String,                        // RFC-3339 UTC
     did: String,                      // Issuer DID
     subject: Option<String>,          // Subject DID
-    kid: String,                      // Key ID: did:key:z...#vN
+    kid: String,                      // Key ID: did:key:z...#ed25519
     nonce: String,                    // Anti-replay (see §6.2)
     stages: Vec<StageExecution>,      // Append-only
     decision: Decision,               // Current decision state
@@ -475,7 +475,7 @@ Rules:
 | Decision | Value |
 |---|---|
 | DID method | `did:key:z...` Ed25519 with strict multicodec (`0xED01`) support + compat fallback |
-| Key ID format | `did:key:z...#vN` where N is monotonically increasing |
+| Key ID format | `did:key:z...#ed25519` |
 | Key rotation | New `kid` published as `ubl/key.rotate` chip; old kid valid for verification of past receipts |
 | Signing curve | Ed25519 (RFC 8032) |
 
@@ -825,22 +825,22 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 |---|---|---|---|
 | **PS1** — AI Passport | First product on the pipeline | AI Passport chip type, advisory wiring, gate endpoints | — |
 | **PS2** — Auth as Pipeline | Auth IS the pipeline — no separate auth system | `auth.rs` with 8 chip types, onboarding dependency chain, `validate_onboarding_chip` at CHECK, drift endpoints removed | 34 + 10 integration |
-| **Onboarding** | Full lifecycle | `ubl/app` → `ubl/user` → `ubl/tenant` → `ubl/membership` → `ubl/token` → `ubl/revoke`. Dependency chain enforced. `DependencyMissing` (409) error code. | 141 total (ubl_runtime) |
+| **Onboarding** | Full lifecycle | `ubl/app` → `ubl/user` → `ubl/tenant` → `ubl/membership` → `ubl/token` → `ubl/revoke`. Dependency chain enforced. `DependencyMissing` (409) error code. | Included in 290 total (`ubl_runtime`) |
 
 ### Completed — Hardening
 
 | Item | Deliverables | Tests |
 |---|---|---|
-| **H1** Signing key from env | `ubl_kms` crate, `signing_key_from_env()`, domain separation | 13 |
+| **H1** Signing key from env | `ubl_kms` crate, `signing_key_from_env()`, domain separation | 16 |
 | **H2** Real DID resolution | All placeholder DIDs replaced, `did:key:z...` derived from Ed25519 via `ubl_kms` | — |
 | **H3** `NaiveCanon` → full ρ | `RhoCanon` in `rb_vm/src/canon.rs`, NFC, BOM rejection, null stripping, key sorting, idempotent | 19 |
 | **H7** Signature domain separation | `domain::RECEIPT`, `RB_VM`, `CAPSULE`, `CHIP` in `ubl_kms` | — |
 | **H8** Rate limiting | Sliding-window per-key, `GateRateLimiter` (IP/tenant/DID), `prune()` | 13 |
-| **H9** UNC-1 core ops | `ubl_unc1` crate: add/sub/mul/div with promotion, `to_dec`, `to_rat`, `from_f64_bits`, BND intervals | 33 |
+| **H9** UNC-1 core ops | `ubl_unc1` crate: add/sub/mul/div with promotion, `to_dec`, `to_rat`, `from_f64_bits`, BND intervals | 36 |
 | **H10** Policy lockfile | `PolicyLock` with YAML parse/serialize, `pin()`, `verify()` | 11 |
 | **H11** RuntimeInfo + BuildMeta | `RuntimeInfo::capture()`, BLAKE3 binary hash, `BuildMeta`, wired into every receipt | 7 |
 | **H13** ρ test vectors | 14 JSON edge-case files in `kats/rho_vectors/`, 16 integration tests | 16 |
-| **H14** `ubl_kms` crate | `sign_canonical`, `verify_canonical`, DID/KID derivation | 13 |
+| **H14** `ubl_kms` crate | `sign_canonical`, `verify_canonical`, strict+compat DID/KID derivation | 16 |
 | **H15** Prometheus `/metrics` | Counters + histogram on gate | — |
 
 ### Completed — PR-A/B/C (Security, Observability, API Surface)
@@ -862,20 +862,21 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 
 | Crate | Tests |
 |---|---|
-| `rb_vm` | 60 |
-| `ubl_receipt` | 18 |
-| `ubl_runtime` | 250 |
+| `rb_vm` | 65 |
+| `ubl_receipt` | 22 |
+| `ubl_runtime` | 290 |
 | `ubl_ai_nrf1` | 85 |
-| `ubl_kms` | 13 |
-| `ubl_unc1` | 33 |
-| **Total** | **459** |
+| `ubl_kms` | 16 |
+| `ubl_unc1` | 36 |
+| `ubl_chipstore` | 6 |
+| `ubl_types` | 24 |
+| **Total (core crates)** | **544** |
 
-### Open — Hardening (3 remaining)
+### Open — Hardening (2 remaining)
 
 | Item | Priority | Status |
 |---|---|---|
 | **H4** P0→P1 rollout automation (see `ROLLOUT_P0_TO_P1.md`) | Medium | Designed, not automated |
-| **H5** Newtype pattern (`Cid`, `Did`, `ChipBody` newtypes) | Low | Open |
 | **H6** Parse, Don't Validate (progressive adoption beyond `auth.rs`) | Low | Open |
 
 ### Next — Protocol Horizons
@@ -896,7 +897,7 @@ The pattern is always the same: define `@type`s, write policies, maybe add a WAS
 
 | Item | Location | Severity | Status |
 |---|---|---|---|
-| SHA2-256 used instead of BLAKE3 | `ubl_ai_nrf1::compute_cid` | 🔴 Critical — CID mismatch with rb_vm | **OPEN** |
+| ~~SHA2-256 used instead of BLAKE3~~ | ~~`ubl_ai_nrf1::compute_cid`~~ | ~~🔴 Critical — CID mismatch with rb_vm~~ | ✅ Fixed — BLAKE3 unified across runtime and VM |
 | ~~Two `Decision` enums~~ | ~~`ubl_runtime` vs `ubl_receipt`~~ | ~~🟡 Confusing~~ | ✅ Fixed S2.2 — unified to `ubl_receipt::Decision` |
 | ~~TR stage is placeholder~~ | ~~`pipeline.rs`~~ | ~~🔴 Critical~~ | ✅ Fixed S2.1 — real rb_vm execution |
 | ~~Hardcoded signing key~~ | ~~`ubl_receipt::SIGNING_KEY`~~ | ~~🟡 Dev only~~ | ✅ Fixed H1/H14 — `ubl_kms`, `signing_key_from_env()` |
