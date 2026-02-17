@@ -120,7 +120,7 @@
 ### Phase M5 — Production Slice (June 28 → August 15, 2026)
 
 - ✅ `(x)` H4 automate P0→P1 rollout mechanics (`scripts/rollout_p0_p1_check.sh` + `make rollout-check`; validates runtime hash allowlist, activation window, quorum, and break-glass mode)
-- ⬜ `( )` Launch one narrow production workflow end-to-end
+- 🟨 `( )` Launch one narrow production workflow end-to-end — canary harness implemented (`scripts/production_slice_canary.sh`, `make prod-slice-canary`, `docs/ops/PRODUCTION_SLICE_CANARY.md`), pending live 30-day operation evidence
 - ⬜ `( )` Hold 30-day stability window with SLO compliance
 - ⬜ `( )` Publish “Achieved” acceptance review against gates
 
@@ -128,7 +128,7 @@
 
 ## 4) Open Feature Backlog (After Critical Path or In Parallel If Cheap)
 
-- ⬜ `( )` F3 LLM Observer narration endpoint/productization
+- ✅ `(x)` F3 LLM Observer narration endpoint/productization (`GET /v1/receipts/:cid/narrate` + optional advisory persistence + MCP tool `ubl.narrate`)
 - ⬜ `( )` F5 UNC-1 numeric opcodes in RB-VM
 - ⬜ `( )` F6 UNC-1 strict KNOCK validation path
 - ⬜ `( )` F7 UNC-1 migration flags rollout

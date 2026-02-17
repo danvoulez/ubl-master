@@ -5,19 +5,20 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ubl_chipstore::{ChipStore, SledBackend};
-use ubl_runtime::advisory::AdvisoryEngine;
+use ubl_runtime::advisory::{Advisory, AdvisoryEngine, AdvisoryHook};
 use ubl_runtime::durable_store::DurableStore;
 use ubl_runtime::error_response::{ErrorCode, UblError};
 use ubl_runtime::event_bus::EventBus;
@@ -34,6 +35,7 @@ struct AppState {
     pipeline: Arc<UblPipeline>,
     chip_store: Arc<ChipStore>,
     manifest: Arc<GateManifest>,
+    advisory_engine: Arc<AdvisoryEngine>,
 }
 
 #[tokio::main]
@@ -55,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ubl-gate/0.1".to_string(),
         "a/system/t/gate".to_string(),
     ));
-    pipeline.set_advisory_engine(advisory_engine);
+    pipeline.set_advisory_engine(advisory_engine.clone());
 
     // Wire NDJSON audit ledger — append-only log alongside Sled CAS
     let ledger = Arc::new(ubl_runtime::ledger::NdjsonLedger::new("./data/ledger"));
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline,
         chip_store,
         manifest,
+        advisory_engine,
     };
 
     let app = Router::new()
@@ -128,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
+        .route("/v1/receipts/:cid/narrate", get(narrate_receipt))
         .route(
             "/v1/passports/:cid/advisories",
             get(get_passport_advisories),
@@ -593,6 +597,120 @@ async fn get_receipt_trace(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct NarrateQuery {
+    persist: Option<bool>,
+}
+
+/// GET /v1/receipts/:cid/narrate — deterministic on-demand narration for a receipt.
+/// Optional `?persist=true` stores a `ubl/advisory` chip with hook `on_demand`.
+async fn narrate_receipt(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+    Query(query): Query<NarrateQuery>,
+) -> (StatusCode, Json<Value>) {
+    let chip = match state.chip_store.get_chip_by_receipt_cid(&cid).await {
+        Ok(Some(chip)) => chip,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "@type": "ubl/error",
+                    "code": "NOT_FOUND",
+                    "message": format!("Receipt {} not found", cid)
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type": "ubl/error",
+                    "code": "INTERNAL_ERROR",
+                    "message": e.to_string()
+                })),
+            );
+        }
+    };
+
+    let world = chip
+        .chip_data
+        .get("@world")
+        .and_then(|v| v.as_str())
+        .unwrap_or("a/system/t/unknown");
+    let policy_count = chip.execution_metadata.policies_applied.len();
+    let latency_ms = chip.execution_metadata.execution_time_ms;
+    let fuel = chip.execution_metadata.fuel_consumed;
+    let decision = "allow";
+
+    let summary = format!(
+        "{} processed as {} in {}ms (fuel {}, policies {}).",
+        chip.chip_type, decision, latency_ms, fuel, policy_count
+    );
+    let narration = json!({
+        "@type": "ubl/advisory.narration",
+        "receipt_cid": cid,
+        "chip_cid": chip.cid,
+        "chip_type": chip.chip_type,
+        "decision": decision,
+        "world": world,
+        "policy_count": policy_count,
+        "latency_ms": latency_ms,
+        "fuel_consumed": fuel,
+        "summary": summary,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let mut persisted_advisory_cid: Option<String> = None;
+    if query.persist.unwrap_or(false) {
+        let adv = Advisory::new(
+            state.advisory_engine.passport_cid.clone(),
+            "narrate".to_string(),
+            cid.clone(),
+            narration.clone(),
+            90,
+            state.advisory_engine.model.clone(),
+            AdvisoryHook::OnDemand,
+        );
+        let body = state.advisory_engine.advisory_to_chip_body(&adv);
+        let metadata = ubl_chipstore::ExecutionMetadata {
+            runtime_version: "advisory/on-demand".to_string(),
+            execution_time_ms: 0,
+            fuel_consumed: 0,
+            policies_applied: vec![],
+            executor_did: chip.execution_metadata.executor_did.clone(),
+            reproducible: true,
+        };
+        match state
+            .chip_store
+            .store_executed_chip(body, cid.clone(), metadata)
+            .await
+        {
+            Ok(adv_cid) => persisted_advisory_cid = Some(adv_cid),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "@type":"ubl/error",
+                        "code":"INTERNAL_ERROR",
+                        "message": format!("narration persist failed: {}", e),
+                    })),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type":"ubl/advisory.narration.response",
+            "receipt_cid": cid,
+            "narration": narration,
+            "persisted_advisory_cid": persisted_advisory_cid,
+        })),
+    )
+}
+
 // ── Manifest endpoints (P2.8 + P2.9) ──
 
 /// GET /openapi.json — OpenAPI 3.1 specification.
@@ -616,6 +734,7 @@ async fn webmcp_manifest(State(state): State<AppState>) -> Json<Value> {
 /// - ubl.deliver → process_raw
 /// - ubl.query → ChipStore get
 /// - ubl.verify → CID recomputation
+/// - ubl.narrate → receipt narration
 /// - registry.listTypes → manifest chip types
 async fn mcp_rpc(
     State(state): State<AppState>,
@@ -768,6 +887,121 @@ async fn dispatch_tool_call(
                     })),
                 ),
             }
+        }
+
+        "ubl.narrate" => {
+            let receipt_cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            let persist = arguments
+                .get("persist")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if receipt_cid.is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32602, "message": "missing required argument: cid" }
+                    })),
+                );
+            }
+
+            let chip = match state.chip_store.get_chip_by_receipt_cid(receipt_cid).await {
+                Ok(Some(chip)) => chip,
+                Ok(None) => {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32004, "message": format!("Receipt {} not found", receipt_cid) }
+                        })),
+                    );
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": -32603, "message": e.to_string() }
+                        })),
+                    );
+                }
+            };
+
+            let world = chip
+                .chip_data
+                .get("@world")
+                .and_then(|v| v.as_str())
+                .unwrap_or("a/system/t/unknown");
+            let policy_count = chip.execution_metadata.policies_applied.len();
+            let latency_ms = chip.execution_metadata.execution_time_ms;
+            let fuel = chip.execution_metadata.fuel_consumed;
+            let summary = format!(
+                "{} processed as allow in {}ms (fuel {}, policies {}).",
+                chip.chip_type, latency_ms, fuel, policy_count
+            );
+            let narration = json!({
+                "@type": "ubl/advisory.narration",
+                "receipt_cid": receipt_cid,
+                "chip_cid": chip.cid,
+                "chip_type": chip.chip_type,
+                "decision": "allow",
+                "world": world,
+                "policy_count": policy_count,
+                "latency_ms": latency_ms,
+                "fuel_consumed": fuel,
+                "summary": summary,
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+            });
+
+            let mut persisted_advisory_cid: Option<String> = None;
+            if persist {
+                let adv = Advisory::new(
+                    state.advisory_engine.passport_cid.clone(),
+                    "narrate".to_string(),
+                    receipt_cid.to_string(),
+                    narration.clone(),
+                    90,
+                    state.advisory_engine.model.clone(),
+                    AdvisoryHook::OnDemand,
+                );
+                let body = state.advisory_engine.advisory_to_chip_body(&adv);
+                let metadata = ubl_chipstore::ExecutionMetadata {
+                    runtime_version: "advisory/on-demand".to_string(),
+                    execution_time_ms: 0,
+                    fuel_consumed: 0,
+                    policies_applied: vec![],
+                    executor_did: chip.execution_metadata.executor_did.clone(),
+                    reproducible: true,
+                };
+                match state
+                    .chip_store
+                    .store_executed_chip(body, receipt_cid.to_string(), metadata)
+                    .await
+                {
+                    Ok(adv_cid) => persisted_advisory_cid = Some(adv_cid),
+                    Err(e) => {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32603, "message": format!("narration persist failed: {}", e) }
+                            })),
+                        );
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                        "receipt_cid": receipt_cid,
+                        "narration": narration,
+                        "persisted_advisory_cid": persisted_advisory_cid,
+                    })).unwrap_or_default() }] }
+                })),
+            )
         }
 
         "registry.listTypes" => {

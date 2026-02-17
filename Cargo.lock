@@ -2551,6 +2551,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "once_cell",
  "prometheus",
  "serde",

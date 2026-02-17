@@ -352,6 +352,31 @@ impl GateManifest {
             }),
         );
 
+        // GET /v1/receipts/{cid}/narrate
+        paths.insert(
+            "/v1/receipts/{cid}/narrate".into(),
+            json!({
+                "get": {
+                    "operationId": "narrateReceipt",
+                    "summary": "Generate deterministic on-demand narration for a receipt",
+                    "parameters": [
+                        {
+                            "name": "cid", "in": "path", "required": true,
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "persist", "in": "query", "required": false,
+                            "schema": { "type": "boolean" }
+                        }
+                    ],
+                    "responses": {
+                        "200": { "description": "Narration response" },
+                        "404": { "description": "Receipt not found" }
+                    }
+                }
+            }),
+        );
+
         json!({
             "openapi": "3.1.0",
             "info": {
@@ -423,6 +448,20 @@ impl GateManifest {
             }
         }));
 
+        // ubl.narrate — deterministic receipt narration
+        tools.push(json!({
+            "name": "ubl.narrate",
+            "description": "Generate deterministic narration for a receipt CID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cid": { "type": "string", "description": "Receipt CID" },
+                    "persist": { "type": "boolean", "description": "Persist narration advisory chip" }
+                },
+                "required": ["cid"]
+            }
+        }));
+
         json!({
             "name": "ubl-gate",
             "version": self.version,
@@ -469,6 +508,12 @@ impl GateManifest {
                     "method": "GET",
                     "path": "/v1/receipts/{cid}/trace",
                     "description": "Get receipt policy trace"
+                },
+                {
+                    "name": "ubl.narrate",
+                    "method": "GET",
+                    "path": "/v1/receipts/{cid}/narrate",
+                    "description": "Generate deterministic receipt narration"
                 }
             ],
             "resources": [
@@ -597,6 +642,7 @@ mod tests {
         assert!(paths.contains_key("/v1/chips/{cid}/verify"));
         assert!(paths.contains_key("/v1/runtime/attestation"));
         assert!(paths.contains_key("/v1/receipts/{cid}/trace"));
+        assert!(paths.contains_key("/v1/receipts/{cid}/narrate"));
     }
 
     #[test]
@@ -654,6 +700,7 @@ mod tests {
         assert!(tool_names.contains(&"ubl.query"));
         assert!(tool_names.contains(&"ubl.verify"));
         assert!(tool_names.contains(&"registry.listTypes"));
+        assert!(tool_names.contains(&"ubl.narrate"));
     }
 
     #[test]

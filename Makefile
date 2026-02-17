@@ -1,4 +1,4 @@
-.PHONY: all build test fmt lint kat gate clean check load-validate rollout-check
+.PHONY: all build test fmt lint kat gate clean check load-validate rollout-check prod-slice-canary
 
 all: build
 
@@ -33,6 +33,12 @@ rollout-check:
 		--runtime-hash "$${RUNTIME_HASH:?set RUNTIME_HASH}" \
 		--allow-placeholder-signatures \
 		--report-file ./data/rollout_report.json
+
+prod-slice-canary:
+	bash scripts/production_slice_canary.sh \
+		--base-url "$${BASE_URL:-http://127.0.0.1:4000}" \
+		--iterations "$${ITERATIONS:-20}" \
+		--report-file ./data/production_slice_report.json
 
 clean:
 	cargo clean

@@ -152,7 +152,7 @@ This section is additive and does not remove any existing items above. It is the
 |---|---|---|---|
 | F1 | **PS3 — Runtime certification** | ✅ Done | `RuntimeInfo` extended with `runtime_hash` + `certs`, signed `SelfAttestation` (`ubl_runtime::runtime_cert`) verifies against DID key, runtime metadata attached to receipts, and gate endpoint `GET /v1/runtime/attestation` exposed in OpenAPI. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
 | F2 | **PS4 — Structured tracing** | Medium | Replace `eprintln!` with `tracing` crate. Structured spans per pipeline stage. Metrics: chips/sec, fuel/chip, deny rate, p99 latency. |
-| F3 | **PS5 — LLM Observer narration** | Low | LLM Observer narrates receipt chains on demand. Already has event bus hooks — needs formatting and endpoint. |
+| F3 | **PS5 — LLM Observer narration** | ✅ Done | Added deterministic on-demand narration endpoint `GET /v1/receipts/:cid/narrate` (optional `persist=true` stores `ubl/advisory` with hook `on_demand`) and MCP tool `ubl.narrate`. |
 | F4 | **Property-based testing** | Low | Add proptest for canon edge cases (Unicode, ordering, decimal, null-stripping). |
 | F5 | **UNC-1 numeric opcodes** | Medium | `num.add`, `num.mul`, `num.to_dec`, `num.from_f64_bits`, `num.compare`, etc. for rb_vm. Depends on H9 (UNC-1 core ops). Byte assignments 0x17+ available. See `docs/vm/opcodes_num.md`. |
 | F6 | **UNC-1 KNOCK validation** | Medium | Reject raw `float`, `NaN/Inf`, malformed `@num` objects at KNOCK stage. Add `normalize_numbers_to_unc1(json)` step in `chip_format.rs` before `to_nrf1_bytes`. |
