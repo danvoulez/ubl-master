@@ -561,7 +561,7 @@ impl UblPipeline {
         // ── Cache result for idempotency ──
         if let Some(key) = idem_key {
             self.idempotency_store.put(key, CachedResult {
-                receipt_cid: result.receipt.receipt_cid.clone(),
+                receipt_cid: result.receipt.receipt_cid.as_str().to_string(),
                 response_json: result.receipt.to_json().unwrap_or_default(),
                 decision: format!("{:?}", result.decision),
                 chain: result.chain.clone(),
@@ -1569,12 +1569,12 @@ mod tests {
         assert!(r.has_stage(PipelineStage::WriteFinished));
 
         // Receipt CID must be set
-        assert!(r.receipt_cid.starts_with("b3:"), "receipt_cid must be BLAKE3");
-        assert_eq!(r.id, r.receipt_cid, "@id must equal receipt_cid");
+        assert!(r.receipt_cid.as_str().starts_with("b3:"), "receipt_cid must be BLAKE3");
+        assert_eq!(r.id, r.receipt_cid.as_str(), "@id must equal receipt_cid");
 
         // Envelope anchors
         assert_eq!(r.receipt_type, "ubl/receipt");
-        assert_eq!(r.world, "a/app/t/ten");
+        assert_eq!(r.world.as_str(), "a/app/t/ten");
         assert_eq!(r.ver, "1.0");
 
         // Auth tokens present on every stage
@@ -2207,7 +2207,7 @@ mod tests {
         // First submission — fresh execution
         let r1 = submit_allow(&pipeline, "ubl/document", body.clone()).await;
         assert!(!r1.replayed, "first submission should not be replayed");
-        assert!(!r1.receipt.receipt_cid.is_empty());
+        assert!(!r1.receipt.receipt_cid.as_str().is_empty());
 
         // Second submission — same (@type, @ver, @world, @id) → cached replay
         let r2 = submit_allow(&pipeline, "ubl/document", body.clone()).await;

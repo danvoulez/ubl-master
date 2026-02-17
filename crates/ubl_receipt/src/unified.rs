@@ -10,6 +10,7 @@
 use crate::pipeline_types::{Decision, PolicyTraceEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use ubl_types::{Cid as TypedCid, Did as TypedDid, Kid as TypedKid, Nonce as TypedNonce, World as TypedWorld};
 
 /// Pipeline stages in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,21 +165,21 @@ pub struct UnifiedReceipt {
     pub ver: String,
     /// World scope
     #[serde(rename = "@world")]
-    pub world: String,
+    pub world: TypedWorld,
 
     /// Schema version number
     pub v: u32,
     /// Creation timestamp (RFC-3339 UTC)
     pub t: String,
     /// Issuer DID
-    pub did: String,
+    pub did: TypedDid,
     /// Subject DID (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// Key ID
-    pub kid: String,
+    pub kid: TypedKid,
     /// Anti-replay nonce
-    pub nonce: String,
+    pub nonce: TypedNonce,
 
     /// Append-only stage executions
     pub stages: Vec<StageExecution>,
@@ -189,9 +190,9 @@ pub struct UnifiedReceipt {
 
     /// Chain linkage to previous receipt
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_receipt_cid: Option<String>,
+    pub prev_receipt_cid: Option<TypedCid>,
     /// Current receipt CID (recomputed after each stage)
-    pub receipt_cid: String,
+    pub receipt_cid: TypedCid,
     /// Ed25519 JWS detached signature (empty until finalized)
     pub sig: String,
 
@@ -216,18 +217,18 @@ impl UnifiedReceipt {
             receipt_type: "ubl/receipt".to_string(),
             id: String::new(), // Set after first CID computation
             ver: "1.0".to_string(),
-            world: world.to_string(),
+            world: TypedWorld::new_unchecked(world),
             v: 1,
             t,
-            did: did.to_string(),
+            did: TypedDid::new_unchecked(did),
             subject: None,
-            kid: kid.to_string(),
-            nonce: nonce.to_string(),
+            kid: TypedKid::new_unchecked(kid),
+            nonce: TypedNonce::new_unchecked(nonce),
             stages: Vec::new(),
             decision: Decision::Allow, // Optimistic — changes on DENY
             effects: serde_json::Value::Object(serde_json::Map::new()),
             prev_receipt_cid: None,
-            receipt_cid: String::new(),
+            receipt_cid: TypedCid::new_unchecked(""),
             sig: String::new(),
             rt: None,
         }
@@ -242,10 +243,10 @@ impl UnifiedReceipt {
     /// Append a stage execution and recompute the receipt CID.
     pub fn append_stage(&mut self, mut stage: StageExecution) -> Result<(), ReceiptError> {
         // Compute auth token: HMAC-BLAKE3(secret, prev_cid || stage_name)
-        let prev_cid = if self.receipt_cid.is_empty() {
+        let prev_cid = if self.receipt_cid.as_str().is_empty() {
             "genesis"
         } else {
-            &self.receipt_cid
+            self.receipt_cid.as_str()
         };
         stage.auth_token = compute_auth_token(prev_cid, stage.stage.as_str());
 
@@ -255,7 +256,7 @@ impl UnifiedReceipt {
         self.recompute_cid()?;
 
         // Update @id to match current CID
-        self.id = self.receipt_cid.clone();
+        self.id = self.receipt_cid.as_str().to_string();
 
         Ok(())
     }
@@ -264,7 +265,7 @@ impl UnifiedReceipt {
     fn recompute_cid(&mut self) -> Result<(), ReceiptError> {
         // Temporarily clear sig and receipt_cid for canonical hashing
         let saved_sig = std::mem::take(&mut self.sig);
-        let saved_cid = std::mem::take(&mut self.receipt_cid);
+        let saved_cid = std::mem::replace(&mut self.receipt_cid, TypedCid::new_unchecked(""));
         let saved_id = std::mem::take(&mut self.id);
 
         let json = serde_json::to_value(&*self)
@@ -276,8 +277,8 @@ impl UnifiedReceipt {
 
         // Restore
         self.sig = saved_sig;
-        self.receipt_cid = new_cid;
-        self.id = self.receipt_cid.clone();
+        self.receipt_cid = TypedCid::new_unchecked(&new_cid);
+        self.id = self.receipt_cid.as_str().to_string();
 
         // Suppress unused warning — saved_cid and saved_id are intentionally dropped
         let _ = saved_cid;
@@ -430,18 +431,18 @@ mod tests {
         let r = make_receipt();
         assert_eq!(r.receipt_type, "ubl/receipt");
         assert_eq!(r.ver, "1.0");
-        assert_eq!(r.world, "a/acme/t/prod");
+        assert_eq!(r.world.as_str(), "a/acme/t/prod");
         assert_eq!(r.v, 1);
     }
 
     #[test]
     fn append_stage_computes_cid() {
         let mut r = make_receipt();
-        assert!(r.receipt_cid.is_empty());
+        assert!(r.receipt_cid.as_str().is_empty());
 
         r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:input-wa")).unwrap();
-        assert!(r.receipt_cid.starts_with("b3:"), "CID must be BLAKE3");
-        assert_eq!(r.id, r.receipt_cid, "@id must match receipt_cid");
+        assert!(r.receipt_cid.as_str().starts_with("b3:"), "CID must be BLAKE3");
+        assert_eq!(r.id, r.receipt_cid.as_str(), "@id must match receipt_cid");
     }
 
     #[test]
