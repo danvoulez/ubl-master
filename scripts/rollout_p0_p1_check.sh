@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-P0_FILE="P0_genesis_policy.json"
-P1_FILE="P1_policy_update.json"
+P0_FILE="P0_GENESIS_POLICY.json"
+P1_FILE="P1_POLICY_UPDATE.json"
 RUNTIME_HASH=""
 EXPECTED_PARENT_CID=""
 MIN_LEAD_SECONDS=300
@@ -18,8 +18,8 @@ Usage:
   scripts/rollout_p0_p1_check.sh [options]
 
 Options:
-  --p0 <file>                         P0 policy file (default: P0_genesis_policy.json)
-  --p1 <file>                         P1 update file (default: P1_policy_update.json)
+  --p0 <file>                         P0 policy file (default: P0_GENESIS_POLICY.json)
+  --p1 <file>                         P1 update file (default: P1_POLICY_UPDATE.json)
   --runtime-hash <sha256:...>         Runtime hash to validate against P0 allowlist (required)
   --expected-parent-cid <b3:...>      Optional expected P1 parent CID
   --min-lead-seconds <n>              Minimum activation lead time in seconds (default: 300)

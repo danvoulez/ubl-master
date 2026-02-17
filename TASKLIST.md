@@ -3,6 +3,7 @@
 **Status**: Single source of truth for all work — done, in progress, and planned
 **Date**: February 17, 2026
 **Spec**: [ARCHITECTURE.md](./ARCHITECTURE.md) — engineering source of truth
+**Docs Index**: [docs/INDEX.md](./docs/INDEX.md)
 
 ---
 
@@ -21,7 +22,7 @@
 - [x] **PS2 — Auth as Pipeline**: `auth.rs` with 8 onboarding chip types, body validation via `from_chip_body`, dependency chain enforcement at CHECK, drift endpoints removed (34 unit + 10 integration tests)
 - [x] **Onboarding**: Full lifecycle `ubl/app` → `ubl/user` → `ubl/tenant` → `ubl/membership` → `ubl/token` → `ubl/revoke` + `ubl/worldscope` + `ubl/role`. Dependency chain enforced. `DependencyMissing` (409) error code. 141 total tests in `ubl_runtime`.
 - [x] **ARCHITECTURE.md rev 2**: Added §0 Protocol Stack (8-layer table), updated §1 evolution table, rewrote §2 crate map, removed BLOCKERs from §5.2/§5.3, rewrote §16 as Build History & Roadmap with Protocol Horizons, updated §17 tech debt
-- [x] **Policy documents**: `P0_genesis_policy.json`, `P1_policy_update.json`, `ROLLOUT_P0_to_P1.md`
+- [x] **Policy documents**: `P0_GENESIS_POLICY.json`, `P1_POLICY_UPDATE.json`, `ROLLOUT_P0_TO_P1.md`
 
 ### Test Counts (current — post wiring session)
 
@@ -140,7 +141,7 @@ This section is additive and does not remove any existing items above. It is the
 
 | # | Task | Location | Notes |
 |---|---|---|---|
-| H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_to_P1.md` | ✅ Done. Added `scripts/rollout_p0_p1_check.sh` + `make rollout-check` preflight with runtime hash allowlist validation, activation_time lead-window checks, signature quorum checks, core type coverage checks, and explicit break-glass mode/reporting (`docs/ops/ROLLOUT_AUTOMATION.md`). |
+| H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_TO_P1.md` | ✅ Done. Added `scripts/rollout_p0_p1_check.sh` + `make rollout-check` preflight with runtime hash allowlist validation, activation_time lead-window checks, signature quorum checks, core type coverage checks, and explicit break-glass mode/reporting (`docs/ops/ROLLOUT_AUTOMATION.md`). |
 | H5 | **Newtype pattern** | All crates | ✅ Done. `ubl_types` crate with `Cid`, `Did`, `Kid`, `Nonce`, `ChipType`, `World` newtypes (24 tests). Migrated `StoredChip.cid`/`receipt_cid` → `TypedCid`, `ExecutionMetadata.executor_did` → `TypedDid`, `UnifiedReceipt` fields (`world`/`did`/`kid`/`nonce`/`receipt_cid`/`prev_receipt_cid`), `PipelineReceipt.body_cid` → `TypedCid`. Serde-transparent wire compat preserved. |
 | H6 | **Parse, Don't Validate** | Pipeline + chip types | `auth.rs` does this well (`from_chip_body`). Rest of pipeline still uses raw `serde_json::Value`. Adopt progressively. |
 
@@ -154,9 +155,9 @@ This section is additive and does not remove any existing items above. It is the
 | F2 | **PS4 — Structured tracing** | Medium | Replace `eprintln!` with `tracing` crate. Structured spans per pipeline stage. Metrics: chips/sec, fuel/chip, deny rate, p99 latency. |
 | F3 | **PS5 — LLM Observer narration** | ✅ Done | Added deterministic on-demand narration endpoint `GET /v1/receipts/:cid/narrate` (optional `persist=true` stores `ubl/advisory` with hook `on_demand`) and MCP tool `ubl.narrate`. |
 | F4 | **Property-based testing** | Low | Add proptest for canon edge cases (Unicode, ordering, decimal, null-stripping). |
-| F5 | **UNC-1 numeric opcodes** | Medium | `num.add`, `num.mul`, `num.to_dec`, `num.from_f64_bits`, `num.compare`, etc. for rb_vm. Depends on H9 (UNC-1 core ops). Byte assignments 0x17+ available. See `docs/vm/opcodes_num.md`. |
+| F5 | **UNC-1 numeric opcodes** | Medium | `num.add`, `num.mul`, `num.to_dec`, `num.from_f64_bits`, `num.compare`, etc. for rb_vm. Depends on H9 (UNC-1 core ops). Byte assignments 0x17+ available. See `docs/vm/OPCODES_NUM.md`. |
 | F6 | **UNC-1 KNOCK validation** | Medium | Reject raw `float`, `NaN/Inf`, malformed `@num` objects at KNOCK stage. Add `normalize_numbers_to_unc1(json)` step in `chip_format.rs` before `to_nrf1_bytes`. |
-| F7 | **UNC-1 migration flags** | Low | Gate flags `REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd\|reject`. Compat phase first, then enforce. See `docs/migration/unc1_migration.md`. |
+| F7 | **UNC-1 migration flags** | Low | Gate flags `REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd\|reject`. Compat phase first, then enforce. See `docs/migration/UNC1_MIGRATION.md`. |
 | F9 | **Key rotation as chip** | ✅ Done | `ubl/key.rotate` implemented with typed payload validation, mandatory `key:rotate` capability check, deterministic Ed25519 material derivation during TR, and persisted `ubl/key.map` old→new mapping in ChipStore. Includes replay-safe flow tests. |
 | F10 | **CAS backends for ChipStore** | Low | Add `CasBackend` trait with `Fs(PathBuf)` and `S3 { bucket, prefix }` variants alongside existing in-memory + sled. Pattern from `ubl-ultimate-main/services/registry-api/src/cas.rs`. |
 | F13 | **Post-quantum signature stubs** | Low | Feature-gated `pq_mldsa3` module for ML-DSA3 (Dilithium3) dual-signing alongside Ed25519. Stub now, real when NIST PQC libraries stabilize. |
@@ -173,7 +174,7 @@ New chip types: `ubl/payment`, `ubl/invoice`, `ubl/settlement`, `ubl/escrow`. Tr
 
 ### Media Protocol (VCX-Core)
 
-Video as content-addressed hash-graph of 64×64 tiles. Editing = manifest rewrite (zero recompression). Certified Runtime as deterministic video editor. LLMs curate by reading NRF-1 manifests, not decoding pixels. Full spec in `VCX-Core`. See also `Addendum_Certified_Runtime.md`.
+Video as content-addressed hash-graph of 64×64 tiles. Editing = manifest rewrite (zero recompression). Certified Runtime as deterministic video editor. LLMs curate by reading NRF-1 manifests, not decoding pixels. Full spec in `VCX-Core`. See also `ADDENDUM_CERTIFIED_RUNTIME.md`.
 
 ### Document Protocol
 
@@ -204,28 +205,33 @@ JSON-RPC over WebSocket server exposing UBL tools to LLMs and external integrati
 
 ---
 
-## Reference Documents (root)
+## Reference Documents
 
 | File | Purpose | Status |
 |---|---|---|
-| `ARCHITECTURE.md` | Engineering spec + protocol stack (source of truth) | ✅ Current (rev 2) |
+| `ARCHITECTURE.md` | Engineering spec + protocol stack (source of truth) | ✅ Current (rev 3) |
 | `TASKLIST.md` | This file — unified task tracking | ✅ Current |
-| `README.md` | Repo README and quick start | Needs update |
-| `ROLLOUT_P0_to_P1.md` | Bootstrap sequence P0→P1 | ✅ Valid (not yet automated) |
-| `Addendum_Certified_Runtime.md` | Certified Runtime roles and RACI | ✅ Valid reference |
-| `Manifesto_de_Reinvencao_BIG.md` | Reinvention manifesto (PT) — axioms, threats, architecture | ✅ Valid reference |
-| `Checklist_Operacional_Reinvencao_BIG.md` | Operational checklist (PT) — decision framework, compliance | ✅ Valid reference |
-| `Checklist_PATCH_Runtime.md` | Runtime requirements (PT) — 7 items, most implemented | ✅ Valid reference |
-| `ROADMAP_DECADE.md` | Long-term vision (speculative) | Needs revision to match 8-layer stack |
+| `README.md` | Repo README and quick start | ✅ Updated |
+| `docs/INDEX.md` | Documentation entrypoint and ownership map | ✅ New canonical index |
+| `docs/STANDARDS.md` | Documentation standards and metadata policy | ✅ New |
+| `ROLLOUT_P0_TO_P1.md` | Bootstrap sequence P0→P1 | ✅ Valid + automated checks |
+| `ADDENDUM_CERTIFIED_RUNTIME.md` | Certified Runtime roles and RACI | ✅ Valid reference |
+| `docs/reference/API.md` | API and MCP endpoints | ✅ New |
+| `docs/reference/CONFIG.md` | Environment/config reference | ✅ New |
+| `docs/reference/ERRORS.md` | Canonical error taxonomy | ✅ New |
+| `docs/security/CRYPTO_TRUST_MODEL.md` | Signature/verification trust model | ✅ New |
+| `docs/lifecycle/RELEASE_READINESS.md` | Release gate checklist and evidence | ✅ New |
+| `docs/changelog/CHANGELOG.md` | Documentation and release change log | ✅ New |
+| `docs/archive/2026-02/` | Archived superseded docs | ✅ Historical only |
 | `VCX-Core` | VCX-Core living spec — media protocol | ✅ Valid (deferred) |
-| `P0_genesis_policy.json` | Genesis policy | ✅ Valid |
-| `P1_policy_update.json` | First policy update | ✅ Valid |
+| `P0_GENESIS_POLICY.json` | Genesis policy | ✅ Valid |
+| `P1_POLICY_UPDATE.json` | First policy update | ✅ Valid |
 | `UNC-1.md` | UNC-1 Numeric Canon spec (INT/DEC/RAT/BND + units) | ✅ New |
 | `schemas/unc-1.schema.json` | JSON Schema for UNC-1 numeric atoms | ✅ New |
 | `kats/unc1/unc1_kats.v1.json` | Known Answer Tests for UNC-1 | ✅ New |
-| `docs/reference/numerics.md` | UNC-1 reference guide | ✅ New |
-| `docs/vm/opcodes_num.md` | UNC-1 opcode spec for RB-VM | ✅ New |
-| `docs/migration/unc1_migration.md` | UNC-1 migration phases and flags | ✅ New |
+| `docs/reference/NUMERICS.md` | UNC-1 reference guide | ✅ New |
+| `docs/vm/OPCODES_NUM.md` | UNC-1 opcode spec for RB-VM | ✅ New |
+| `docs/migration/UNC1_MIGRATION.md` | UNC-1 migration phases and flags | ✅ New |
 
 ---
 

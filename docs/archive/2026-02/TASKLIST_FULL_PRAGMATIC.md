@@ -35,7 +35,7 @@
 - ✅ `(x)` PS2 Auth as Pipeline
 - ✅ `(x)` Full onboarding chain (`ubl/app` → `ubl/revoke` + scopes/roles)
 - ✅ `(x)` ARCHITECTURE rev2 alignment
-- ✅ `(x)` Policy docs (`P0_genesis_policy.json`, `P1_policy_update.json`, rollout doc)
+- ✅ `(x)` Policy docs (`P0_GENESIS_POLICY.json`, `P1_POLICY_UPDATE.json`, rollout doc)
 
 ### Resolved Critical IDs
 

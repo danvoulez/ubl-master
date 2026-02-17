@@ -1,7 +1,9 @@
 # UBL MASTER — Architecture & Engineering Specification
 
-**Status**: Living document — engineering source of truth
-**Date**: February 16, 2026 (rev 2)
+**Status**: Active normative architecture document
+**Date**: February 17, 2026 (rev 3)
+**Implementation status source**: `TASKLIST.md`
+**Documentation index**: `docs/INDEX.md`
 
 > **Universal Business Leverage** leverages the best of determinism with the best of the stochasticism of LLMs — both comfortable and at maximum potential, with limits expressed by clear rules.
 
@@ -132,7 +134,7 @@ POST /v1/chips → KNOCK (validate) → WA (seal intent) → CHECK (policy + onb
 
 **Working**: Full 5-stage pipeline with real rb_vm execution. Chips stored in ChipStore. UnifiedReceipt evolves through stages. Genesis bootstrap at startup. Onboarding dependency chain enforced (app→user→tenant→membership→token→revoke). Canonical error responses. Advisory engine. AI Passport. Event bus. Gate serves real ChipStore lookups and receipt traces.
 
-**Not yet working**: SHA2→BLAKE3 metadata cleanup in legacy paths. Runtime self-attestation hardening (`runtime_hash` as trust anchor). Structured tracing standardization.
+**Hardening in progress**: legacy metadata cleanup and additional reproducibility hardening remain. Runtime self-attestation, structured tracing, and durability boundary are implemented.
 
 ---
 
@@ -872,7 +874,7 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 
 | Item | Priority | Status |
 |---|---|---|
-| **H4** P0→P1 rollout automation (see `ROLLOUT_P0_to_P1.md`) | Medium | Designed, not automated |
+| **H4** P0→P1 rollout automation (see `ROLLOUT_P0_TO_P1.md`) | Medium | Designed, not automated |
 | **H5** Newtype pattern (`Cid`, `Did`, `ChipBody` newtypes) | Low | Open |
 | **H6** Parse, Don't Validate (progressive adoption beyond `auth.rs`) | Low | Open |
 
@@ -910,8 +912,8 @@ The pattern is always the same: define `@type`s, write policies, maybe add a WAS
 | ~~No canonical errors~~ | ~~HTTP responses~~ | ~~🟡 Inconsistent~~ | ✅ Fixed S3.6 + PR-B P1.7 — `UblError` with 8-category taxonomy |
 | ~~4 pre-existing chip_format test failures~~ | ~~`ubl_ai_nrf1::chip_format`~~ | ~~🟡 Tests exist but fail~~ | ✅ Fixed C2 — tests were already passing |
 | ~~No runtime self-attestation~~ | ~~`ubl_runtime`~~ | ~~🟡 Needed for PS3~~ | ✅ Fixed H11 — `RuntimeInfo::capture()`, BLAKE3 binary hash, `BuildMeta` |
-| No structured tracing | All crates | 🟡 `eprintln!` only | **OPEN** (F2) |
-| Newtype pattern needed | All crates | 🟢 Minor | **OPEN** (H5) |
+| ~~No structured tracing~~ | ~~All crates~~ | ~~🟡 `eprintln!` only~~ | ✅ Fixed F2 — tracing spans and structured logs wired |
+| ~~Newtype pattern needed~~ | ~~All crates~~ | ~~🟢 Minor~~ | ✅ Fixed H5 — `ubl_types` newtypes integrated |
 | Parse, Don't Validate | Pipeline + chip types | 🟢 Minor | **OPEN** (H6) |
 
 ---

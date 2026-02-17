@@ -27,8 +27,8 @@ and exits non-zero if rollout checks fail (except in break-glass mode).
 
 ```bash
 bash scripts/rollout_p0_p1_check.sh \
-  --p0 P0_genesis_policy.json \
-  --p1 P1_policy_update.json \
+  --p0 P0_GENESIS_POLICY.json \
+  --p1 P1_POLICY_UPDATE.json \
   --runtime-hash "sha256:rt-PROD-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" \
   --min-lead-seconds 1800 \
   --report-file ./data/rollout_report.json

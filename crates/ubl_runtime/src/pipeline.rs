@@ -761,6 +761,7 @@ impl UblPipeline {
         receipt
             .finalize_and_sign(&self.signing_key, crypto_mode)
             .map_err(|e| PipelineError::SignError(format!("WF finalize/sign failed: {}", e)))?;
+        let unified_receipt_cid = receipt.receipt_cid.as_str().to_string();
 
         let total_ms = pipeline_start.elapsed().as_millis() as i64;
 
@@ -789,7 +790,7 @@ impl UblPipeline {
             let stored_chip_res = store
                 .store_executed_chip(
                     request.body.clone(),
-                    wf_receipt.body_cid.as_str().to_string(),
+                    unified_receipt_cid.clone(),
                     metadata,
                 )
                 .await;
@@ -807,7 +808,7 @@ impl UblPipeline {
                 let mapping = mapping_chip(
                     world,
                     &rotation_chip_cid,
-                    wf_receipt.body_cid.as_str(),
+                    &unified_receipt_cid,
                     rotate_req.reason.as_deref(),
                     &material,
                 );
@@ -822,7 +823,7 @@ impl UblPipeline {
                 store
                     .store_executed_chip(
                         mapping,
-                        wf_receipt.body_cid.as_str().to_string(),
+                        unified_receipt_cid.clone(),
                         mapping_meta,
                     )
                     .await
@@ -849,7 +850,7 @@ impl UblPipeline {
                 app,
                 tenant,
                 chip_cid: wf_receipt.body_cid.as_str().to_string(),
-                receipt_cid: wf_receipt.body_cid.as_str().to_string(),
+                receipt_cid: unified_receipt_cid.clone(),
                 decision: "Allow".to_string(),
                 did: Some(self.did.clone()),
                 kid: Some(self.kid.clone()),
@@ -907,7 +908,7 @@ impl UblPipeline {
             world = %parsed_request.world,
             decision = "allow",
             duration_ms = total_ms,
-            receipt_cid = %wf_receipt.body_cid.as_str(),
+            receipt_cid = %unified_receipt_cid,
             "pipeline completed"
         );
 
@@ -2265,8 +2266,14 @@ mod tests {
         assert_eq!(stored.chip_type, "ubl/document");
         assert_eq!(
             stored.receipt_cid.as_str(),
-            result.final_receipt.body_cid.as_str()
+            result.receipt.receipt_cid.as_str()
         );
+
+        let by_receipt = chip_store
+            .get_chip_by_receipt_cid(result.receipt.receipt_cid.as_str())
+            .await
+            .unwrap();
+        assert!(by_receipt.is_some(), "receipt_cid lookup must resolve stored chip");
     }
 
     #[tokio::test]

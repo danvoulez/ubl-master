@@ -1,4 +1,9 @@
-# Rollout P0 → P1 (Bootstrap Seguro)
+# Rollout P0 -> P1 (Bootstrap Seguro)
+
+**Status**: active
+**Owner**: Ops + Security
+**Last reviewed**: 2026-02-17
+**Automation**: `scripts/rollout_p0_p1_check.sh` (`make rollout-check`)
 
 ## Objetivo
 Ancorar o sistema em **P0 (Genesis hardcoded)** e, após verificação, ativar **P1** que libera Onboarding e tipos centrais — mantendo o princípio **Auth IS the pipeline** (sem endpoints exclusivos).

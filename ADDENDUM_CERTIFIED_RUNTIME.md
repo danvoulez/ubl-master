@@ -1,5 +1,10 @@
 # Addendum — Certified Runtime como Motor de Estado
 
+**Status**: active (complementary)
+**Owner**: Core Runtime
+**Last reviewed**: 2026-02-17
+**Primary trust model**: `docs/security/CRYPTO_TRUST_MODEL.md`
+
 > **Tese:** O Certified Runtime não é só um carimbador de recibos. Ele é **motor de alterações**, **executor de política**,
 > **árbitro determinístico** e **cartório criptográfico** do sistema. O LLM aconselha; o Runtime **decide e assina**.
 
