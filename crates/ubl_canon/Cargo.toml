@@ -1,0 +1,16 @@
+[package]
+name = "ubl_canon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = "0.22"
+hex = "0.4"
+ubl_ai_nrf1 = { path = "../ubl_ai_nrf1" }
+
+[dev-dependencies]
+proptest = { workspace = true }

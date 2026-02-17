@@ -19,6 +19,8 @@ hex = "0.4"
 blake3 = { workspace = true }
 ubl_ledger = { path = "../ubl_ledger" }
 ubl_types = { path = "../ubl_types" }
+ubl_kms = { path = "../ubl_kms" }
+ubl_canon = { path = "../ubl_canon" }
 
 # Property testing
 proptest = { workspace = true, optional = true }

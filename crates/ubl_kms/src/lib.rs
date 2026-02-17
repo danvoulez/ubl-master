@@ -7,14 +7,15 @@
 //! - H1: Signing key from env (`SIGNING_KEY_HEX`)
 //! - H7: Signature domain separation (`"ubl-receipt/v1"`, etc.)
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use base64::Engine;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 // Re-export key types so downstream crates don't need ed25519_dalek directly
 pub use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
+const ED25519_PUB_MULTICODEC: [u8; 2] = [0xED, 0x01];
 
 #[derive(Debug, thiserror::Error)]
 pub enum KmsError {
@@ -36,6 +37,7 @@ pub mod domain {
     pub const RB_VM: &str = "ubl-rb-vm/v1";
     pub const CAPSULE: &str = "ubl-capsule/v1";
     pub const CHIP: &str = "ubl-chip/v1";
+    pub const CAPABILITY: &str = "ubl-capability/v1";
 }
 
 /// Load an Ed25519 signing key from the `SIGNING_KEY_HEX` environment variable.
@@ -47,10 +49,12 @@ pub fn signing_key_from_env() -> Result<SigningKey, KmsError> {
 
 /// Parse a 64-char hex string into an Ed25519 signing key.
 pub fn signing_key_from_hex(hex_str: &str) -> Result<SigningKey, KmsError> {
-    let bytes = hex::decode(hex_str.trim())
-        .map_err(|e| KmsError::BadHex(e.to_string()))?;
+    let bytes = hex::decode(hex_str.trim()).map_err(|e| KmsError::BadHex(e.to_string()))?;
     if bytes.len() != 32 {
-        return Err(KmsError::BadHex(format!("got {} bytes, need 32", bytes.len())));
+        return Err(KmsError::BadHex(format!(
+            "got {} bytes, need 32",
+            bytes.len()
+        )));
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&bytes);
@@ -69,7 +73,78 @@ pub fn verifying_key(sk: &SigningKey) -> VerifyingKey {
 
 /// Derive a `did:key:z...` DID from a verifying key.
 pub fn did_from_verifying_key(vk: &VerifyingKey) -> String {
-    format!("did:key:z{}", bs58::encode(vk.to_bytes()).into_string())
+    if std::env::var("UBL_DIDKEY_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("strict"))
+        .unwrap_or(false)
+    {
+        did_from_verifying_key_strict(vk)
+    } else {
+        format!("did:key:z{}", bs58::encode(vk.to_bytes()).into_string())
+    }
+}
+
+/// Derive strict `did:key:z...` using multicodec-ed25519-pub prefix (0xED01).
+pub fn did_from_verifying_key_strict(vk: &VerifyingKey) -> String {
+    let mut prefixed = Vec::with_capacity(2 + vk.as_bytes().len());
+    prefixed.extend_from_slice(&ED25519_PUB_MULTICODEC);
+    prefixed.extend_from_slice(vk.as_bytes());
+    format!("did:key:z{}", bs58::encode(prefixed).into_string())
+}
+
+/// Parse a `did:key:z...` DID into an Ed25519 verifying key.
+pub fn verifying_key_from_did(did: &str) -> Result<VerifyingKey, KmsError> {
+    if let Ok(vk) = verifying_key_from_did_strict(did) {
+        return Ok(vk);
+    }
+
+    // Compat fallback: payload is raw 32-byte key bytes.
+    let encoded = did
+        .strip_prefix("did:key:z")
+        .ok_or_else(|| KmsError::BadSignature("did must start with 'did:key:z'".into()))?;
+
+    let key_bytes = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|e| KmsError::BadSignature(format!("invalid did:key base58: {}", e)))?;
+
+    if key_bytes.len() != 32 {
+        return Err(KmsError::BadSignature(format!(
+            "did:key must decode to 32 bytes, got {}",
+            key_bytes.len()
+        )));
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&key_bytes);
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| KmsError::BadSignature(format!("invalid ed25519 public key: {}", e)))
+}
+
+/// Parse strict multicodec `did:key` (must be `z` multibase + `0xED01` prefix).
+pub fn verifying_key_from_did_strict(did: &str) -> Result<VerifyingKey, KmsError> {
+    let encoded = did
+        .strip_prefix("did:key:z")
+        .ok_or_else(|| KmsError::BadSignature("did must start with 'did:key:z'".into()))?;
+
+    let bytes = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|e| KmsError::BadSignature(format!("invalid did:key base58: {}", e)))?;
+
+    if bytes.len() != 34 {
+        return Err(KmsError::BadSignature(format!(
+            "strict did:key must decode to 34 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if bytes[0..2] != ED25519_PUB_MULTICODEC {
+        return Err(KmsError::BadSignature(
+            "unsupported multicodec; expected ed25519-pub (0xED01)".to_string(),
+        ));
+    }
+
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes[2..]);
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| KmsError::BadSignature(format!("invalid ed25519 public key: {}", e)))
 }
 
 /// Derive the key ID (`did:key:z...#ed25519`) from a verifying key.
@@ -86,8 +161,8 @@ pub fn sign_canonical(
     value: &serde_json::Value,
     domain: &str,
 ) -> Result<String, KmsError> {
-    let nrf_bytes = ubl_ai_nrf1::nrf::to_nrf1_bytes(value)
-        .map_err(|e| KmsError::Nrf(e.to_string()))?;
+    let nrf_bytes =
+        ubl_ai_nrf1::nrf::to_nrf1_bytes(value).map_err(|e| KmsError::Nrf(e.to_string()))?;
     let msg = domain_message(domain, &nrf_bytes);
     let sig: Signature = sk.sign(&msg);
     Ok(format!("ed25519:{}", BASE64.encode(sig.to_bytes())))
@@ -112,8 +187,8 @@ pub fn verify_canonical(
     domain: &str,
     sig_str: &str,
 ) -> Result<bool, KmsError> {
-    let nrf_bytes = ubl_ai_nrf1::nrf::to_nrf1_bytes(value)
-        .map_err(|e| KmsError::Nrf(e.to_string()))?;
+    let nrf_bytes =
+        ubl_ai_nrf1::nrf::to_nrf1_bytes(value).map_err(|e| KmsError::Nrf(e.to_string()))?;
     let msg = domain_message(domain, &nrf_bytes);
     verify_raw(vk, &msg, sig_str)
 }
@@ -138,8 +213,8 @@ fn verify_raw(vk: &VerifyingKey, msg: &[u8], sig_str: &str) -> Result<bool, KmsE
     let sig_bytes = BASE64
         .decode(b64)
         .map_err(|e| KmsError::BadSignature(e.to_string()))?;
-    let sig = Signature::from_slice(&sig_bytes)
-        .map_err(|e| KmsError::BadSignature(e.to_string()))?;
+    let sig =
+        Signature::from_slice(&sig_bytes).map_err(|e| KmsError::BadSignature(e.to_string()))?;
     Ok(vk.verify(msg, &sig).is_ok())
 }
 
@@ -254,6 +329,34 @@ mod tests {
         let kid = kid_from_verifying_key(&vk);
         assert!(kid.ends_with("#ed25519"));
         assert!(kid.starts_with("did:key:z"));
+    }
+
+    #[test]
+    fn verifying_key_from_did_roundtrip() {
+        let (_, vk) = test_keypair();
+        let did = did_from_verifying_key(&vk);
+        let parsed = verifying_key_from_did(&did).unwrap();
+        assert_eq!(parsed.to_bytes(), vk.to_bytes());
+    }
+
+    #[test]
+    fn didkey_multicodec_vectors_pass() {
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let vk = verifying_key(&sk);
+        let strict_did = did_from_verifying_key_strict(&vk);
+
+        let strict_parsed = verifying_key_from_did_strict(&strict_did).unwrap();
+        assert_eq!(strict_parsed.to_bytes(), vk.to_bytes());
+
+        // Compat parser also accepts strict vectors.
+        let compat_parsed = verifying_key_from_did(&strict_did).unwrap();
+        assert_eq!(compat_parsed.to_bytes(), vk.to_bytes());
+    }
+
+    #[test]
+    fn verifying_key_from_did_rejects_invalid_prefix() {
+        let err = verifying_key_from_did("did:web:example.com").unwrap_err();
+        assert!(matches!(err, KmsError::BadSignature(_)));
     }
 
     #[test]

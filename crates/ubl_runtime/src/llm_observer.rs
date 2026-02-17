@@ -7,6 +7,7 @@ use crate::event_bus::{EventBus, ReceiptEvent};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 /// AI Analysis of a receipt event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,11 +49,15 @@ impl LlmObserver {
                 match rx.recv().await {
                     Ok(event) => {
                         let analysis = Self::analyze(&event);
-                        eprintln!("[observer] {} {} risk={:.2}",
-                            analysis.pipeline_stage, analysis.receipt_cid, analysis.risk_score);
+                        info!(
+                            stage = %analysis.pipeline_stage,
+                            receipt_cid = %analysis.receipt_cid,
+                            risk_score = analysis.risk_score,
+                            "observer analysis"
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[observer] lagged, skipped {} events", n);
+                        warn!(skipped = n, "observer lagged");
                     }
                     Err(_) => break, // channel closed
                 }

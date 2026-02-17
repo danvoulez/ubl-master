@@ -5,7 +5,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -58,6 +59,64 @@ static PIPELINE_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     h
 });
 
+static CRYPTO_VERIFY_FAIL_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ubl_crypto_verify_fail_total",
+            "Crypto verification failures by component and mode",
+        ),
+        &["component", "mode"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+static CANON_DIVERGENCE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ubl_canon_divergence_total",
+            "Canonicalization divergence incidents by component",
+        ),
+        &["component"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+static OUTBOX_PENDING: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new("ubl_outbox_pending", "Pending outbox events").unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+static OUTBOX_RETRY_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new("ubl_outbox_retry_total", "Outbox retry attempts").unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+static IDEMPOTENCY_HIT_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ubl_idempotency_hit_total",
+        "Idempotency cache hits (replay served)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+static IDEMPOTENCY_REPLAY_BLOCK_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ubl_idempotency_replay_block_total",
+        "Replay requests blocked by idempotency",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub fn inc_chips_total() {
     CHIPS_TOTAL.inc();
 }
@@ -82,6 +141,32 @@ pub fn observe_pipeline_seconds(secs: f64) {
     PIPELINE_SECONDS.observe(secs);
 }
 
+pub fn inc_crypto_verify_fail(component: &str, mode: &str) {
+    CRYPTO_VERIFY_FAIL_TOTAL
+        .with_label_values(&[component, mode])
+        .inc();
+}
+
+pub fn inc_canon_divergence(component: &str) {
+    CANON_DIVERGENCE_TOTAL.with_label_values(&[component]).inc();
+}
+
+pub fn set_outbox_pending(v: i64) {
+    OUTBOX_PENDING.set(v);
+}
+
+pub fn inc_outbox_retry() {
+    OUTBOX_RETRY_TOTAL.inc();
+}
+
+pub fn inc_idempotency_hit() {
+    IDEMPOTENCY_HIT_TOTAL.inc();
+}
+
+pub fn inc_idempotency_replay_block() {
+    IDEMPOTENCY_REPLAY_BLOCK_TOTAL.inc();
+}
+
 pub fn encode_metrics() -> String {
     // Force lazy init of all metrics so they appear even at zero
     Lazy::force(&CHIPS_TOTAL);
@@ -90,6 +175,12 @@ pub fn encode_metrics() -> String {
     Lazy::force(&KNOCK_REJECT_TOTAL);
     Lazy::force(&ERROR_TOTAL);
     Lazy::force(&PIPELINE_SECONDS);
+    Lazy::force(&CRYPTO_VERIFY_FAIL_TOTAL);
+    Lazy::force(&CANON_DIVERGENCE_TOTAL);
+    Lazy::force(&OUTBOX_PENDING);
+    Lazy::force(&OUTBOX_RETRY_TOTAL);
+    Lazy::force(&IDEMPOTENCY_HIT_TOTAL);
+    Lazy::force(&IDEMPOTENCY_REPLAY_BLOCK_TOTAL);
 
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();

@@ -21,7 +21,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// A capability embedded in a chip body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,9 +64,19 @@ impl std::fmt::Display for CapError {
         match self {
             Self::Missing => write!(f, "missing @cap: capability required"),
             Self::Malformed(msg) => write!(f, "malformed @cap: {}", msg),
-            Self::WrongAction { required, got } => write!(f, "wrong capability action: required '{}', got '{}'", required, got),
-            Self::WrongAudience { required, got } => write!(f, "wrong capability audience: required '{}', got '{}'", required, got),
-            Self::Expired { expires_at, now } => write!(f, "capability expired at {} (now: {})", expires_at, now),
+            Self::WrongAction { required, got } => write!(
+                f,
+                "wrong capability action: required '{}', got '{}'",
+                required, got
+            ),
+            Self::WrongAudience { required, got } => write!(
+                f,
+                "wrong capability audience: required '{}', got '{}'",
+                required, got
+            ),
+            Self::Expired { expires_at, now } => {
+                write!(f, "capability expired at {} (now: {})", expires_at, now)
+            }
             Self::InvalidSignature(msg) => write!(f, "invalid capability signature: {}", msg),
         }
     }
@@ -102,14 +112,11 @@ pub fn extract_cap(body: &Value) -> Result<Capability, CapError> {
 ///
 /// Checks:
 /// 1. Action matches the required action.
-/// 2. Audience matches or is a prefix of the chip's @world.
-/// 3. Not expired (if expires_at is set).
-/// 4. Signature present (actual Ed25519 verification is best-effort for now).
-pub fn validate_cap(
-    cap: &Capability,
-    required_action: &str,
-    world: &str,
-) -> Result<(), CapError> {
+/// 2. Audience matches the chip's @world scope boundary.
+/// 3. issued_at/expires_at (if present) are valid RFC-3339.
+/// 4. Not expired (if expires_at is set).
+/// 5. Signature is valid over canonical capability payload.
+pub fn validate_cap(cap: &Capability, required_action: &str, world: &str) -> Result<(), CapError> {
     // 1. Action check
     if cap.action != required_action {
         return Err(CapError::WrongAction {
@@ -118,32 +125,88 @@ pub fn validate_cap(
         });
     }
 
-    // 2. Audience check — cap audience must be a prefix of @world
-    //    e.g. cap audience "a/acme" matches world "a/acme/t/prod"
-    if !world.starts_with(&cap.audience) {
+    // 2. Audience check with path boundary semantics.
+    //    "a/acme" matches "a/acme/t/prod", but not "a/acme2".
+    if !audience_matches_world(&cap.audience, world) {
         return Err(CapError::WrongAudience {
             required: world.to_string(),
             got: cap.audience.clone(),
         });
     }
 
-    // 3. Expiration check
+    // 3. Timestamp parse/validation
+    let issued_at = chrono::DateTime::parse_from_rfc3339(&cap.issued_at)
+        .map_err(|e| CapError::Malformed(format!("issued_at must be RFC-3339: {}", e)))?
+        .with_timezone(&chrono::Utc);
+
+    let now = chrono::Utc::now();
+
+    // 4. Expiration check
     if !cap.expires_at.is_empty() {
-        let now = chrono::Utc::now().to_rfc3339();
-        if cap.expires_at < now {
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&cap.expires_at)
+            .map_err(|e| CapError::Malformed(format!("expires_at must be RFC-3339: {}", e)))?
+            .with_timezone(&chrono::Utc);
+
+        if expires_at <= issued_at {
+            return Err(CapError::Malformed(
+                "expires_at must be later than issued_at".to_string(),
+            ));
+        }
+
+        if expires_at <= now {
             return Err(CapError::Expired {
                 expires_at: cap.expires_at.clone(),
-                now,
+                now: now.to_rfc3339(),
             });
         }
     }
 
-    // 4. Signature presence (full Ed25519 verification deferred to P3)
+    // 5. Signature verification
     if cap.signature.is_empty() {
         return Err(CapError::InvalidSignature("signature is empty".to_string()));
     }
 
+    let verifying_key = ubl_kms::verifying_key_from_did(&cap.issued_by)
+        .map_err(|e| CapError::InvalidSignature(e.to_string()))?;
+
+    let payload = cap_signing_payload(cap);
+    let verified = ubl_kms::verify_canonical(
+        &verifying_key,
+        &payload,
+        ubl_kms::domain::CAPABILITY,
+        &cap.signature,
+    )
+    .map_err(|e| CapError::InvalidSignature(e.to_string()))?;
+
+    if !verified {
+        return Err(CapError::InvalidSignature(
+            "signature verification failed".to_string(),
+        ));
+    }
+
     Ok(())
+}
+
+fn audience_matches_world(audience: &str, world: &str) -> bool {
+    if world == audience {
+        return true;
+    }
+
+    if let Some(rest) = world.strip_prefix(audience) {
+        return rest.starts_with('/');
+    }
+
+    false
+}
+
+fn cap_signing_payload(cap: &Capability) -> Value {
+    json!({
+        "action": cap.action,
+        "audience": cap.audience,
+        "issued_by": cap.issued_by,
+        "issued_at": cap.issued_at,
+        "expires_at": cap.expires_at,
+    })
 }
 
 /// Validate that a chip body carries the required capability.
@@ -183,15 +246,38 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_valid_cap(action: &str, audience: &str) -> Value {
+    fn make_signed_cap(action: &str, audience: &str, issued_at: &str, expires_at: &str) -> Value {
+        let sk = ubl_kms::generate_signing_key();
+        let vk = ubl_kms::verifying_key(&sk);
+        let issued_by = ubl_kms::did_from_verifying_key(&vk);
+
+        let payload = json!({
+            "action": action,
+            "audience": audience,
+            "issued_by": issued_by,
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+        });
+
+        let sig = ubl_kms::sign_canonical(&sk, &payload, ubl_kms::domain::CAPABILITY).unwrap();
+
         json!({
             "action": action,
             "audience": audience,
-            "issued_by": "did:key:z6MkTest",
-            "issued_at": "2025-01-01T00:00:00Z",
-            "expires_at": "2099-12-31T23:59:59Z",
-            "signature": "ed25519:dGVzdHNpZw"
+            "issued_by": payload["issued_by"],
+            "issued_at": issued_at,
+            "expires_at": expires_at,
+            "signature": sig,
         })
+    }
+
+    fn make_valid_cap(action: &str, audience: &str) -> Value {
+        make_signed_cap(
+            action,
+            audience,
+            "2025-01-01T00:00:00Z",
+            "2099-12-31T23:59:59Z",
+        )
     }
 
     #[test]
@@ -203,7 +289,7 @@ mod tests {
         let cap = extract_cap(&body).unwrap();
         assert_eq!(cap.action, "registry:init");
         assert_eq!(cap.audience, "a/acme");
-        assert_eq!(cap.issued_by, "did:key:z6MkTest");
+        assert!(cap.issued_by.starts_with("did:key:z"));
     }
 
     #[test]
@@ -245,20 +331,25 @@ mod tests {
     fn validate_audience_prefix_match() {
         let cap_val = make_valid_cap("registry:init", "a/acme");
         let cap: Capability = serde_json::from_value(cap_val).unwrap();
-        // "a/acme" is prefix of "a/acme/t/prod" — should pass
         assert!(validate_cap(&cap, "registry:init", "a/acme/t/prod").is_ok());
     }
 
     #[test]
+    fn validate_audience_boundary_mismatch_rejected() {
+        let cap_val = make_valid_cap("registry:init", "a/ac");
+        let cap: Capability = serde_json::from_value(cap_val).unwrap();
+        let err = validate_cap(&cap, "registry:init", "a/acme/t/prod").unwrap_err();
+        assert!(matches!(err, CapError::WrongAudience { .. }));
+    }
+
+    #[test]
     fn validate_expired_cap() {
-        let body = json!({
-            "action": "registry:init",
-            "audience": "a/acme",
-            "issued_by": "did:key:z6MkTest",
-            "issued_at": "2020-01-01T00:00:00Z",
-            "expires_at": "2020-12-31T23:59:59Z",
-            "signature": "ed25519:dGVzdHNpZw"
-        });
+        let body = make_signed_cap(
+            "registry:init",
+            "a/acme",
+            "2020-01-01T00:00:00Z",
+            "2020-12-31T23:59:59Z",
+        );
         let cap: Capability = serde_json::from_value(body).unwrap();
         let err = validate_cap(&cap, "registry:init", "a/acme").unwrap_err();
         assert!(matches!(err, CapError::Expired { .. }));
@@ -266,29 +357,25 @@ mod tests {
 
     #[test]
     fn validate_no_expiry_is_ok() {
-        let body = json!({
-            "action": "registry:init",
-            "audience": "a/acme",
-            "issued_by": "did:key:z6MkTest",
-            "issued_at": "2025-01-01T00:00:00Z",
-            "expires_at": "",
-            "signature": "ed25519:dGVzdHNpZw"
-        });
+        let body = make_signed_cap("registry:init", "a/acme", "2025-01-01T00:00:00Z", "");
         let cap: Capability = serde_json::from_value(body).unwrap();
         assert!(validate_cap(&cap, "registry:init", "a/acme").is_ok());
     }
 
     #[test]
     fn validate_empty_signature_rejected() {
-        let body = json!({
-            "action": "registry:init",
-            "audience": "a/acme",
-            "issued_by": "did:key:z6MkTest",
-            "issued_at": "2025-01-01T00:00:00Z",
-            "expires_at": "",
-            "signature": ""
-        });
+        let mut body = make_signed_cap("registry:init", "a/acme", "2025-01-01T00:00:00Z", "");
+        body["signature"] = json!("");
         let cap: Capability = serde_json::from_value(body).unwrap();
+        let err = validate_cap(&cap, "registry:init", "a/acme").unwrap_err();
+        assert!(matches!(err, CapError::InvalidSignature(_)));
+    }
+
+    #[test]
+    fn validate_signature_tamper_rejected() {
+        let mut cap_val = make_valid_cap("registry:init", "a/acme");
+        cap_val["issued_at"] = json!("2025-01-02T00:00:00Z"); // invalidates signature
+        let cap: Capability = serde_json::from_value(cap_val).unwrap();
         let err = validate_cap(&cap, "registry:init", "a/acme").unwrap_err();
         assert!(matches!(err, CapError::InvalidSignature(_)));
     }
@@ -307,13 +394,19 @@ mod tests {
     #[test]
     fn require_cap_missing_fails() {
         let body = json!({"@type": "ubl/app", "@world": "a/acme"});
-        assert!(matches!(require_cap(&body, "registry:init", "a/acme"), Err(CapError::Missing)));
+        assert!(matches!(
+            require_cap(&body, "registry:init", "a/acme"),
+            Err(CapError::Missing)
+        ));
     }
 
     #[test]
     fn required_capability_for_types() {
         assert_eq!(required_capability("ubl/app"), Some("registry:init"));
-        assert_eq!(required_capability("ubl/membership"), Some("membership:grant"));
+        assert_eq!(
+            required_capability("ubl/membership"),
+            Some("membership:grant")
+        );
         assert_eq!(required_capability("ubl/revoke"), Some("revoke:execute"));
         assert_eq!(required_capability("ubl/user"), None);
         assert_eq!(required_capability("ubl/document"), None);
@@ -326,7 +419,7 @@ mod tests {
         let consumed = ConsumedCap::from(&cap);
         assert_eq!(consumed.action, "registry:init");
         assert_eq!(consumed.audience, "a/acme");
-        assert_eq!(consumed.issued_by, "did:key:z6MkTest");
+        assert!(consumed.issued_by.starts_with("did:key:z"));
         assert!(!consumed.consumed_at.is_empty());
     }
 
@@ -335,7 +428,10 @@ mod tests {
         let err = CapError::Missing;
         assert!(err.to_string().contains("missing @cap"));
 
-        let err = CapError::WrongAction { required: "a".into(), got: "b".into() };
+        let err = CapError::WrongAction {
+            required: "a".into(),
+            got: "b".into(),
+        };
         assert!(err.to_string().contains("wrong capability action"));
     }
 }

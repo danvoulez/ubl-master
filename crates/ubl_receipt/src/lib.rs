@@ -16,8 +16,8 @@ pub use pipeline_types::{
     KnockBody, ChipIntent, PolicyTraceEntry, RbResult, OperationResult
 };
 pub use unified::{
-    UnifiedReceipt, StageExecution, PipelineStage, ReceiptError,
-    RuntimeInfo, BuildMeta,
+    BuildMeta, CryptoMode, PipelineStage, ReceiptError, RuntimeInfo, StageExecution,
+    UnifiedReceipt, VerifyMode, VerifyReport,
 };
 
 // Re-export leaf newtypes for downstream crates

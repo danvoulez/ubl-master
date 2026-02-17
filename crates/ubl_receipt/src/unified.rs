@@ -10,7 +10,10 @@
 use crate::pipeline_types::{Decision, PolicyTraceEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use ubl_types::{Cid as TypedCid, Did as TypedDid, Kid as TypedKid, Nonce as TypedNonce, World as TypedWorld};
+use ubl_canon::{cid_of, CryptoMode as CanonCryptoMode};
+use ubl_types::{
+    Cid as TypedCid, Did as TypedDid, Kid as TypedKid, Nonce as TypedNonce, World as TypedWorld,
+};
 
 /// Pipeline stages in execution order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,8 +53,48 @@ pub struct StageExecution {
     pub fuel_used: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub policy_trace: Vec<PolicyTraceEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_sig: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_sig_payload_cid: Option<String>,
     pub auth_token: String,
     pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoMode {
+    CompatV1,
+    HashFirstV2,
+}
+
+impl CryptoMode {
+    pub fn from_env() -> Self {
+        match std::env::var("UBL_CRYPTO_MODE") {
+            Ok(v) if v.eq_ignore_ascii_case("hash_first_v2") => Self::HashFirstV2,
+            _ => Self::CompatV1,
+        }
+    }
+
+    fn as_canon(self) -> CanonCryptoMode {
+        match self {
+            Self::CompatV1 => CanonCryptoMode::CompatV1,
+            Self::HashFirstV2 => CanonCryptoMode::HashFirstV2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    V1Only,
+    V2Only,
+    Dual,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyReport {
+    pub valid: bool,
+    pub v1_valid: bool,
+    pub v2_valid: bool,
 }
 
 /// Build provenance metadata — collected at compile time and startup.
@@ -85,7 +128,12 @@ impl BuildMeta {
                 .to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .to_string(),
             git_commit: option_env!("GIT_COMMIT").map(|s| s.to_string()),
             git_dirty: option_env!("GIT_DIRTY").map(|s| s == "true"),
         }
@@ -201,17 +249,13 @@ pub struct UnifiedReceipt {
     pub rt: Option<RuntimeInfo>,
 }
 
-/// Secret used for HMAC auth tokens between stages.
-const STAGE_SECRET: &[u8] = b"ubl-stage-secret-v1"; // TODO: load from env
+const STAGE_SECRET_ENV: &str = "UBL_STAGE_SECRET";
+const STAGE_SECRET_PREV_ENV: &str = "UBL_STAGE_SECRET_PREV";
+const RECEIPT_DOMAIN_ENV: &str = "UBL_SIGN_DOMAIN_RECEIPT";
 
 impl UnifiedReceipt {
     /// Create a new receipt at the start of pipeline processing.
-    pub fn new(
-        world: &str,
-        did: &str,
-        kid: &str,
-        nonce: &str,
-    ) -> Self {
+    pub fn new(world: &str, did: &str, kid: &str, nonce: &str) -> Self {
         let t = chrono::Utc::now().to_rfc3339();
         Self {
             receipt_type: "ubl/receipt".to_string(),
@@ -242,13 +286,16 @@ impl UnifiedReceipt {
 
     /// Append a stage execution and recompute the receipt CID.
     pub fn append_stage(&mut self, mut stage: StageExecution) -> Result<(), ReceiptError> {
+        let current_key = load_required_stage_secret_key()?;
+
         // Compute auth token: HMAC-BLAKE3(secret, prev_cid || stage_name)
         let prev_cid = if self.receipt_cid.as_str().is_empty() {
             "genesis"
         } else {
             self.receipt_cid.as_str()
         };
-        stage.auth_token = compute_auth_token(prev_cid, stage.stage.as_str());
+        stage.auth_token =
+            compute_auth_token_with_key(prev_cid, stage.stage.as_str(), &current_key);
 
         self.stages.push(stage);
 
@@ -258,22 +305,27 @@ impl UnifiedReceipt {
         // Update @id to match current CID
         self.id = self.receipt_cid.as_str().to_string();
 
+        // Enforce auth-chain integrity after every append.
+        let previous_key = load_optional_stage_secret_key(STAGE_SECRET_PREV_ENV)?;
+        if !self.verify_auth_chain_with_keys(&current_key, previous_key.as_ref())? {
+            return Err(ReceiptError::AuthChainBroken(
+                "stage auth token mismatch after append".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
     /// Recompute the receipt CID from current state (excluding sig).
     fn recompute_cid(&mut self) -> Result<(), ReceiptError> {
-        // Temporarily clear sig and receipt_cid for canonical hashing
+        // Temporarily clear sig and receipt_cid for canonical hashing/signing payload.
         let saved_sig = std::mem::take(&mut self.sig);
         let saved_cid = std::mem::replace(&mut self.receipt_cid, TypedCid::new_unchecked(""));
         let saved_id = std::mem::take(&mut self.id);
 
-        let json = serde_json::to_value(&*self)
-            .map_err(|e| ReceiptError::Serialization(e.to_string()))?;
-
-        let canonical = canonical_json_bytes(&json);
-        let hash = blake3::hash(&canonical);
-        let new_cid = format!("b3:{}", hex::encode(hash.as_bytes()));
+        let json =
+            serde_json::to_value(&*self).map_err(|e| ReceiptError::Serialization(e.to_string()))?;
+        let new_cid = cid_of(&json).map_err(|e| ReceiptError::Signature(e.to_string()))?;
 
         // Restore
         self.sig = saved_sig;
@@ -287,12 +339,108 @@ impl UnifiedReceipt {
         Ok(())
     }
 
+    fn signature_payload_value(&self) -> Result<serde_json::Value, ReceiptError> {
+        let mut tmp = self.clone();
+        tmp.sig.clear();
+        serde_json::to_value(tmp).map_err(|e| ReceiptError::Serialization(e.to_string()))
+    }
+
+    /// Finalize the receipt signature for WF output.
+    pub fn finalize_and_sign(
+        &mut self,
+        sk: &ubl_kms::Ed25519SigningKey,
+        mode: CryptoMode,
+    ) -> Result<(), ReceiptError> {
+        let payload = self.signature_payload_value()?;
+        let domain = receipt_sign_domain();
+        self.sig = match mode.as_canon() {
+            CanonCryptoMode::CompatV1 => ubl_canon::sign_domain_v1(&payload, &domain, sk)
+                .map_err(|e| ReceiptError::Signature(e.to_string()))?,
+            CanonCryptoMode::HashFirstV2 => {
+                ubl_canon::sign_domain_v2_hash_first(&payload, &domain, sk)
+                    .map_err(|e| ReceiptError::Signature(e.to_string()))?
+            }
+        };
+        Ok(())
+    }
+
+    /// Verify the receipt signature against `did`.
+    pub fn verify_signature(&self, mode: VerifyMode) -> Result<VerifyReport, ReceiptError> {
+        if self.sig.is_empty() {
+            return Err(ReceiptError::Signature("receipt signature is empty".to_string()));
+        }
+
+        let vk = ubl_kms::verifying_key_from_did(self.did.as_str())
+            .map_err(|e| ReceiptError::Signature(e.to_string()))?;
+        let payload = self.signature_payload_value()?;
+        let domain = receipt_sign_domain();
+
+        let v1_valid = ubl_canon::verify_domain_v1(&payload, &domain, &vk, &self.sig)
+            .map_err(|e| ReceiptError::Signature(e.to_string()))?;
+        let v2_valid = ubl_canon::verify_domain_v2_hash_first(&payload, &domain, &vk, &self.sig)
+            .map_err(|e| ReceiptError::Signature(e.to_string()))?;
+
+        let valid = match mode {
+            VerifyMode::V1Only => v1_valid,
+            VerifyMode::V2Only => v2_valid,
+            VerifyMode::Dual => v1_valid || v2_valid,
+        };
+
+        Ok(VerifyReport {
+            valid,
+            v1_valid,
+            v2_valid,
+        })
+    }
+
     /// Mark the receipt as denied.
     pub fn deny(&mut self, reason: &str) {
         self.decision = Decision::Deny;
         if let Some(obj) = self.effects.as_object_mut() {
-            obj.insert("deny_reason".to_string(), serde_json::Value::String(reason.to_string()));
+            obj.insert(
+                "deny_reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
         }
+        // Decision/effects are mutable across the pipeline. Rebuild prior stage
+        // auth tokens against the new state so the chain remains internally
+        // consistent before appending the WF stage.
+        self.rebuild_auth_chain_with_current_key();
+        let _ = self.recompute_cid();
+        self.id = self.receipt_cid.as_str().to_string();
+    }
+
+    fn rebuild_auth_chain_with_current_key(&mut self) {
+        let Ok(current_key) = load_required_stage_secret_key() else {
+            return;
+        };
+        if self.stages.is_empty() {
+            return;
+        }
+
+        let mut shadow = self.clone();
+        shadow.stages.clear();
+        shadow.receipt_cid = TypedCid::new_unchecked("");
+        shadow.id.clear();
+
+        let mut rebuilt = Vec::with_capacity(self.stages.len());
+        for mut stage in self.stages.clone() {
+            let prev_cid = if shadow.receipt_cid.as_str().is_empty() {
+                "genesis"
+            } else {
+                shadow.receipt_cid.as_str()
+            };
+            stage.auth_token =
+                compute_auth_token_with_key(prev_cid, stage.stage.as_str(), &current_key);
+            shadow.stages.push(stage.clone());
+            if shadow.recompute_cid().is_err() {
+                return;
+            }
+            shadow.id = shadow.receipt_cid.as_str().to_string();
+            rebuilt.push(stage);
+        }
+
+        self.stages = rebuilt;
     }
 
     /// Get the current stage count.
@@ -312,25 +460,59 @@ impl UnifiedReceipt {
 
     /// Verify the auth chain is intact.
     pub fn verify_auth_chain(&self) -> bool {
-        let mut prev_cid = "genesis".to_string();
+        let current_key = match load_required_stage_secret_key() {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let previous_key = match load_optional_stage_secret_key(STAGE_SECRET_PREV_ENV) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+
+        self.verify_auth_chain_with_keys(&current_key, previous_key.as_ref())
+            .unwrap_or(false)
+    }
+
+    fn verify_auth_chain_with_keys(
+        &self,
+        current_key: &[u8; 32],
+        previous_key: Option<&[u8; 32]>,
+    ) -> Result<bool, ReceiptError> {
+        // Replay the receipt CID evolution stage by stage and verify token at each step.
+        let mut shadow = self.clone();
+        shadow.stages.clear();
+        shadow.receipt_cid = TypedCid::new_unchecked("");
+        shadow.id.clear();
 
         for stage in &self.stages {
-            let expected = compute_auth_token(&prev_cid, stage.stage.as_str());
-            if stage.auth_token != expected {
-                return false;
+            let prev_cid = if shadow.receipt_cid.as_str().is_empty() {
+                "genesis"
+            } else {
+                shadow.receipt_cid.as_str()
+            };
+
+            let expected_current =
+                compute_auth_token_with_key(prev_cid, stage.stage.as_str(), current_key);
+            let expected_previous = previous_key
+                .map(|k| compute_auth_token_with_key(prev_cid, stage.stage.as_str(), k));
+
+            let token_matches = stage.auth_token == expected_current
+                || expected_previous.as_deref() == Some(stage.auth_token.as_str());
+            if !token_matches {
+                return Ok(false);
             }
-            // After this stage, the receipt CID would have been recomputed.
-            // For chain verification, we use the auth_token as the link.
-            prev_cid = stage.auth_token.clone();
+
+            shadow.stages.push(stage.clone());
+            shadow.recompute_cid()?;
+            shadow.id = shadow.receipt_cid.as_str().to_string();
         }
 
-        true
+        Ok(shadow.receipt_cid == self.receipt_cid)
     }
 
     /// Serialize to Universal Envelope JSON.
     pub fn to_json(&self) -> Result<serde_json::Value, ReceiptError> {
-        serde_json::to_value(self)
-            .map_err(|e| ReceiptError::Serialization(e.to_string()))
+        serde_json::to_value(self).map_err(|e| ReceiptError::Serialization(e.to_string()))
     }
 
     /// Deserialize from Universal Envelope JSON.
@@ -340,9 +522,53 @@ impl UnifiedReceipt {
     }
 }
 
+fn load_required_stage_secret_key() -> Result<[u8; 32], ReceiptError> {
+    let raw = std::env::var(STAGE_SECRET_ENV).map_err(|_| {
+        ReceiptError::AuthChainBroken(format!(
+            "{} is not set; configure a stage secret",
+            STAGE_SECRET_ENV
+        ))
+    })?;
+
+    key_from_secret_str(&raw).map_err(|e| {
+        ReceiptError::AuthChainBroken(format!("invalid {} value: {}", STAGE_SECRET_ENV, e))
+    })
+}
+
+fn load_optional_stage_secret_key(var_name: &str) -> Result<Option<[u8; 32]>, ReceiptError> {
+    match std::env::var(var_name) {
+        Ok(raw) => key_from_secret_str(&raw).map(Some).map_err(|e| {
+            ReceiptError::AuthChainBroken(format!("invalid {} value: {}", var_name, e))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(ReceiptError::AuthChainBroken(format!(
+            "failed reading {}: {}",
+            var_name, e
+        ))),
+    }
+}
+
+fn key_from_secret_str(raw: &str) -> Result<[u8; 32], String> {
+    if raw.is_empty() {
+        return Err("secret is empty".to_string());
+    }
+
+    let bytes = if let Some(hex_payload) = raw.strip_prefix("hex:") {
+        hex::decode(hex_payload).map_err(|e| format!("hex decode failed: {}", e))?
+    } else {
+        raw.as_bytes().to_vec()
+    };
+
+    Ok(padded_key(&bytes))
+}
+
+fn receipt_sign_domain() -> String {
+    std::env::var(RECEIPT_DOMAIN_ENV).unwrap_or_else(|_| ubl_canon::domains::RECEIPT.to_string())
+}
+
 /// Compute HMAC-BLAKE3 auth token for stage chain linkage.
-fn compute_auth_token(prev_cid: &str, stage_name: &str) -> String {
-    let mut hasher = blake3::Hasher::new_keyed(&padded_key(STAGE_SECRET));
+fn compute_auth_token_with_key(prev_cid: &str, stage_name: &str, key: &[u8; 32]) -> String {
+    let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(prev_cid.as_bytes());
     hasher.update(b"||");
     hasher.update(stage_name.as_bytes());
@@ -358,34 +584,12 @@ fn padded_key(key: &[u8]) -> [u8; 32] {
     buf
 }
 
-/// Produce canonical JSON bytes (sorted keys, no extra whitespace).
-fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    fn sort(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut sorted = serde_json::Map::new();
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                for k in keys {
-                    sorted.insert(k.clone(), sort(&map[k]));
-                }
-                serde_json::Value::Object(sorted)
-            }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(sort).collect())
-            }
-            other => other.clone(),
-        }
-    }
-    let sorted = sort(value);
-    serde_json::to_vec(&sorted).unwrap_or_default()
-}
-
 #[derive(Debug)]
 pub enum ReceiptError {
     Serialization(String),
     InvalidStageOrder(String),
     AuthChainBroken(String),
+    Signature(String),
 }
 
 impl std::fmt::Display for ReceiptError {
@@ -394,6 +598,7 @@ impl std::fmt::Display for ReceiptError {
             Self::Serialization(s) => write!(f, "Serialization error: {}", s),
             Self::InvalidStageOrder(s) => write!(f, "Invalid stage order: {}", s),
             Self::AuthChainBroken(s) => write!(f, "Auth chain broken: {}", s),
+            Self::Signature(s) => write!(f, "Signature error: {}", s),
         }
     }
 }
@@ -404,7 +609,15 @@ impl std::error::Error for ReceiptError {}
 mod tests {
     use super::*;
 
+    const TEST_STAGE_SECRET_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn ensure_test_stage_secret() {
+        std::env::set_var(STAGE_SECRET_ENV, format!("hex:{}", TEST_STAGE_SECRET_HEX));
+    }
+
     fn make_receipt() -> UnifiedReceipt {
+        ensure_test_stage_secret();
         UnifiedReceipt::new(
             "a/acme/t/prod",
             "did:key:z123",
@@ -421,6 +634,8 @@ mod tests {
             output_cid: Some(format!("b3:output-{}", stage.as_str())),
             fuel_used: None,
             policy_trace: vec![],
+            vm_sig: None,
+            vm_sig_payload_cid: None,
             auth_token: String::new(), // Computed by append_stage
             duration_ms: 1,
         }
@@ -440,31 +655,44 @@ mod tests {
         let mut r = make_receipt();
         assert!(r.receipt_cid.as_str().is_empty());
 
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:input-wa")).unwrap();
-        assert!(r.receipt_cid.as_str().starts_with("b3:"), "CID must be BLAKE3");
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:input-wa"))
+            .unwrap();
+        assert!(
+            r.receipt_cid.as_str().starts_with("b3:"),
+            "CID must be BLAKE3"
+        );
         assert_eq!(r.id, r.receipt_cid.as_str(), "@id must match receipt_cid");
     }
 
     #[test]
     fn cid_changes_with_each_stage() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
         let cid_after_wa = r.receipt_cid.clone();
 
-        r.append_stage(make_stage(PipelineStage::Check, "b3:check")).unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
         let cid_after_check = r.receipt_cid.clone();
 
-        assert_ne!(cid_after_wa, cid_after_check, "CID must change after each stage");
+        assert_ne!(
+            cid_after_wa, cid_after_check,
+            "CID must change after each stage"
+        );
     }
 
     #[test]
     fn full_pipeline_stages() {
         let mut r = make_receipt();
 
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
-        r.append_stage(make_stage(PipelineStage::Check, "b3:check")).unwrap();
-        r.append_stage(make_stage(PipelineStage::Transition, "b3:tr")).unwrap();
-        r.append_stage(make_stage(PipelineStage::WriteFinished, "b3:wf")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Transition, "b3:tr"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteFinished, "b3:wf"))
+            .unwrap();
 
         assert_eq!(r.stage_count(), 4);
         assert!(r.has_stage(PipelineStage::WriteAhead));
@@ -476,11 +704,16 @@ mod tests {
     #[test]
     fn auth_tokens_are_non_empty() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
-        r.append_stage(make_stage(PipelineStage::Check, "b3:check")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
 
         for stage in &r.stages {
-            assert!(stage.auth_token.starts_with("hmac:"), "auth_token must be HMAC");
+            assert!(
+                stage.auth_token.starts_with("hmac:"),
+                "auth_token must be HMAC"
+            );
             assert!(stage.auth_token.len() > 5);
         }
     }
@@ -488,20 +721,55 @@ mod tests {
     #[test]
     fn auth_tokens_differ_per_stage() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
-        r.append_stage(make_stage(PipelineStage::Check, "b3:check")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
 
         assert_ne!(
-            r.stages[0].auth_token,
-            r.stages[1].auth_token,
+            r.stages[0].auth_token, r.stages[1].auth_token,
             "Each stage must have a unique auth token"
         );
     }
 
     #[test]
+    fn verify_auth_chain_detects_tamper() {
+        let mut r = make_receipt();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
+        assert!(r.verify_auth_chain());
+
+        r.stages[1].auth_token = "hmac:deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        assert!(!r.verify_auth_chain());
+    }
+
+    #[test]
+    fn verify_auth_chain_accepts_previous_secret_after_rotation() {
+        // Build receipt with the test key.
+        let mut r = make_receipt();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.append_stage(make_stage(PipelineStage::Check, "b3:check"))
+            .unwrap();
+
+        let old_key = key_from_secret_str(&format!("hex:{}", TEST_STAGE_SECRET_HEX)).unwrap();
+        let new_key = key_from_secret_str(
+            "hex:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .unwrap();
+
+        assert!(r
+            .verify_auth_chain_with_keys(&new_key, Some(&old_key))
+            .unwrap());
+    }
+
+    #[test]
     fn deny_sets_decision_and_effect() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
         r.deny("type not allowed");
 
         assert_eq!(r.decision, Decision::Deny);
@@ -511,7 +779,8 @@ mod tests {
     #[test]
     fn to_json_has_all_anchors() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
         let json = r.to_json().unwrap();
         assert_eq!(json["@type"], "ubl/receipt");
@@ -524,6 +793,7 @@ mod tests {
 
     #[test]
     fn receipt_cid_is_deterministic() {
+        ensure_test_stage_secret();
         // Same inputs → same CID
         let mut r1 = UnifiedReceipt::new("a/x/t/y", "did:key:z1", "did:key:z1#v0", "aabb");
         let mut r2 = UnifiedReceipt::new("a/x/t/y", "did:key:z1", "did:key:z1#v0", "aabb");
@@ -538,6 +808,8 @@ mod tests {
             output_cid: None,
             fuel_used: None,
             policy_trace: vec![],
+            vm_sig: None,
+            vm_sig_payload_cid: None,
             auth_token: String::new(),
             duration_ms: 0,
         };
@@ -545,13 +817,17 @@ mod tests {
         r1.append_stage(stage1.clone()).unwrap();
         r2.append_stage(stage1).unwrap();
 
-        assert_eq!(r1.receipt_cid, r2.receipt_cid, "Same inputs must produce same CID");
+        assert_eq!(
+            r1.receipt_cid, r2.receipt_cid,
+            "Same inputs must produce same CID"
+        );
     }
 
     #[test]
     fn check_stage_includes_policy_trace() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
         let check_stage = StageExecution {
             stage: PipelineStage::Check,
@@ -567,6 +843,8 @@ mod tests {
                 rb_results: vec![],
                 duration_ms: 0,
             }],
+            vm_sig: None,
+            vm_sig_payload_cid: None,
             auth_token: String::new(),
             duration_ms: 1,
         };
@@ -579,7 +857,8 @@ mod tests {
     #[test]
     fn tr_stage_records_fuel() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
         let tr_stage = StageExecution {
             stage: PipelineStage::Transition,
@@ -588,6 +867,8 @@ mod tests {
             output_cid: Some("b3:tr-output".to_string()),
             fuel_used: Some(42),
             policy_trace: vec![],
+            vm_sig: Some("ed25519:test".to_string()),
+            vm_sig_payload_cid: Some("b3:test-payload".to_string()),
             auth_token: String::new(),
             duration_ms: 5,
         };
@@ -601,7 +882,10 @@ mod tests {
     #[test]
     fn runtime_info_capture_has_valid_fields() {
         let rt = RuntimeInfo::capture();
-        assert!(rt.binary_hash.starts_with("b3:"), "binary_hash must be b3: prefixed");
+        assert!(
+            rt.binary_hash.starts_with("b3:"),
+            "binary_hash must be b3: prefixed"
+        );
         assert!(!rt.version.is_empty());
         assert!(!rt.build.arch.is_empty());
         assert!(!rt.build.os.is_empty());
@@ -627,18 +911,24 @@ mod tests {
 
     #[test]
     fn receipt_with_runtime_info_includes_rt_in_json() {
+        ensure_test_stage_secret();
         let rt = RuntimeInfo::new("b3:test-hash", "0.1.0");
         let mut r = UnifiedReceipt::new(
             "a/acme/t/prod",
             "did:key:z123",
             "did:key:z123#v0",
             "aabbccdd",
-        ).with_runtime_info(rt);
+        )
+        .with_runtime_info(rt);
 
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
         let json = r.to_json().unwrap();
-        assert!(json.get("rt").is_some(), "receipt JSON must include rt field");
+        assert!(
+            json.get("rt").is_some(),
+            "receipt JSON must include rt field"
+        );
         assert_eq!(json["rt"]["binary_hash"], "b3:test-hash");
         assert_eq!(json["rt"]["version"], "0.1.0");
         assert!(json["rt"]["build"]["arch"].is_string());
@@ -648,7 +938,8 @@ mod tests {
     #[test]
     fn receipt_without_runtime_info_omits_rt() {
         let mut r = make_receipt();
-        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
         let json = r.to_json().unwrap();
         assert!(json.get("rt").is_none(), "rt should be omitted when None");
@@ -659,14 +950,19 @@ mod tests {
         let bm = BuildMeta::capture();
         assert!(!bm.os.is_empty());
         assert!(!bm.arch.is_empty());
-        assert!(!bm.rustc.is_empty(), "rustc must be non-empty (at least 'unknown')");
+        assert!(
+            !bm.rustc.is_empty(),
+            "rustc must be non-empty (at least 'unknown')"
+        );
         assert!(bm.profile == "debug" || bm.profile == "release");
     }
 
     #[test]
     fn runtime_info_changes_receipt_cid() {
+        ensure_test_stage_secret();
         let mut r1 = make_receipt();
-        r1.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r1.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
         let cid_without_rt = r1.receipt_cid.clone();
 
         let rt = RuntimeInfo::new("b3:some-binary", "0.1.0");
@@ -675,11 +971,52 @@ mod tests {
             "did:key:z123",
             "did:key:z123#v0",
             "deadbeef01020304",
-        ).with_runtime_info(rt);
+        )
+        .with_runtime_info(rt);
         r2.t = r1.t.clone(); // same timestamp
-        r2.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa")).unwrap();
+        r2.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
 
-        assert_ne!(cid_without_rt, r2.receipt_cid,
-            "RuntimeInfo must affect receipt CID (different content = different CID)");
+        assert_ne!(
+            cid_without_rt, r2.receipt_cid,
+            "RuntimeInfo must affect receipt CID (different content = different CID)"
+        );
+    }
+
+    #[test]
+    fn receipt_sign_and_verify_ok() {
+        ensure_test_stage_secret();
+        let sk = ubl_kms::generate_signing_key();
+        let vk = sk.verifying_key();
+        let did = ubl_kms::did_from_verifying_key(&vk);
+        let kid = ubl_kms::kid_from_verifying_key(&vk);
+
+        let mut r = UnifiedReceipt::new("a/acme/t/prod", &did, &kid, "deadbeef01020304");
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.finalize_and_sign(&sk, CryptoMode::CompatV1).unwrap();
+
+        let report = r.verify_signature(VerifyMode::V1Only).unwrap();
+        assert!(report.valid);
+        assert!(report.v1_valid);
+    }
+
+    #[test]
+    fn receipt_bitflip_invalidates_sig() {
+        ensure_test_stage_secret();
+        let sk = ubl_kms::generate_signing_key();
+        let vk = sk.verifying_key();
+        let did = ubl_kms::did_from_verifying_key(&vk);
+        let kid = ubl_kms::kid_from_verifying_key(&vk);
+
+        let mut r = UnifiedReceipt::new("a/acme/t/prod", &did, &kid, "deadbeef01020304");
+        r.append_stage(make_stage(PipelineStage::WriteAhead, "b3:wa"))
+            .unwrap();
+        r.finalize_and_sign(&sk, CryptoMode::CompatV1).unwrap();
+        assert!(r.verify_signature(VerifyMode::V1Only).unwrap().valid);
+
+        r.effects["tampered"] = serde_json::json!(true);
+        let report = r.verify_signature(VerifyMode::V1Only).unwrap();
+        assert!(!report.valid);
     }
 }

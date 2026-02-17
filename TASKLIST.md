@@ -84,6 +84,58 @@
 
 ---
 
+## Execution Path — February 17, 2026 → "Achieved"
+
+This section is additive and does not remove any existing items above. It is the operating plan from **today (February 17, 2026)** until the project reaches "Achieved."
+
+### Definition of "Achieved"
+
+"Achieved" means all five gates below are green and stable for one full release window (30 consecutive days):
+
+- [ ] **G1 — Security trust chain closed**: capability signatures are cryptographically verified, receipt stage secret is managed (not hardcoded), and receipt auth chain verification is correct and enforced.
+- [ ] **G2 — Determinism proven**: canonicalization is uniform across all CID/sign paths and reproducibility KATs pass on Linux + macOS in CI.
+- [ ] **G3 — Data path scales**: no critical API path depends on full-store scans; indexed lookups exist for high-traffic queries.
+- [ ] **G4 — Runtime operable**: structured tracing, dashboards, alerts, and incident/runbook coverage are in place.
+- [ ] **G5 — Real workload live**: one production workflow runs under SLO with measured reliability and auditability.
+
+### Timeline With Exit Criteria
+
+| Window | Milestone | Must Finish | Exit Proof |
+|---|---|---|---|
+| **Feb 17, 2026 → Mar 14, 2026** | **M1 — Trust Baseline** | Capability signature verification (hardening of PR-A P0.3), remove hardcoded stage secret (`STAGE_SECRET`), correct and enforce `verify_auth_chain()`, segment-safe capability audience matching, strict RFC-3339 expiration checks. | Security tests include forge/fail cases; no hardcoded secrets in runtime receipt auth path. |
+| **Mar 15, 2026 → Apr 18, 2026** | **M2 — Determinism Contract** | Canonicalize VM receipt emission path (remove non-canonical JSON hash/sign path), complete Parse-Don't-Validate expansion (H6) on critical chip types, add cross-platform determinism CI matrix and golden vectors. | Same chip vectors produce same chip CID across CI platforms; receipt semantics match PF-02 policy. |
+| **Apr 19, 2026 → May 23, 2026** | **M3 — Indexed Storage Plane** | Replace scan-based ChipStore query paths with indexes (`chip_type`, `receipt_cid`, revocation target, tags, executor DID), implement rebuild tooling, remove endpoint-level scan dependencies for receipt/verify paths. | Load test evidence (target dataset >= 100k chips) shows bounded lookup latency and no O(n) hot-path scans. |
+| **May 24, 2026 → Jun 27, 2026** | **M4 — Certified Runtime Operations** | Deliver PS3 (F1 Runtime certification), PS4 (F2 structured tracing), SLO dashboards and alerting, failure drills and recovery playbook. | On-call runbook validated in drill; runtime provenance present in receipts; p95/p99 latency and error metrics visible. |
+| **Jun 28, 2026 → Aug 15, 2026** | **M5 — First Production Slice** | Launch one end-to-end workflow (single domain), enforce policy rollout automation (H4), complete post-launch hardening fixes, publish acceptance report against G1–G5. | 30-day stability window with SLO met, incident log reviewed, and "Achieved" gates all checked. |
+
+### Net-New Work Items Added Today (Feb 17, 2026)
+
+| ID | Task | Priority | Status |
+|---|---|---|---|
+| N1 | **Cryptographic capability verification** | Critical | Done |
+| N2 | **Receipt stage secret management (env/KMS + rotation)** | Critical | Done |
+| N3 | **Fix + enforce receipt auth chain verification semantics** | Critical | Done |
+| N4 | **Canonicalize VM `EmitRc` payload hash/sign path** | High | Done |
+| N5 | **Segment-safe audience matching (`@cap.audience` vs `@world`)** | High | Done |
+| N6 | **Strict RFC-3339 token/cap expiration parsing and checks** | High | Done |
+| N7 | **Indexed receipt lookup path for gate endpoints** | High | Done |
+
+### Existing Backlog Alignment (No Task Loss)
+
+| Existing ID | Phase | Notes |
+|---|---|---|
+| H4 (P0→P1 rollout automation) | M5 | Required for controlled production transition. |
+| H6 (Parse, Don't Validate) | M2 | Move critical chip flow to typed parsing first. |
+| F1 (Runtime certification) | M4 | Core deliverable for "Certified Runtime." |
+| F2 (Structured tracing) | M4 | Required for operability gate G4. |
+| F4 (Property testing) | M2 | Supports determinism/confidence proof. |
+| F5/F6/F7 (UNC-1 runtime/migration) | M2 → M4 | Keep behind migration flags until deterministic baseline is locked. |
+| F9 (Key rotation as chip) | M4 | Complements N2 secret lifecycle. |
+| F10 (CAS backends) | Post-M5 | Keep after "Achieved" unless production workload demands earlier. |
+| F13 (PQ signature stubs) | Post-M5 | Keep feature-gated and non-blocking for initial achievement gate. |
+
+---
+
 ## Open — Hardening the Base (2 remaining)
 
 | # | Task | Location | Notes |

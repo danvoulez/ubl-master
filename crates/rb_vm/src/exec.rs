@@ -4,6 +4,7 @@ use crate::{
     tlv::Instr,
     types::{Cid, RcPayload, Value},
 };
+use base64::Engine;
 use serde_json::json;
 
 pub type Fuel = u64;
@@ -65,6 +66,8 @@ pub struct Vm<'a, C: CasProvider, S: SignProvider, K: CanonProvider> {
 #[derive(Debug)]
 pub struct VmOutcome {
     pub rc_cid: Option<Cid>,
+    pub rc_sig: Option<String>,
+    pub rc_payload_cid: Option<Cid>,
     pub steps: u64,
     pub fuel_used: Fuel,
     pub trace: Vec<TraceStep>,
@@ -291,7 +294,7 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                     };
                     // Ed25519 verification
                     let valid = if pubkey_bytes.len() == 32 && sig_bytes.len() == 64 {
-                        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
                         match VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap()) {
                             Ok(vk) => {
                                 let sig = Signature::from_bytes(&sig_bytes.try_into().unwrap());
@@ -327,11 +330,26 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         decision: json!({"status":"ok"}),
                         body: self.rc_body.clone(),
                     };
-                    let bytes = serde_json::to_vec(&payload).unwrap(); // TODO: canon NRF
-                    let _sig = self.signer.sign_jws(&bytes); // MVP: assinatura crua
+                    // Canonicalize the full RC payload before signing/hashing so
+                    // key order and equivalent JSON forms cannot change signatures/CIDs.
+                    let payload_json = serde_json::to_value(&payload)
+                        .map_err(|_| ExecError::Deny("rc_payload_serialize_error".into()))?;
+                    let payload_json = self.canon.canon(payload_json);
+                    let bytes = serde_json::to_vec(&payload_json)
+                        .map_err(|_| ExecError::Deny("rc_payload_encode_error".into()))?;
+                    let sig_bytes = self.signer.sign_jws(&bytes);
+                    if sig_bytes.is_empty() {
+                        return Err(ExecError::Deny("emit_rc_missing_signature".into()));
+                    }
+                    let sig = format!(
+                        "ed25519:{}",
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes)
+                    );
                     let cid = self.cas.put(&bytes);
                     return Ok(VmOutcome {
-                        rc_cid: Some(cid),
+                        rc_cid: Some(cid.clone()),
+                        rc_sig: Some(sig),
+                        rc_payload_cid: Some(cid),
                         steps: self.steps,
                         fuel_used: self.fuel_used,
                         trace: std::mem::take(&mut self.trace),
@@ -350,6 +368,8 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
         }
         Ok(VmOutcome {
             rc_cid: None,
+            rc_sig: None,
+            rc_payload_cid: None,
             steps: self.steps,
             fuel_used: self.fuel_used,
             trace: std::mem::take(&mut self.trace),

@@ -13,11 +13,16 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 use ubl_chipstore::{ChipStore, SledBackend};
 use ubl_runtime::advisory::AdvisoryEngine;
-use ubl_runtime::error_response::UblError;
+use ubl_runtime::durable_store::DurableStore;
+use ubl_runtime::error_response::{ErrorCode, UblError};
 use ubl_runtime::event_bus::EventBus;
 use ubl_runtime::manifest::GateManifest;
+use ubl_runtime::outbox_dispatcher::OutboxDispatcher;
 use ubl_runtime::policy_loader::InMemoryPolicyStorage;
 use ubl_runtime::UblPipeline;
 
@@ -33,7 +38,8 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting UBL MASTER Gate");
+    init_tracing();
+    info!("starting UBL MASTER Gate");
 
     // Initialize shared components
     let _event_bus = Arc::new(EventBus::new());
@@ -59,8 +65,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bootstrap genesis chip — self-signed root of all policy
     match pipeline.bootstrap_genesis().await {
-        Ok(cid) => println!("Genesis chip bootstrapped: {}", cid),
-        Err(e) => eprintln!("FATAL: Genesis bootstrap failed: {}", e),
+        Ok(cid) => info!(%cid, "genesis chip bootstrapped"),
+        Err(e) => error!(error = %e, "FATAL: genesis bootstrap failed"),
+    }
+
+    // Start outbox dispatcher workers when SQLite durability is enabled.
+    if let Ok(Some(store)) = DurableStore::from_env() {
+        let workers: usize = std::env::var("UBL_OUTBOX_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        metrics::set_outbox_pending(store.outbox_pending().unwrap_or(0));
+
+        for worker_id in 0..workers {
+            let dispatcher = OutboxDispatcher::new(store.clone()).with_backoff(2, 300);
+            let store_for_metrics = store.clone();
+            tokio::spawn(async move {
+                loop {
+                    let processed = dispatcher.run_once(64, |event| match event.event_type.as_str() {
+                        // Placeholder delivery path; real publisher can be wired here.
+                        "emit_receipt" => Ok(()),
+                        _ => {
+                            metrics::inc_outbox_retry();
+                            Err(format!("unknown outbox event type: {}", event.event_type))
+                        }
+                    });
+
+                    match processed {
+                        Ok(processed_count) => {
+                            metrics::set_outbox_pending(
+                                store_for_metrics.outbox_pending().unwrap_or_default(),
+                            );
+                            if processed_count == 0 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                        }
+                        Err(e) => {
+                            metrics::inc_outbox_retry();
+                            warn!(worker_id, error = %e, "outbox worker error");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+        }
+        info!(workers, "outbox dispatcher started");
     }
 
     let manifest = Arc::new(GateManifest::default());
@@ -87,10 +137,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await?;
-    println!("Gate listening on http://0.0.0.0:4000");
+    info!("gate listening on http://0.0.0.0:4000");
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,ubl_runtime=debug,ubl_gate=debug")
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .try_init();
 }
 
 async fn healthz() -> Json<Value> {
@@ -121,6 +181,8 @@ async fn create_chip(
             let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
             let mut headers = HeaderMap::new();
             if result.replayed {
+                metrics::inc_idempotency_hit();
+                metrics::inc_idempotency_replay_block();
                 headers.insert("X-UBL-Replay", "true".parse().unwrap());
             }
             (
@@ -140,6 +202,15 @@ async fn create_chip(
         Err(e) => {
             metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
             let ubl_err = UblError::from_pipeline_error(&e);
+            match ubl_err.code {
+                ErrorCode::SignError | ErrorCode::InvalidSignature => {
+                    let mode = std::env::var("UBL_CRYPTO_MODE")
+                        .unwrap_or_else(|_| "compat_v1".to_string());
+                    metrics::inc_crypto_verify_fail("pipeline", &mode);
+                }
+                ErrorCode::CanonError => metrics::inc_canon_divergence("pipeline"),
+                _ => {}
+            }
             let code_str = format!("{:?}", ubl_err.code);
             if code_str.contains("Knock") {
                 metrics::inc_knock_reject();
@@ -196,13 +267,10 @@ async fn verify_chip(
     let receipt_exists = if receipt_cid.as_str().is_empty() {
         false
     } else {
-        // Scan for receipt (same pattern as get_receipt_trace)
-        let query = ubl_chipstore::ChipQuery {
-            chip_type: None, tags: vec![], created_after: None,
-            created_before: None, executor_did: None, limit: Some(1000), offset: None,
-        };
-        state.chip_store.query(&query).await
-            .map(|r| r.chips.iter().any(|c| c.receipt_cid == *receipt_cid))
+        state.chip_store
+            .get_chip_by_receipt_cid(receipt_cid.as_str())
+            .await
+            .map(|c| c.is_some())
             .unwrap_or(false)
     };
 
@@ -293,7 +361,7 @@ async fn get_passport_advisories(
     // Query ChipStore for advisory chips that reference this passport
     let query = ubl_chipstore::ChipQuery {
         chip_type: Some("ubl/advisory".to_string()),
-        tags: vec![],
+        tags: vec![format!("passport_cid:{}", passport_cid)],
         created_after: None,
         created_before: None,
         executor_did: None,
@@ -303,10 +371,9 @@ async fn get_passport_advisories(
 
     match state.chip_store.query(&query).await {
         Ok(result) => {
-            // Filter by passport_cid in chip_data
-            let advisories: Vec<Value> = result.chips.iter()
-                .filter(|c| c.chip_data.get("passport_cid")
-                    .and_then(|v| v.as_str()) == Some(passport_cid.as_str()))
+            let advisories: Vec<Value> = result
+                .chips
+                .iter()
                 .map(|c| json!({
                     "cid": c.cid,
                     "action": c.chip_data.get("action").unwrap_or(&json!("unknown")),
@@ -422,45 +489,27 @@ async fn get_receipt_trace(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    // Look up the chip by its receipt_cid
-    // For now, scan by querying all chips and matching receipt_cid
-    // In production, this would be an indexed lookup
-    let query = ubl_chipstore::ChipQuery {
-        chip_type: None,
-        tags: vec![],
-        created_after: None,
-        created_before: None,
-        executor_did: None,
-        limit: Some(1000),
-        offset: None,
-    };
-
-    match state.chip_store.query(&query).await {
-        Ok(result) => {
-            if let Some(chip) = result.chips.iter().find(|c| c.receipt_cid.as_str() == cid) {
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "@type": "ubl/trace",
-                        "receipt_cid": cid,
-                        "chip_cid": chip.cid,
-                        "chip_type": chip.chip_type,
-                        "execution_metadata": {
-                            "runtime_version": chip.execution_metadata.runtime_version,
-                            "execution_time_ms": chip.execution_metadata.execution_time_ms,
-                            "fuel_consumed": chip.execution_metadata.fuel_consumed,
-                            "policies_applied": chip.execution_metadata.policies_applied,
-                            "reproducible": chip.execution_metadata.reproducible,
-                        },
-                    })),
-                )
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Receipt {} not found", cid)})),
-                )
-            }
-        }
+    match state.chip_store.get_chip_by_receipt_cid(&cid).await {
+        Ok(Some(chip)) => (
+            StatusCode::OK,
+            Json(json!({
+                "@type": "ubl/trace",
+                "receipt_cid": cid,
+                "chip_cid": chip.cid,
+                "chip_type": chip.chip_type,
+                "execution_metadata": {
+                    "runtime_version": chip.execution_metadata.runtime_version,
+                    "execution_time_ms": chip.execution_metadata.execution_time_ms,
+                    "fuel_consumed": chip.execution_metadata.fuel_consumed,
+                    "policies_applied": chip.execution_metadata.policies_applied,
+                    "reproducible": chip.execution_metadata.reproducible,
+                },
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Receipt {} not found", cid)})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),

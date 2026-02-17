@@ -120,6 +120,9 @@ The four Laws remain **inviolable**. Everything else is implementation detail th
 | `ai_passport.rs` | AI Passport chip type — LLM identity, rights, duties |
 | `ledger.rs` | `LedgerWriter` trait, `NdjsonLedger`, `InMemoryLedger` (6 tests) |
 | `event_bus.rs` | In-process event bus for receipt events |
+| `durable_store.rs` | SQLite durability boundary: atomic commit (`receipts + idempotency + outbox`) |
+| `outbox_dispatcher.rs` | Durable outbox claim/ack/nack + retry/backoff worker |
+| `transition_registry.rs` | Deterministic TR bytecode resolution by `@type`/profile/override |
 
 ### 2.1 What Works End-to-End Today
 
@@ -129,7 +132,7 @@ POST /v1/chips → KNOCK (validate) → WA (seal intent) → CHECK (policy + onb
 
 **Working**: Full 5-stage pipeline with real rb_vm execution. Chips stored in ChipStore. UnifiedReceipt evolves through stages. Genesis bootstrap at startup. Onboarding dependency chain enforced (app→user→tenant→membership→token→revoke). Canonical error responses. Advisory engine. AI Passport. Event bus. Gate serves real ChipStore lookups and receipt traces.
 
-**Not yet working**: SHA2→BLAKE3 migration. Real DID resolution (placeholder DIDs). Runtime self-attestation (`runtime_hash`). Structured tracing. Rich URLs (implemented but not production-tested).
+**Not yet working**: SHA2→BLAKE3 metadata cleanup in legacy paths. Runtime self-attestation hardening (`runtime_hash` as trust anchor). Structured tracing standardization.
 
 ---
 
@@ -357,18 +360,22 @@ struct StageExecution {
 
 **CID evolution**: `receipt_cid` recomputed after each stage append. The WF `receipt_cid` is the final canonical CID.
 
-### 5.3 rb_vm Pipeline Integration (✅ Implemented — S2.1)
+### 5.3 rb_vm Pipeline Integration (✅ Implemented — S2.1 + P1 registry wiring)
 
-TR stage creates a `Vm` instance, decodes the chip's TLV bytecode, and executes it with real fuel metering. `PipelineCas`, `PipelineSigner`, and `PipelineCanon` implement the rb_vm traits. Fuel used and RB count recorded in the UnifiedReceipt TR stage.
+TR stage creates a `Vm` instance and executes TLV bytecode selected by `TransitionRegistry` (not a fixed passthrough blob). `PipelineCas`, `PipelineSigner`, and `PipelineCanon` implement rb_vm traits. Fuel usage, bytecode provenance, and adapter metadata are recorded in TR `vm_state`.
+
+Resolution order:
+1. chip override `@tr.bytecode_hex`
+2. chip override `@tr.profile`
+3. env map `UBL_TR_BYTECODE_MAP_JSON`
+4. env map `UBL_TR_PROFILE_MAP_JSON`
+5. built-in default profile by `@type`
 
 ```rust
-async fn stage_transition(&self, request: &ChipRequest, ...) -> Result<PipelineReceipt, PipelineError> {
-    let chip_bytes = get_chip_bytecode(request)?;
-    let code = tlv::decode_stream(&chip_bytes)?;
-    let mut vm = Vm::new(cfg, cas, &signer, canon, input_cids);
-    let outcome = vm.run(&code)?;
-    // outcome.rc_cid, outcome.fuel_used, outcome.steps → into receipt
-}
+let resolution = transition_registry.resolve(&request.chip_type, &request.body)?;
+let instructions = tlv::decode_stream(&resolution.bytecode)?;
+let outcome = vm.run(&instructions)?;
+// outcome.rc_cid, outcome.fuel_used, outcome.steps + resolution metadata -> TR receipt
 ```
 
 ### 5.4 Input Validation (KNOCK stage)
@@ -465,7 +472,7 @@ Rules:
 
 | Decision | Value |
 |---|---|
-| DID method | `did:key:z...` (Ed25519 public key, base58-btc) |
+| DID method | `did:key:z...` Ed25519 with strict multicodec (`0xED01`) support + compat fallback |
 | Key ID format | `did:key:z...#vN` where N is monotonically increasing |
 | Key rotation | New `kid` published as `ubl/key.rotate` chip; old kid valid for verification of past receipts |
 | Signing curve | Ed25519 (RFC 8032) |
@@ -488,10 +495,10 @@ All signatures include a context prefix to prevent cross-domain replay:
 
 | Context | Domain String |
 |---|---|
-| Receipt signing | `"ubl-receipt/v1"` |
+| Receipt signing | `"ubl/receipt/v1"` |
 | RB-VM signing | `"ubl-rb-vm/v1"` |
 | Policy signing | `"ubl-policy/v1"` |
-| URL signing | `"ubl-url/v1"` |
+| URL signing | `"ubl/rich-url/v1"` |
 
 Format: `sig = Ed25519.sign(key, domain_string || BLAKE3(payload))`
 
@@ -681,6 +688,10 @@ The passport enters the registry through the same door as everything else — PO
 | `CAS_NOT_FOUND` | CasGet on missing CID | TR |
 | `SIGN_ERROR` | Signature generation/verification failure | WF |
 | `STORAGE_ERROR` | ChipStore/Ledger write failure | WF |
+| `invalid_signature` | Rich URL / receipt signature invalid (strict mode) | Verify |
+| `runtime_hash_mismatch` | Rich URL `rt` differs from receipt runtime hash | Verify |
+| `idempotency_conflict` | Replay key already committed in durable idempotency store | WF |
+| `durable_commit_failed` | Atomic SQLite commit failed (`receipts + idempotency + outbox`) | WF |
 | `INTERNAL_ERROR` | Unexpected system error | Any |
 | `REPLAY_DETECTED` | Nonce reuse detected | WA |
 
@@ -707,8 +718,12 @@ https://{host}/{app}/{tenant}/receipts/{receipt_id}.json
 A rich URL contains enough information to:
 1. Fetch the receipt JSON from the URL path
 2. Recompute `b3:hash(NRF(receipt_body))` and verify it matches `cid`
-3. Verify `sig` against `did` public key with domain `"ubl-url/v1"`
+3. Verify `sig` against `did:key` public key with domain `"ubl/rich-url/v1"`
 4. Verify `rt` matches the expected runtime binary hash
+
+Rollout mode is controlled by `UBL_RICHURL_VERIFY_MODE`:
+- `shadow`: verify and log, do not fail request
+- `strict`: fail-closed on any verification mismatch
 
 ### 13.3 Self-Contained URLs (for QR/mobile)
 

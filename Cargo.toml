@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/ubl_ai_nrf1",
+  "crates/ubl_canon",
   "crates/rb_vm",
   "crates/ubl_runtime",
   "crates/ubl_receipt",
@@ -46,6 +47,10 @@ iggy = "0.6"
 # Storage
 sled = "0.34"
 redis = { version = "0.25", features = ["tokio-comp"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [package]
 name = "ubl_master"

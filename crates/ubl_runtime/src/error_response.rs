@@ -56,6 +56,14 @@ pub enum ErrorCode {
     SignError,
     #[serde(rename = "STORAGE_ERROR")]
     StorageError,
+    #[serde(rename = "invalid_signature")]
+    InvalidSignature,
+    #[serde(rename = "runtime_hash_mismatch")]
+    RuntimeHashMismatch,
+    #[serde(rename = "idempotency_conflict")]
+    IdempotencyConflict,
+    #[serde(rename = "durable_commit_failed")]
+    DurableCommitFailed,
 
     #[serde(rename = "INTERNAL_ERROR")]
     InternalError,
@@ -100,6 +108,10 @@ impl ErrorCode {
             Self::CanonError => 422,
             Self::SignError => 422,
             Self::StorageError => 500,
+            Self::InvalidSignature => 400,
+            Self::RuntimeHashMismatch => 400,
+            Self::IdempotencyConflict => 409,
+            Self::DurableCommitFailed => 500,
             Self::InternalError => 500,
             Self::Unauthorized => 401,
             Self::NotFound => 404,
@@ -129,13 +141,14 @@ impl ErrorCode {
             | Self::TypeMismatch
             | Self::StackUnderflow
             | Self::CasNotFound => "BadInput",
+            Self::InvalidSignature | Self::RuntimeHashMismatch => "BadInput",
 
             Self::Unauthorized | Self::SignError => "Unauthorized",
             Self::PolicyDenied => "Forbidden",
             Self::NotFound | Self::DependencyMissing => "NotFound",
-            Self::ReplayDetected => "Conflict",
+            Self::ReplayDetected | Self::IdempotencyConflict => "Conflict",
             Self::TooManyRequests => "TooManyRequests",
-            Self::StorageError | Self::InternalError => "Internal",
+            Self::StorageError | Self::DurableCommitFailed | Self::InternalError => "Internal",
             Self::Unavailable => "Unavailable",
         }
     }
@@ -227,6 +240,10 @@ impl UblError {
             PipelineError::CanonError(msg) => (ErrorCode::CanonError, msg.clone()),
             PipelineError::SignError(msg) => (ErrorCode::SignError, msg.clone()),
             PipelineError::StorageError(msg) => (ErrorCode::StorageError, msg.clone()),
+            PipelineError::IdempotencyConflict(msg) => (ErrorCode::IdempotencyConflict, msg.clone()),
+            PipelineError::DurableCommitFailed(msg) => {
+                (ErrorCode::DurableCommitFailed, msg.clone())
+            }
             PipelineError::Internal(msg) => (ErrorCode::InternalError, msg.clone()),
         };
 

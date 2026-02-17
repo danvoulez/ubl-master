@@ -1,24 +1,30 @@
 //! UBL Pipeline - WA→TR→WF processing
 
-use crate::reasoning_bit::{Decision, EvalContext};
-use crate::policy_bit::PolicyResult;
-use crate::policy_loader::{PolicyLoader, ChipRequest as PolicyChipRequest, PolicyStorage};
-use crate::genesis::genesis_chip_cid;
+use crate::advisory::AdvisoryEngine;
+use crate::durable_store::{CommitInput, DurableError, DurableStore, NewOutboxEvent};
 use crate::event_bus::{EventBus, ReceiptEvent};
-use ubl_receipt::{WaReceiptBody, WfReceiptBody, PolicyTraceEntry, UnifiedReceipt, StageExecution, PipelineStage, RuntimeInfo};
-use rb_vm::{CasProvider, SignProvider, Vm, VmConfig, ExecError};
+use crate::genesis::genesis_chip_cid;
+use crate::idempotency::{CachedResult, IdempotencyKey, IdempotencyStore};
+use crate::ledger::{LedgerWriter, NullLedger};
+use crate::policy_bit::PolicyResult;
+use crate::policy_loader::{ChipRequest as PolicyChipRequest, PolicyLoader, PolicyStorage};
+use crate::reasoning_bit::{Decision, EvalContext};
+use crate::transition_registry::TransitionRegistry;
 use rb_vm::canon::CanonProvider;
-use rb_vm::types::Cid as VmCid;
 use rb_vm::tlv;
+use rb_vm::types::Cid as VmCid;
+use rb_vm::{CasProvider, ExecError, SignProvider, Vm, VmConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 use ubl_chipstore::{ChipStore, ExecutionMetadata};
-use crate::advisory::AdvisoryEngine;
-use crate::idempotency::{IdempotencyKey, IdempotencyStore, CachedResult};
-use crate::ledger::{LedgerWriter, NullLedger};
 use ubl_kms::{did_from_verifying_key, kid_from_verifying_key, Ed25519SigningKey as SigningKey};
+use ubl_receipt::{
+    CryptoMode, PipelineStage, PolicyTraceEntry, RuntimeInfo, StageExecution, UnifiedReceipt,
+    WaReceiptBody, WfReceiptBody,
+};
 
 /// The UBL Pipeline processor
 pub struct UblPipeline {
@@ -38,9 +44,40 @@ pub struct UblPipeline {
     signing_key: Arc<SigningKey>,
     /// Audit ledger — append-only log of pipeline events
     ledger: Arc<dyn LedgerWriter>,
+    /// Durable persistence boundary for receipts + idempotency + outbox (SQLite).
+    durable_store: Option<Arc<DurableStore>>,
+    /// Deterministic transition bytecode selector.
+    transition_registry: Arc<TransitionRegistry>,
 }
 
 const DEFAULT_FUEL_LIMIT: u64 = 1_000_000;
+
+fn load_durable_store() -> Option<Arc<DurableStore>> {
+    match DurableStore::from_env() {
+        Ok(Some(store)) => Some(Arc::new(store)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                "DurableStore init failed; falling back to in-memory idempotency only: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+fn load_transition_registry() -> Arc<TransitionRegistry> {
+    match TransitionRegistry::from_env() {
+        Ok(registry) => Arc::new(registry),
+        Err(e) => {
+            warn!(
+                "TransitionRegistry init failed; falling back to defaults: {}",
+                e
+            );
+            Arc::new(TransitionRegistry::default())
+        }
+    }
+}
 
 // ── Pipeline-local providers for rb_vm ──────────────────────────
 
@@ -49,7 +86,11 @@ struct PipelineCas {
 }
 
 impl PipelineCas {
-    fn new() -> Self { Self { store: HashMap::new() } }
+    fn new() -> Self {
+        Self {
+            store: HashMap::new(),
+        }
+    }
 }
 
 impl CasProvider for PipelineCas {
@@ -72,10 +113,13 @@ impl SignProvider for PipelineSigner {
     fn sign_jws(&self, payload: &[u8]) -> Vec<u8> {
         let sig_str = ubl_kms::sign_bytes(&self.signing_key, payload, ubl_kms::domain::RB_VM);
         // Return raw signature bytes (strip "ed25519:" prefix and decode base64)
-        sig_str.strip_prefix("ed25519:").map(|b64| {
-            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
-                .unwrap_or_else(|_| vec![0u8; 64])
-        }).unwrap_or_else(|| vec![0u8; 64])
+        sig_str
+            .strip_prefix("ed25519:")
+            .map(|b64| {
+                base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64)
+                    .unwrap_or_else(|_| vec![0u8; 64])
+            })
+            .unwrap_or_else(|| vec![0u8; 64])
     }
     fn kid(&self) -> String {
         self.kid.clone()
@@ -91,17 +135,79 @@ impl CanonProvider for PipelineCanon {
     }
 }
 
-/// Build minimal bytecode: PushInput(0) → EmitRc
-fn build_passthrough_bytecode() -> Vec<u8> {
-    let mut code = Vec::new();
-    // PushInput(0): op=0x12, payload len=2, payload=0x0000 (index 0)
-    code.push(0x12); // PushInput opcode
-    code.extend_from_slice(&2u16.to_be_bytes()); // length = 2
-    code.extend_from_slice(&0u16.to_be_bytes()); // index = 0
-    // EmitRc: op=0x10, payload len=0
-    code.push(0x10); // EmitRc opcode
-    code.extend_from_slice(&0u16.to_be_bytes()); // length = 0
-    code
+#[derive(Debug, Clone)]
+struct AdapterRuntimeInfo {
+    wasm_sha256: String,
+    abi_version: String,
+}
+
+impl AdapterRuntimeInfo {
+    fn parse_optional(body: &serde_json::Value) -> Result<Option<Self>, PipelineError> {
+        let Some(adapter) = body.get("adapter") else {
+            return Ok(None);
+        };
+        let adapter = adapter
+            .as_object()
+            .ok_or_else(|| PipelineError::InvalidChip("adapter must be object".to_string()))?;
+
+        let wasm_sha256 = adapter
+            .get("wasm_sha256")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PipelineError::InvalidChip("adapter.wasm_sha256 missing".to_string()))?;
+        let abi_version = adapter
+            .get("abi_version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PipelineError::InvalidChip("adapter.abi_version missing".to_string()))?;
+
+        let is_hex = wasm_sha256.len() == 64 && wasm_sha256.chars().all(|c| c.is_ascii_hexdigit());
+        if !is_hex {
+            return Err(PipelineError::InvalidChip(
+                "adapter.wasm_sha256 must be 64 hex chars".to_string(),
+            ));
+        }
+        if abi_version != "1.0" {
+            return Err(PipelineError::InvalidChip(format!(
+                "adapter.abi_version unsupported: {}",
+                abi_version
+            )));
+        }
+
+        Ok(Some(Self {
+            wasm_sha256: wasm_sha256.to_string(),
+            abi_version: abi_version.to_string(),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedChipRequest<'a> {
+    world: &'a str,
+}
+
+impl<'a> ParsedChipRequest<'a> {
+    fn parse(request: &'a ChipRequest) -> Result<Self, PipelineError> {
+        let chip_type = request
+            .body
+            .get("@type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PipelineError::InvalidChip("missing @type".to_string()))?;
+        if chip_type != request.chip_type {
+            return Err(PipelineError::InvalidChip(format!(
+                "request.chip_type '{}' != body.@type '{}'",
+                request.chip_type, chip_type
+            )));
+        }
+
+        let world = request
+            .body
+            .get("@world")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PipelineError::InvalidChip("missing @world".to_string()))?;
+        ubl_ai_nrf1::UblEnvelope::validate_world(world)
+            .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
+
+        Ok(Self { world })
+    }
 }
 
 /// Request to process a chip
@@ -141,10 +247,20 @@ struct CheckResult {
     trace: Vec<PolicyTraceEntry>,
 }
 
+fn decision_to_wire(decision: &Decision) -> &'static str {
+    match decision {
+        Decision::Allow => "allow",
+        Decision::Deny => "deny",
+        Decision::Require => "require",
+    }
+}
+
 impl UblPipeline {
     /// Convert a runtime PolicyResult into a receipt PolicyTraceEntry with RB votes.
     fn policy_result_to_trace(policy_result: &PolicyResult, duration_ms: i64) -> PolicyTraceEntry {
-        let rb_results: Vec<ubl_receipt::RbResult> = policy_result.circuit_results.iter()
+        let rb_results: Vec<ubl_receipt::RbResult> = policy_result
+            .circuit_results
+            .iter()
             .flat_map(|cr| cr.rb_results.iter())
             .map(|rb| ubl_receipt::RbResult {
                 rb_id: rb.rb_id.clone(),
@@ -156,7 +272,12 @@ impl UblPipeline {
             .collect();
 
         PolicyTraceEntry {
-            level: policy_result.policy_id.split('.').nth(1).unwrap_or("unknown").to_string(),
+            level: policy_result
+                .policy_id
+                .split('.')
+                .nth(1)
+                .unwrap_or("unknown")
+                .to_string(),
             policy_id: policy_result.policy_id.clone(),
             result: policy_result.decision.clone(),
             reason: policy_result.reason.clone(),
@@ -166,10 +287,22 @@ impl UblPipeline {
     }
     /// Load signing key from env (`SIGNING_KEY_HEX`) or generate a dev key.
     fn load_or_generate_key() -> SigningKey {
-        match ubl_kms::signing_key_from_env() {
+        let key = match ubl_kms::signing_key_from_env() {
             Ok(key) => key,
             Err(_) => ubl_kms::generate_signing_key(),
+        };
+
+        // Stage auth secret bootstrap:
+        // If UBL_STAGE_SECRET is not provided, derive a process-local default
+        // from the signing key seed so auth-chain generation is configured.
+        if std::env::var("UBL_STAGE_SECRET").is_err() {
+            std::env::set_var(
+                "UBL_STAGE_SECRET",
+                format!("hex:{}", hex::encode(key.to_bytes())),
+            );
         }
+
+        key
     }
 
     /// Create a new pipeline instance
@@ -191,6 +324,8 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
+            durable_store: load_durable_store(),
+            transition_registry: load_transition_registry(),
         }
     }
 
@@ -213,14 +348,13 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
+            durable_store: load_durable_store(),
+            transition_registry: load_transition_registry(),
         }
     }
 
     /// Create pipeline with ChipStore for persistence
-    pub fn with_chip_store(
-        storage: Box<dyn PolicyStorage>,
-        chip_store: Arc<ChipStore>,
-    ) -> Self {
+    pub fn with_chip_store(storage: Box<dyn PolicyStorage>, chip_store: Arc<ChipStore>) -> Self {
         let key = Self::load_or_generate_key();
         let vk = key.verifying_key();
         let did = did_from_verifying_key(&vk);
@@ -238,6 +372,8 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
+            durable_store: load_durable_store(),
+            transition_registry: load_transition_registry(),
         }
     }
 
@@ -262,7 +398,9 @@ impl UblPipeline {
 
         // If ChipStore is present, persist the genesis chip (idempotent)
         if let Some(ref store) = self.chip_store {
-            let already = store.exists(&genesis_cid).await
+            let already = store
+                .exists(&genesis_cid)
+                .await
                 .map_err(|e| PipelineError::Internal(format!("Genesis check: {}", e)))?;
 
             if !already {
@@ -275,11 +413,14 @@ impl UblPipeline {
                     reproducible: true,
                 };
 
-                store.store_executed_chip(
-                    genesis_body,
-                    genesis_cid.clone(), // self-signed: receipt_cid == chip_cid
-                    metadata,
-                ).await.map_err(|e| PipelineError::Internal(format!("Genesis store: {}", e)))?;
+                store
+                    .store_executed_chip(
+                        genesis_body,
+                        genesis_cid.clone(), // self-signed: receipt_cid == chip_cid
+                        metadata,
+                    )
+                    .await
+                    .map_err(|e| PipelineError::Internal(format!("Genesis store: {}", e)))?;
             }
         }
 
@@ -298,8 +439,7 @@ impl UblPipeline {
     /// Use this when you have raw HTTP body bytes (e.g. from the gate).
     pub async fn process_raw(&self, bytes: &[u8]) -> Result<PipelineResult, PipelineError> {
         // Stage 0: KNOCK
-        let value = crate::knock::knock(bytes)
-            .map_err(|e| PipelineError::Knock(e.to_string()))?;
+        let value = crate::knock::knock(bytes).map_err(|e| PipelineError::Knock(e.to_string()))?;
 
         let chip_type = value["@type"].as_str().unwrap_or("").to_string();
         let request = ChipRequest {
@@ -317,20 +457,54 @@ impl UblPipeline {
     ///
     /// **Idempotency:** If the chip has key `(@type, @ver, @world, @id)` and
     /// that key was already processed, returns the cached result immediately.
-    pub async fn process_chip(&self, request: ChipRequest) -> Result<PipelineResult, PipelineError> {
+    pub async fn process_chip(
+        &self,
+        request: ChipRequest,
+    ) -> Result<PipelineResult, PipelineError> {
         let pipeline_start = std::time::Instant::now();
+        let parsed_request = ParsedChipRequest::parse(&request)?;
+        let chip_id = request
+            .body
+            .get("@id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        info!(
+            chip_type = %request.chip_type,
+            world = %parsed_request.world,
+            chip_id = %chip_id,
+            "pipeline request accepted"
+        );
 
         // ── Idempotency check: replay returns cached result (no re-execution) ──
         let idem_key = IdempotencyKey::from_chip_body(&request.body);
+        let durable_idem_key = idem_key.as_ref().map(|k| k.to_durable_key());
         if let Some(ref key) = idem_key {
-            if let Some(cached) = self.idempotency_store.get(key).await {
-                let decision = if cached.decision.contains("Allow") {
+            let cached = if let (Some(durable), Some(durable_key)) =
+                (&self.durable_store, durable_idem_key.as_ref())
+            {
+                durable
+                    .get_idempotent(durable_key)
+                    .map_err(|e| PipelineError::StorageError(format!("Idempotency lookup: {}", e)))?
+            } else {
+                self.idempotency_store.get(key).await
+            };
+
+            if let Some(cached) = cached {
+                let decision = if cached.decision.eq_ignore_ascii_case("allow")
+                    || cached.decision.contains("Allow")
+                {
                     Decision::Allow
                 } else {
                     Decision::Deny
                 };
                 let receipt = UnifiedReceipt::from_json(&cached.response_json)
                     .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
+                info!(
+                    chip_type = %request.chip_type,
+                    world = %parsed_request.world,
+                    receipt_cid = %cached.receipt_cid,
+                    "pipeline idempotency replay"
+                );
                 return Ok(PipelineResult {
                     final_receipt: PipelineReceipt {
                         body_cid: ubl_types::Cid::new_unchecked(&cached.receipt_cid),
@@ -345,62 +519,80 @@ impl UblPipeline {
             }
         }
 
-        // Extract @world for the unified receipt
-        let world = request.body.get("@world")
-            .and_then(|v| v.as_str())
-            .unwrap_or("a/unknown/t/unknown");
+        // `@world` and `@type` already parsed/validated above.
+        let world = parsed_request.world;
         let nonce = Self::generate_nonce();
 
         // Create the unified receipt — it evolves through each stage
-        let mut receipt = UnifiedReceipt::new(
-            world,
-            &self.did,
-            &self.kid,
-            &nonce,
-        ).with_runtime_info((*self.runtime_info).clone());
+        let mut receipt = UnifiedReceipt::new(world, &self.did, &self.kid, &nonce)
+            .with_runtime_info((*self.runtime_info).clone());
 
         // Stage 1: WA (Write-Ahead)
         let wa_start = std::time::Instant::now();
         let wa_receipt = self.stage_write_ahead(&request).await?;
         let wa_ms = wa_start.elapsed().as_millis() as i64;
+        debug!(chip_type = %request.chip_type, duration_ms = wa_ms, "stage wa completed");
 
-        receipt.append_stage(StageExecution {
-            stage: PipelineStage::WriteAhead,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.as_str().to_string(),
-            output_cid: Some(wa_receipt.body_cid.as_str().to_string()),
-            fuel_used: None,
-            policy_trace: vec![],
-            auth_token: String::new(),
-            duration_ms: wa_ms,
-        }).map_err(|e| PipelineError::Internal(format!("Receipt WA: {}", e)))?;
+        receipt
+            .append_stage(StageExecution {
+                stage: PipelineStage::WriteAhead,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                input_cid: wa_receipt.body_cid.as_str().to_string(),
+                output_cid: Some(wa_receipt.body_cid.as_str().to_string()),
+                fuel_used: None,
+                policy_trace: vec![],
+                vm_sig: None,
+                vm_sig_payload_cid: None,
+                auth_token: String::new(),
+                duration_ms: wa_ms,
+            })
+            .map_err(|e| PipelineError::Internal(format!("Receipt WA: {}", e)))?;
 
         // Publish WA event
-        self.publish_receipt_event(&wa_receipt, "wa", None, Some(wa_ms), Some(world), None).await;
+        self.publish_receipt_event(&wa_receipt, "wa", None, Some(wa_ms), Some(world), None)
+            .await;
 
         // Stage 2: CHECK (Policy Evaluation)
         let check_start = std::time::Instant::now();
         let check = self.stage_check(&request).await?;
         let check_ms = check_start.elapsed().as_millis() as i64;
+        debug!(
+            chip_type = %request.chip_type,
+            duration_ms = check_ms,
+            decision = ?check.decision,
+            "stage check completed"
+        );
 
-        receipt.append_stage(StageExecution {
-            stage: PipelineStage::Check,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.as_str().to_string(),
-            output_cid: None,
-            fuel_used: None,
-            policy_trace: check.trace.clone(),
-            auth_token: String::new(),
-            duration_ms: check_ms,
-        }).map_err(|e| PipelineError::Internal(format!("Receipt CHECK: {}", e)))?;
+        receipt
+            .append_stage(StageExecution {
+                stage: PipelineStage::Check,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                input_cid: wa_receipt.body_cid.as_str().to_string(),
+                output_cid: None,
+                fuel_used: None,
+                policy_trace: check.trace.clone(),
+                vm_sig: None,
+                vm_sig_payload_cid: None,
+                auth_token: String::new(),
+                duration_ms: check_ms,
+            })
+            .map_err(|e| PipelineError::Internal(format!("Receipt CHECK: {}", e)))?;
 
         // Post-CHECK advisory hook (non-blocking) — explain denial
         if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
             let adv = engine.post_check_advisory(
                 wa_receipt.body_cid.as_str(),
-                if matches!(check.decision, Decision::Deny) { "deny" } else { "allow" },
+                if matches!(check.decision, Decision::Deny) {
+                    "deny"
+                } else {
+                    "allow"
+                },
                 &check.reason,
-                &check.trace.iter().map(|t| serde_json::to_value(t).unwrap_or_default()).collect::<Vec<_>>(),
+                &check
+                    .trace
+                    .iter()
+                    .map(|t| serde_json::to_value(t).unwrap_or_default())
+                    .collect::<Vec<_>>(),
             );
             let body = engine.advisory_to_chip_body(&adv);
             let store = store.clone();
@@ -413,8 +605,11 @@ impl UblPipeline {
                     executor_did: ubl_types::Did::new_unchecked("did:key:advisory"),
                     reproducible: false,
                 };
-                if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
-                    eprintln!("Advisory post-CHECK store failed (non-fatal): {}", e);
+                if let Err(e) = store
+                    .store_executed_chip(body, "self".to_string(), metadata)
+                    .await
+                {
+                    warn!(error = %e, "advisory post-CHECK store failed (non-fatal)");
                 }
             });
         }
@@ -423,63 +618,149 @@ impl UblPipeline {
         if matches!(check.decision, Decision::Deny) {
             receipt.deny(&check.reason);
 
-            let wf_receipt = self.create_deny_receipt(&request, &wa_receipt, &check).await?;
-
+            let wf_receipt = self
+                .create_deny_receipt(&request, &wa_receipt, &check)
+                .await?;
             let deny_ms = pipeline_start.elapsed().as_millis() as i64;
-            self.publish_receipt_event(&wf_receipt, "wf", Some("deny".to_string()), Some(deny_ms), Some(world), Some(wa_receipt.body_cid.as_str())).await;
 
-            return Ok(PipelineResult {
+            receipt
+                .append_stage(StageExecution {
+                    stage: PipelineStage::WriteFinished,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    input_cid: wa_receipt.body_cid.as_str().to_string(),
+                    output_cid: Some(wf_receipt.body_cid.as_str().to_string()),
+                    fuel_used: None,
+                    policy_trace: check.trace.clone(),
+                    vm_sig: None,
+                    vm_sig_payload_cid: None,
+                    auth_token: String::new(),
+                    duration_ms: deny_ms,
+                })
+                .map_err(|e| PipelineError::Internal(format!("Receipt WF(DENY): {}", e)))?;
+            receipt
+                .finalize_and_sign(&self.signing_key, CryptoMode::from_env())
+                .map_err(|e| PipelineError::SignError(format!("WF(DENY) sign failed: {}", e)))?;
+
+            self.publish_receipt_event(
+                &wf_receipt,
+                "wf",
+                Some("deny".to_string()),
+                Some(deny_ms),
+                Some(world),
+                Some(wa_receipt.body_cid.as_str()),
+            )
+            .await;
+
+            let result = PipelineResult {
                 final_receipt: wf_receipt.clone(),
-                chain: vec![wa_receipt.body_cid.as_str().to_string(), "no-tr".to_string(), wf_receipt.body_cid.as_str().to_string()],
+                chain: vec![
+                    wa_receipt.body_cid.as_str().to_string(),
+                    "no-tr".to_string(),
+                    wf_receipt.body_cid.as_str().to_string(),
+                ],
                 decision: Decision::Deny,
                 receipt,
                 replayed: false,
-            });
+            };
+            info!(
+                chip_type = %request.chip_type,
+                world = %parsed_request.world,
+                decision = "deny",
+                duration_ms = deny_ms,
+                "pipeline completed"
+            );
+
+            self.persist_final_result(idem_key.as_ref(), world, &result)
+                .await?;
+            return Ok(result);
         }
 
         // Stage 3: TR (Transition - RB-VM execution)
         let tr_start = std::time::Instant::now();
         let tr_receipt = self.stage_transition(&request, &check).await?;
         let tr_ms = tr_start.elapsed().as_millis() as i64;
+        debug!(chip_type = %request.chip_type, duration_ms = tr_ms, "stage tr completed");
 
-        let fuel_used = tr_receipt.body.get("vm_state")
+        let fuel_used = tr_receipt
+            .body
+            .get("vm_state")
             .and_then(|v| v.get("fuel_used"))
             .and_then(|v| v.as_u64());
 
-        receipt.append_stage(StageExecution {
-            stage: PipelineStage::Transition,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.as_str().to_string(),
-            output_cid: Some(tr_receipt.body_cid.as_str().to_string()),
-            fuel_used,
-            policy_trace: vec![],
-            auth_token: String::new(),
-            duration_ms: tr_ms,
-        }).map_err(|e| PipelineError::Internal(format!("Receipt TR: {}", e)))?;
+        receipt
+            .append_stage(StageExecution {
+                stage: PipelineStage::Transition,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                input_cid: wa_receipt.body_cid.as_str().to_string(),
+                output_cid: Some(tr_receipt.body_cid.as_str().to_string()),
+                fuel_used,
+                policy_trace: vec![],
+                vm_sig: tr_receipt
+                    .body
+                    .get("vm_sig")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                vm_sig_payload_cid: tr_receipt
+                    .body
+                    .get("vm_sig_payload_cid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                auth_token: String::new(),
+                duration_ms: tr_ms,
+            })
+            .map_err(|e| PipelineError::Internal(format!("Receipt TR: {}", e)))?;
 
         // Publish TR event
-        self.publish_receipt_event(&tr_receipt, "tr", None, Some(tr_ms), Some(world), Some(wa_receipt.body_cid.as_str())).await;
+        self.publish_receipt_event(
+            &tr_receipt,
+            "tr",
+            None,
+            Some(tr_ms),
+            Some(world),
+            Some(wa_receipt.body_cid.as_str()),
+        )
+        .await;
 
         // Stage 4: WF (Write-Finished)
         let wf_start = std::time::Instant::now();
-        let wf_receipt = self.stage_write_finished(&request, &wa_receipt, &tr_receipt, &check).await?;
+        let wf_receipt = self
+            .stage_write_finished(&request, &wa_receipt, &tr_receipt, &check)
+            .await?;
         let wf_ms = wf_start.elapsed().as_millis() as i64;
+        debug!(chip_type = %request.chip_type, duration_ms = wf_ms, "stage wf completed");
 
-        receipt.append_stage(StageExecution {
-            stage: PipelineStage::WriteFinished,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: tr_receipt.body_cid.as_str().to_string(),
-            output_cid: Some(wf_receipt.body_cid.as_str().to_string()),
-            fuel_used: None,
-            policy_trace: vec![],
-            auth_token: String::new(),
-            duration_ms: wf_ms,
-        }).map_err(|e| PipelineError::Internal(format!("Receipt WF: {}", e)))?;
+        receipt
+            .append_stage(StageExecution {
+                stage: PipelineStage::WriteFinished,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                input_cid: tr_receipt.body_cid.as_str().to_string(),
+                output_cid: Some(wf_receipt.body_cid.as_str().to_string()),
+                fuel_used: None,
+                policy_trace: vec![],
+                vm_sig: None,
+                vm_sig_payload_cid: None,
+                auth_token: String::new(),
+                duration_ms: wf_ms,
+            })
+            .map_err(|e| PipelineError::Internal(format!("Receipt WF: {}", e)))?;
+
+        let crypto_mode = CryptoMode::from_env();
+        receipt
+            .finalize_and_sign(&self.signing_key, crypto_mode)
+            .map_err(|e| PipelineError::SignError(format!("WF finalize/sign failed: {}", e)))?;
 
         let total_ms = pipeline_start.elapsed().as_millis() as i64;
 
         // Publish successful WF event
-        self.publish_receipt_event(&wf_receipt, "wf", Some("allow".to_string()), Some(total_ms), Some(world), Some(tr_receipt.body_cid.as_str())).await;
+        self.publish_receipt_event(
+            &wf_receipt,
+            "wf",
+            Some("allow".to_string()),
+            Some(total_ms),
+            Some(world),
+            Some(tr_receipt.body_cid.as_str()),
+        )
+        .await;
 
         // Persist chip to ChipStore (best-effort — never blocks pipeline)
         if let Some(ref store) = self.chip_store {
@@ -491,12 +772,15 @@ impl UblPipeline {
                 executor_did: ubl_types::Did::new_unchecked(&self.did),
                 reproducible: true,
             };
-            if let Err(e) = store.store_executed_chip(
-                request.body.clone(),
-                wf_receipt.body_cid.as_str().to_string(),
-                metadata,
-            ).await {
-                eprintln!("ChipStore persist failed (non-fatal): {}", e);
+            if let Err(e) = store
+                .store_executed_chip(
+                    request.body.clone(),
+                    wf_receipt.body_cid.as_str().to_string(),
+                    metadata,
+                )
+                .await
+            {
+                warn!(error = %e, "ChipStore persist failed (non-fatal)");
             }
         }
 
@@ -517,7 +801,7 @@ impl UblPipeline {
                 kid: Some(self.kid.clone()),
             };
             if let Err(e) = self.ledger.append(&entry).await {
-                eprintln!("Ledger append failed (non-fatal): {}", e);
+                warn!(error = %e, "Ledger append failed (non-fatal)");
             }
         }
 
@@ -540,8 +824,11 @@ impl UblPipeline {
                     executor_did: ubl_types::Did::new_unchecked("did:key:advisory"),
                     reproducible: false,
                 };
-                if let Err(e) = store.store_executed_chip(body, "self".to_string(), metadata).await {
-                    eprintln!("Advisory post-WF store failed (non-fatal): {}", e);
+                if let Err(e) = store
+                    .store_executed_chip(body, "self".to_string(), metadata)
+                    .await
+                {
+                    warn!(error = %e, "advisory post-WF store failed (non-fatal)");
                 }
             });
         }
@@ -558,28 +845,101 @@ impl UblPipeline {
             replayed: false,
         };
 
-        // ── Cache result for idempotency ──
-        if let Some(key) = idem_key {
-            self.idempotency_store.put(key, CachedResult {
-                receipt_cid: result.receipt.receipt_cid.as_str().to_string(),
-                response_json: result.receipt.to_json().unwrap_or_default(),
-                decision: format!("{:?}", result.decision),
-                chain: result.chain.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-            }).await;
-        }
+        self.persist_final_result(idem_key.as_ref(), world, &result)
+            .await?;
+
+        info!(
+            chip_type = %request.chip_type,
+            world = %parsed_request.world,
+            decision = "allow",
+            duration_ms = total_ms,
+            receipt_cid = %wf_receipt.body_cid.as_str(),
+            "pipeline completed"
+        );
 
         Ok(result)
     }
 
+    async fn persist_final_result(
+        &self,
+        idem_key: Option<&IdempotencyKey>,
+        world: &str,
+        result: &PipelineResult,
+    ) -> Result<(), PipelineError> {
+        if let Some(ref durable) = self.durable_store {
+            let receipt_json = result
+                .receipt
+                .to_json()
+                .map_err(|e| PipelineError::DurableCommitFailed(e.to_string()))?;
+            let rt_hash = result
+                .receipt
+                .rt
+                .as_ref()
+                .map(|rt| rt.binary_hash.clone())
+                .unwrap_or_else(|| self.runtime_info.binary_hash.clone());
+            let created_at = chrono::Utc::now().timestamp();
+            let event = NewOutboxEvent {
+                event_type: "emit_receipt".to_string(),
+                payload_json: serde_json::json!({
+                    "receipt_cid": result.receipt.receipt_cid.as_str(),
+                    "decision": decision_to_wire(&result.decision),
+                    "world": world,
+                }),
+            };
+
+            let input = CommitInput {
+                receipt_cid: result.receipt.receipt_cid.as_str().to_string(),
+                receipt_json,
+                did: self.did.clone(),
+                kid: self.kid.clone(),
+                rt_hash,
+                decision: decision_to_wire(&result.decision).to_string(),
+                idem_key: idem_key.map(|k| k.to_durable_key()),
+                chain: result.chain.clone(),
+                outbox_events: vec![event],
+                created_at,
+                fail_after_receipt_write: false,
+            };
+
+            match durable.commit_wf_atomically(&input) {
+                Ok(_) => Ok(()),
+                Err(DurableError::IdempotencyConflict(e)) => {
+                    Err(PipelineError::IdempotencyConflict(e))
+                }
+                Err(e) => Err(PipelineError::DurableCommitFailed(e.to_string())),
+            }
+        } else {
+            if let Some(key) = idem_key.cloned() {
+                self.idempotency_store
+                    .put(
+                        key,
+                        CachedResult {
+                            receipt_cid: result.receipt.receipt_cid.as_str().to_string(),
+                            response_json: result.receipt.to_json().unwrap_or_default(),
+                            decision: decision_to_wire(&result.decision).to_string(),
+                            chain: result.chain.clone(),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    )
+                    .await;
+            }
+            Ok(())
+        }
+    }
+
     /// Stage 1: Write-Ahead - create ghost record, freeze @world
-    async fn stage_write_ahead(&self, request: &ChipRequest) -> Result<PipelineReceipt, PipelineError> {
+    async fn stage_write_ahead(
+        &self,
+        request: &ChipRequest,
+    ) -> Result<PipelineReceipt, PipelineError> {
         // Validate @world format before freezing
         if let Some(world) = request.body.get("@world").and_then(|v| v.as_str()) {
             ubl_ai_nrf1::UblEnvelope::validate_world(world)
                 .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
         } else {
-            return Err(PipelineError::InvalidChip("missing @world anchor".to_string()));
+            return Err(PipelineError::InvalidChip(
+                "missing @world anchor".to_string(),
+            ));
         }
 
         // Generate nonce and check for replay
@@ -594,11 +954,14 @@ impl UblPipeline {
         let wa_body = WaReceiptBody {
             ghost: true,
             chip_cid: "pending".to_string(), // Will be computed later
-            policy_cid: genesis_chip_cid(), // For now, just genesis
+            policy_cid: genesis_chip_cid(),  // For now, just genesis
             frozen_time: chrono::Utc::now().to_rfc3339(),
             caller: self.did.clone(),
             context: request.body.clone(),
-            operation: request.operation.clone().unwrap_or_else(|| "create".to_string()),
+            operation: request
+                .operation
+                .clone()
+                .unwrap_or_else(|| "create".to_string()),
             nonce,
             kid: self.kid.clone(),
         };
@@ -630,13 +993,23 @@ impl UblPipeline {
                 .map_err(|e| PipelineError::InvalidChip(format!("Onboarding validation: {}", e)))?;
 
             // 2. Validate @world format
-            let world_str = request.body.get("@world")
+            let world_str = request
+                .body
+                .get("@world")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| PipelineError::InvalidChip("Onboarding chip missing @world".into()))?;
+                .ok_or_else(|| {
+                    PipelineError::InvalidChip("Onboarding chip missing @world".into())
+                })?;
 
             // 3. Check dependency chain against ChipStore
             if let Some(ref store) = self.chip_store {
-                self.check_onboarding_dependencies(&request.chip_type, &request.body, world_str, store).await?;
+                self.check_onboarding_dependencies(
+                    &request.chip_type,
+                    &request.body,
+                    world_str,
+                    store,
+                )
+                .await?;
             }
         }
 
@@ -645,11 +1018,17 @@ impl UblPipeline {
             chip_type: request.chip_type.clone(),
             body: request.body.clone(),
             parents: request.parents.clone(),
-            operation: request.operation.clone().unwrap_or_else(|| "create".to_string()),
+            operation: request
+                .operation
+                .clone()
+                .unwrap_or_else(|| "create".to_string()),
         };
 
         // Load policy chain
-        let policies = self.policy_loader.load_policy_chain(&policy_request).await
+        let policies = self
+            .policy_loader
+            .load_policy_chain(&policy_request)
+            .await
             .map_err(|e| PipelineError::Internal(format!("Policy loading: {}", e)))?;
 
         // Create evaluation context
@@ -699,7 +1078,11 @@ impl UblPipeline {
     }
 
     /// Stage 3: TR - Transition (RB-VM execution)
-    async fn stage_transition(&self, request: &ChipRequest, _check: &CheckResult) -> Result<PipelineReceipt, PipelineError> {
+    async fn stage_transition(
+        &self,
+        request: &ChipRequest,
+        _check: &CheckResult,
+    ) -> Result<PipelineReceipt, PipelineError> {
         // Encode chip body to NRF bytes and store as CAS input
         let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(&request.body)
             .map_err(|e| PipelineError::Internal(format!("TR input NRF: {}", e)))?;
@@ -718,39 +1101,91 @@ impl UblPipeline {
             trace: true,
         };
 
-        // Build and decode bytecode
-        let bytecode = build_passthrough_bytecode();
-        let instructions = tlv::decode_stream(&bytecode)
+        let adapter_info = AdapterRuntimeInfo::parse_optional(&request.body)?;
+
+        // Resolve bytecode by chip type / chip override / env override.
+        let resolution = self
+            .transition_registry
+            .resolve(&request.chip_type, &request.body)
+            .map_err(|e| PipelineError::InvalidChip(format!("TR bytecode resolution: {}", e)))?;
+        let bytecode_hash = format!(
+            "b3:{}",
+            hex::encode(blake3::hash(&resolution.bytecode).as_bytes())
+        );
+        let instructions = tlv::decode_stream(&resolution.bytecode)
             .map_err(|e| PipelineError::Internal(format!("TR bytecode decode: {}", e)))?;
 
         // Execute VM
         let mut vm = Vm::new(cfg, cas, &signer, canon, vec![input_cid.clone()]);
         let outcome = vm.run(&instructions).map_err(|e| match e {
-            ExecError::FuelExhausted => PipelineError::FuelExhausted(
-                format!("VM fuel exhausted (limit: {})", self.fuel_limit)
-            ),
-            ExecError::StackUnderflow(op) => PipelineError::StackUnderflow(
-                format!("stack underflow at {:?}", op)
-            ),
-            ExecError::TypeMismatch(op) => PipelineError::TypeMismatch(
-                format!("type mismatch at {:?}", op)
-            ),
-            ExecError::InvalidPayload(op) => PipelineError::TypeMismatch(
-                format!("invalid payload for {:?}", op)
-            ),
+            ExecError::FuelExhausted => PipelineError::FuelExhausted(format!(
+                "VM fuel exhausted (limit: {})",
+                self.fuel_limit
+            )),
+            ExecError::StackUnderflow(op) => {
+                PipelineError::StackUnderflow(format!("stack underflow at {:?}", op))
+            }
+            ExecError::TypeMismatch(op) => {
+                PipelineError::TypeMismatch(format!("type mismatch at {:?}", op))
+            }
+            ExecError::InvalidPayload(op) => {
+                PipelineError::TypeMismatch(format!("invalid payload for {:?}", op))
+            }
             ExecError::Deny(reason) => PipelineError::PolicyDenied(reason),
         })?;
+
+        if outcome.rc_sig.as_deref().unwrap_or("").is_empty() {
+            return Err(PipelineError::SignError(
+                "TR EmitRc did not return a persisted signature".to_string(),
+            ));
+        }
+
+        let mut vm_state = serde_json::Map::new();
+        vm_state.insert("fuel_used".to_string(), serde_json::json!(outcome.fuel_used));
+        vm_state.insert("steps".to_string(), serde_json::json!(outcome.steps));
+        vm_state.insert(
+            "result".to_string(),
+            serde_json::json!(if outcome.rc_cid.is_some() {
+                "receipt_emitted"
+            } else {
+                "completed"
+            }),
+        );
+        vm_state.insert(
+            "trace_len".to_string(),
+            serde_json::json!(outcome.trace.len()),
+        );
+        vm_state.insert(
+            "bytecode_source".to_string(),
+            serde_json::json!(resolution.source),
+        );
+        vm_state.insert("bytecode_hash".to_string(), serde_json::json!(bytecode_hash));
+        vm_state.insert(
+            "bytecode_len".to_string(),
+            serde_json::json!(resolution.bytecode.len()),
+        );
+        vm_state.insert(
+            "bytecode_profile".to_string(),
+            serde_json::json!(resolution.profile.as_str()),
+        );
+        if let Some(info) = adapter_info {
+            vm_state.insert(
+                "adapter_wasm_sha256".to_string(),
+                serde_json::json!(info.wasm_sha256),
+            );
+            vm_state.insert(
+                "adapter_abi_version".to_string(),
+                serde_json::json!(info.abi_version),
+            );
+        }
 
         let tr_body = serde_json::json!({
             "@type": "ubl/transition",
             "input_cid": input_cid.0,
             "output_cid": outcome.rc_cid.as_ref().map(|c| c.0.clone()).unwrap_or_default(),
-            "vm_state": {
-                "fuel_used": outcome.fuel_used,
-                "steps": outcome.steps,
-                "result": if outcome.rc_cid.is_some() { "receipt_emitted" } else { "completed" },
-                "trace_len": outcome.trace.len()
-            }
+            "vm_sig": outcome.rc_sig.as_deref().unwrap_or_default(),
+            "vm_sig_payload_cid": outcome.rc_payload_cid.as_ref().map(|c| c.0.clone()).unwrap_or_default(),
+            "vm_state": vm_state
         });
 
         let nrf1_bytes = ubl_ai_nrf1::to_nrf1_bytes(&tr_body)
@@ -878,9 +1313,15 @@ impl UblPipeline {
         }
         if let Some(trace) = receipt.body.get("policy_trace") {
             if let Some(arr) = trace.as_array() {
-                event.rb_count = Some(arr.iter()
-                    .flat_map(|p| p.get("rb_results").and_then(|r| r.as_array()).map(|a| a.len() as u64))
-                    .sum());
+                event.rb_count = Some(
+                    arr.iter()
+                        .flat_map(|p| {
+                            p.get("rb_results")
+                                .and_then(|r| r.as_array())
+                                .map(|a| a.len() as u64)
+                        })
+                        .sum(),
+                );
             }
         }
 
@@ -891,7 +1332,7 @@ impl UblPipeline {
 
         // Best effort - don't fail pipeline if event publishing fails
         if let Err(e) = self.event_bus.publish_stage_event(event).await {
-            eprintln!("Failed to publish receipt event: {}", e);
+            warn!(error = %e, "Failed to publish receipt event");
         }
     }
 
@@ -910,19 +1351,31 @@ impl UblPipeline {
             // App is the root — no dependencies, but slug must be unique.
             // Requires cap.registry:init (P0.3).
             "ubl/app" => {
-                crate::capability::require_cap(body, "registry:init", world)
-                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/app capability: {}", e)))?;
+                crate::capability::require_cap(body, "registry:init", world).map_err(|e| {
+                    PipelineError::InvalidChip(format!("ubl/app capability: {}", e))
+                })?;
 
                 let slug = body.get("slug").and_then(|v| v.as_str()).unwrap_or("");
-                let existing = store.get_chips_by_type("ubl/app").await
+                let existing = store
+                    .query(&ubl_chipstore::ChipQuery {
+                        chip_type: Some("ubl/app".to_string()),
+                        tags: vec![format!("slug:{}", slug)],
+                        created_after: None,
+                        created_before: None,
+                        executor_did: None,
+                        limit: None,
+                        offset: None,
+                    })
+                    .await
                     .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
-                for chip in &existing {
+                for chip in &existing.chips {
                     if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(slug) {
                         // Check if this app has been revoked
                         if !self.is_revoked(chip.cid.as_str(), store).await? {
-                            return Err(PipelineError::InvalidChip(
-                                format!("App slug '{}' already registered", slug),
-                            ));
+                            return Err(PipelineError::InvalidChip(format!(
+                                "App slug '{}' already registered",
+                                slug
+                            )));
                         }
                     }
                 }
@@ -936,18 +1389,26 @@ impl UblPipeline {
                 self.require_app_exists(&scope.app, store).await?;
 
                 // Check if this is the first user for this app
-                let existing_users = store.get_chips_by_type("ubl/user").await
+                let existing_users = store
+                    .query(&ubl_chipstore::ChipQuery {
+                        chip_type: Some("ubl/user".to_string()),
+                        tags: vec![format!("app:{}", scope.app)],
+                        created_after: None,
+                        created_before: None,
+                        executor_did: None,
+                        limit: Some(1),
+                        offset: None,
+                    })
+                    .await
                     .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
-                let has_user_for_app = existing_users.iter().any(|c| {
-                    c.chip_data.get("@world").and_then(|v| v.as_str())
-                        .map(|w| w.starts_with(&format!("a/{}", scope.app)))
-                        .unwrap_or(false)
-                });
+                let has_user_for_app = !existing_users.chips.is_empty();
                 if !has_user_for_app {
-                    crate::capability::require_cap(body, "registry:init", world)
-                        .map_err(|e| PipelineError::InvalidChip(
-                            format!("first ubl/user for app '{}' requires capability: {}", scope.app, e)
-                        ))?;
+                    crate::capability::require_cap(body, "registry:init", world).map_err(|e| {
+                        PipelineError::InvalidChip(format!(
+                            "first ubl/user for app '{}' requires capability: {}",
+                            scope.app, e
+                        ))
+                    })?;
                 }
             }
 
@@ -957,45 +1418,65 @@ impl UblPipeline {
                     .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
                 self.require_app_exists(&scope.app, store).await?;
 
-                let creator_cid = body.get("creator_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(creator_cid, "ubl/user", store).await?;
+                let creator_cid = body
+                    .get("creator_cid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.require_chip_exists(creator_cid, "ubl/user", store)
+                    .await?;
             }
 
             // Membership requires: user_cid and tenant_cid both exist.
             // Requires cap.membership:grant (P0.4).
             "ubl/membership" => {
-                crate::capability::require_cap(body, "membership:grant", world)
-                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/membership capability: {}", e)))?;
+                crate::capability::require_cap(body, "membership:grant", world).map_err(|e| {
+                    PipelineError::InvalidChip(format!("ubl/membership capability: {}", e))
+                })?;
 
                 let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(user_cid, "ubl/user", store).await?;
+                self.require_chip_exists(user_cid, "ubl/user", store)
+                    .await?;
 
-                let tenant_cid = body.get("tenant_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(tenant_cid, "ubl/tenant", store).await?;
+                let tenant_cid = body
+                    .get("tenant_cid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.require_chip_exists(tenant_cid, "ubl/tenant", store)
+                    .await?;
             }
 
             // Token requires: user_cid exists
             "ubl/token" => {
                 let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(user_cid, "ubl/user", store).await?;
+                self.require_chip_exists(user_cid, "ubl/user", store)
+                    .await?;
             }
 
             // Revoke requires: target_cid exists (any type) + actor_cid exists.
             // Requires cap.revoke:execute (P0.4).
             "ubl/revoke" => {
-                crate::capability::require_cap(body, "revoke:execute", world)
-                    .map_err(|e| PipelineError::InvalidChip(format!("ubl/revoke capability: {}", e)))?;
+                crate::capability::require_cap(body, "revoke:execute", world).map_err(|e| {
+                    PipelineError::InvalidChip(format!("ubl/revoke capability: {}", e))
+                })?;
 
-                let target_cid = body.get("target_cid").and_then(|v| v.as_str()).unwrap_or("");
-                if !store.exists(target_cid).await
-                    .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))? {
-                    return Err(PipelineError::DependencyMissing(
-                        format!("Revoke target '{}' not found", target_cid),
-                    ));
+                let target_cid = body
+                    .get("target_cid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !store
+                    .exists(target_cid)
+                    .await
+                    .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?
+                {
+                    return Err(PipelineError::DependencyMissing(format!(
+                        "Revoke target '{}' not found",
+                        target_cid
+                    )));
                 }
 
                 let actor_cid = body.get("actor_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(actor_cid, "ubl/user", store).await?;
+                self.require_chip_exists(actor_cid, "ubl/user", store)
+                    .await?;
             }
 
             _ => {} // not an onboarding type
@@ -1010,10 +1491,20 @@ impl UblPipeline {
         app_slug: &str,
         store: &Arc<ubl_chipstore::ChipStore>,
     ) -> Result<(), PipelineError> {
-        let apps = store.get_chips_by_type("ubl/app").await
+        let apps = store
+            .query(&ubl_chipstore::ChipQuery {
+                chip_type: Some("ubl/app".to_string()),
+                tags: vec![format!("slug:{}", app_slug)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: None,
+                offset: None,
+            })
+            .await
             .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?;
 
-        for chip in &apps {
+        for chip in &apps.chips {
             if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug) {
                 if !self.is_revoked(chip.cid.as_str(), store).await? {
                     return Ok(());
@@ -1021,9 +1512,10 @@ impl UblPipeline {
             }
         }
 
-        Err(PipelineError::DependencyMissing(
-            format!("App '{}' not found — register ubl/app first", app_slug),
-        ))
+        Err(PipelineError::DependencyMissing(format!(
+            "App '{}' not found — register ubl/app first",
+            app_slug
+        )))
     }
 
     /// Check that a chip with the given CID exists, is the expected type, and is not revoked.
@@ -1033,21 +1525,25 @@ impl UblPipeline {
         expected_type: &str,
         store: &Arc<ubl_chipstore::ChipStore>,
     ) -> Result<(), PipelineError> {
-        let chip = store.get_chip(cid).await
+        let chip = store
+            .get_chip(cid)
+            .await
             .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?
-            .ok_or_else(|| PipelineError::DependencyMissing(
-                format!("{} '{}' not found", expected_type, cid),
-            ))?;
+            .ok_or_else(|| {
+                PipelineError::DependencyMissing(format!("{} '{}' not found", expected_type, cid))
+            })?;
 
         if chip.chip_type != expected_type {
             return Err(PipelineError::InvalidChip(format!(
-                "CID '{}' is '{}', expected '{}'", cid, chip.chip_type, expected_type,
+                "CID '{}' is '{}', expected '{}'",
+                cid, chip.chip_type, expected_type,
             )));
         }
 
         if self.is_revoked(cid, store).await? {
             return Err(PipelineError::DependencyMissing(format!(
-                "{} '{}' has been revoked", expected_type, cid,
+                "{} '{}' has been revoked",
+                expected_type, cid,
             )));
         }
 
@@ -1060,16 +1556,20 @@ impl UblPipeline {
         target_cid: &str,
         store: &Arc<ubl_chipstore::ChipStore>,
     ) -> Result<bool, PipelineError> {
-        let revocations = store.get_chips_by_type("ubl/revoke").await
+        let revocations = store
+            .query(&ubl_chipstore::ChipQuery {
+                chip_type: Some("ubl/revoke".to_string()),
+                tags: vec![format!("target_cid:{}", target_cid)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: Some(1),
+                offset: None,
+            })
+            .await
             .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?;
 
-        for rev in &revocations {
-            if rev.chip_data.get("target_cid").and_then(|v| v.as_str()) == Some(target_cid) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+        Ok(!revocations.chips.is_empty())
     }
 }
 
@@ -1100,6 +1600,10 @@ pub enum PipelineError {
     SignError(String),
     #[error("Storage error: {0}")]
     StorageError(String),
+    #[error("Idempotency conflict: {0}")]
+    IdempotencyConflict(String),
+    #[error("Durable commit failed: {0}")]
+    DurableCommitFailed(String),
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -1108,6 +1612,7 @@ pub enum PipelineError {
 mod tests {
     use super::*;
     use crate::policy_loader::InMemoryPolicyStorage;
+    use crate::transition_registry::TrBytecodeProfile;
     use serde_json::json;
 
     #[tokio::test]
@@ -1202,6 +1707,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_input_same_receipt_vm() {
+        std::env::set_var(
+            "SIGNING_KEY_HEX",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
+        let request = ChipRequest {
+            chip_type: "ubl/document".to_string(),
+            body: json!({
+                "@type": "ubl/document",
+                "@id": "same-input",
+                "@ver": "1.0",
+                "@world": "a/app/t/ten"
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let p1 = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
+        let r1 = p1.process_chip(request.clone()).await.unwrap();
+
+        let p2 = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
+        let r2 = p2.process_chip(request).await.unwrap();
+
+        // WA/WF include nonce and vary, but TR VM receipt is deterministic for same chip input.
+        assert_eq!(r1.chain[1], r2.chain[1]);
+        std::env::remove_var("SIGNING_KEY_HEX");
+    }
+
+    #[test]
+    fn tr_profile_selection_by_chip_type() {
+        let registry = TransitionRegistry::default();
+        assert_eq!(
+            TransitionRegistry::default_profile_for("ubl/document"),
+            TrBytecodeProfile::PassV1
+        );
+        assert_eq!(
+            TransitionRegistry::default_profile_for("ubl/token"),
+            TrBytecodeProfile::AuditV1
+        );
+        let resolved = registry
+            .resolve("ubl/token", &json!({"@type":"ubl/token"}))
+            .unwrap();
+        assert_eq!(resolved.profile, TrBytecodeProfile::AuditV1);
+    }
+
+    #[test]
+    fn resolve_transition_bytecode_prefers_chip_override() {
+        let registry = TransitionRegistry::default();
+        let request = ChipRequest {
+            chip_type: "ubl/document".to_string(),
+            body: json!({
+                "@type": "ubl/document",
+                "@id": "override-bytecode",
+                "@ver": "1.0",
+                "@world": "a/app/t/ten",
+                "@tr": {
+                    "bytecode_hex": "1200020000100000"
+                }
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let resolved = registry.resolve(&request.chip_type, &request.body).unwrap();
+        assert_eq!(resolved.source, "chip:@tr.bytecode_hex");
+        assert_eq!(
+            resolved.bytecode,
+            vec![0x12, 0x00, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn wasm_adapter_hash_and_abi_verified() {
+        let good = json!({
+            "adapter": {
+                "wasm_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "abi_version": "1.0"
+            }
+        });
+        assert!(AdapterRuntimeInfo::parse_optional(&good)
+            .unwrap()
+            .is_some());
+
+        let bad_hash = json!({
+            "adapter": {
+                "wasm_sha256": "not-hex",
+                "abi_version": "1.0"
+            }
+        });
+        assert!(matches!(
+            AdapterRuntimeInfo::parse_optional(&bad_hash),
+            Err(PipelineError::InvalidChip(_))
+        ));
+
+        let bad_abi = json!({
+            "adapter": {
+                "wasm_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "abi_version": "2.0"
+            }
+        });
+        assert!(matches!(
+            AdapterRuntimeInfo::parse_optional(&bad_abi),
+            Err(PipelineError::InvalidChip(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn policy_trace_has_rb_votes() {
         let storage = InMemoryPolicyStorage::new();
         let pipeline = UblPipeline::new(Box::new(storage));
@@ -1230,7 +1842,10 @@ mod tests {
         let first = &trace[0];
         assert!(first["policy_id"].is_string());
         let rbs = first["rb_results"].as_array().unwrap();
-        assert!(!rbs.is_empty(), "rb_results must expose individual RB votes");
+        assert!(
+            !rbs.is_empty(),
+            "rb_results must expose individual RB votes"
+        );
 
         // Each RB result should have rb_id, decision, reason
         let rb = &rbs[0];
@@ -1341,7 +1956,11 @@ mod tests {
         // WA metadata must contain nonce and kid
         let nonce = wa_event.metadata.get("nonce").and_then(|v| v.as_str());
         assert!(nonce.is_some(), "WA receipt must have nonce");
-        assert_eq!(nonce.unwrap().len(), 32, "nonce must be 32 hex chars (16 bytes)");
+        assert_eq!(
+            nonce.unwrap().len(),
+            32,
+            "nonce must be 32 hex chars (16 bytes)"
+        );
 
         let kid = wa_event.metadata.get("kid").and_then(|v| v.as_str());
         assert!(kid.is_some(), "WA receipt must have kid");
@@ -1368,7 +1987,10 @@ mod tests {
             let result = pipeline.process_chip(request).await.unwrap();
             // Extract nonce from WA receipt body (it's in the chain)
             let wa_cid = &result.chain[0];
-            assert!(nonces.insert(wa_cid.clone()), "WA CIDs must be unique (nonce ensures this)");
+            assert!(
+                nonces.insert(wa_cid.clone()),
+                "WA CIDs must be unique (nonce ensures this)"
+            );
         }
         assert_eq!(nonces.len(), 10);
     }
@@ -1414,7 +2036,10 @@ mod tests {
         assert!(stored.is_some(), "chip must be persisted after allow");
         let stored = stored.unwrap();
         assert_eq!(stored.chip_type, "ubl/document");
-        assert_eq!(stored.receipt_cid.as_str(), result.final_receipt.body_cid.as_str());
+        assert_eq!(
+            stored.receipt_cid.as_str(),
+            result.final_receipt.body_cid.as_str()
+        );
     }
 
     #[tokio::test]
@@ -1479,7 +2104,11 @@ mod tests {
 
         // Should have received WA, TR, WF events
         let count = event_bus.event_count().await;
-        assert!(count >= 3, "expected at least 3 events (WA+TR+WF), got {}", count);
+        assert!(
+            count >= 3,
+            "expected at least 3 events (WA+TR+WF), got {}",
+            count
+        );
 
         // First event should be WA
         let wa_event = rx.try_recv().unwrap();
@@ -1516,13 +2145,36 @@ mod tests {
 
         // Every event must have canonical fields
         for ev in &events {
-            assert!(ev.world.is_some(), "stage {} missing world", ev.pipeline_stage);
+            assert!(
+                ev.world.is_some(),
+                "stage {} missing world",
+                ev.pipeline_stage
+            );
             assert_eq!(ev.world.as_deref(), Some("a/app/t/ten"));
-            assert!(ev.actor.is_some(), "stage {} missing actor", ev.pipeline_stage);
-            assert!(ev.actor.as_ref().unwrap().starts_with("did:key:"), "actor must be a DID");
-            assert!(ev.binary_hash.is_some(), "stage {} missing binary_hash", ev.pipeline_stage);
-            assert!(ev.output_cid.is_some(), "stage {} missing output_cid", ev.pipeline_stage);
-            assert!(ev.latency_ms.is_some(), "stage {} missing latency_ms", ev.pipeline_stage);
+            assert!(
+                ev.actor.is_some(),
+                "stage {} missing actor",
+                ev.pipeline_stage
+            );
+            assert!(
+                ev.actor.as_ref().unwrap().starts_with("did:key:"),
+                "actor must be a DID"
+            );
+            assert!(
+                ev.binary_hash.is_some(),
+                "stage {} missing binary_hash",
+                ev.pipeline_stage
+            );
+            assert!(
+                ev.output_cid.is_some(),
+                "stage {} missing output_cid",
+                ev.pipeline_stage
+            );
+            assert!(
+                ev.latency_ms.is_some(),
+                "stage {} missing latency_ms",
+                ev.pipeline_stage
+            );
         }
 
         // WA has no input_cid (it's the first stage)
@@ -1532,12 +2184,20 @@ mod tests {
         // TR has input_cid = WA output
         let tr = events.iter().find(|e| e.pipeline_stage == "tr").unwrap();
         assert!(tr.input_cid.is_some(), "TR must have input_cid");
-        assert_eq!(tr.input_cid.as_deref(), wa.output_cid.as_deref(), "TR input = WA output");
+        assert_eq!(
+            tr.input_cid.as_deref(),
+            wa.output_cid.as_deref(),
+            "TR input = WA output"
+        );
 
         // WF has input_cid = TR output
         let wf = events.iter().find(|e| e.pipeline_stage == "wf").unwrap();
         assert!(wf.input_cid.is_some(), "WF must have input_cid");
-        assert_eq!(wf.input_cid.as_deref(), tr.output_cid.as_deref(), "WF input = TR output");
+        assert_eq!(
+            wf.input_cid.as_deref(),
+            tr.output_cid.as_deref(),
+            "WF input = TR output"
+        );
         assert_eq!(wf.decision.as_deref(), Some("allow"));
     }
 
@@ -1569,7 +2229,10 @@ mod tests {
         assert!(r.has_stage(PipelineStage::WriteFinished));
 
         // Receipt CID must be set
-        assert!(r.receipt_cid.as_str().starts_with("b3:"), "receipt_cid must be BLAKE3");
+        assert!(
+            r.receipt_cid.as_str().starts_with("b3:"),
+            "receipt_cid must be BLAKE3"
+        );
         assert_eq!(r.id, r.receipt_cid.as_str(), "@id must equal receipt_cid");
 
         // Envelope anchors
@@ -1579,7 +2242,11 @@ mod tests {
 
         // Auth tokens present on every stage
         for stage in &r.stages {
-            assert!(stage.auth_token.starts_with("hmac:"), "stage {:?} missing auth_token", stage.stage);
+            assert!(
+                stage.auth_token.starts_with("hmac:"),
+                "stage {:?} missing auth_token",
+                stage.stage
+            );
         }
 
         // Decision is Allow
@@ -1587,7 +2254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unified_receipt_deny_has_two_stages() {
+    async fn unified_receipt_deny_has_wf_and_no_tr() {
         let storage = InMemoryPolicyStorage::new();
         let pipeline = UblPipeline::new(Box::new(storage));
 
@@ -1606,12 +2273,12 @@ mod tests {
         let result = pipeline.process_chip(request).await.unwrap();
         let r = &result.receipt;
 
-        // Deny path: WA + CHECK only (no TR, no WF)
-        assert_eq!(r.stage_count(), 2);
+        // Deny path: WA + CHECK + WF (no TR)
+        assert_eq!(r.stage_count(), 3);
         assert!(r.has_stage(PipelineStage::WriteAhead));
         assert!(r.has_stage(PipelineStage::Check));
         assert!(!r.has_stage(PipelineStage::Transition));
-        assert!(!r.has_stage(PipelineStage::WriteFinished));
+        assert!(r.has_stage(PipelineStage::WriteFinished));
 
         assert_eq!(r.decision, Decision::Deny);
         assert!(r.effects["deny_reason"].is_string());
@@ -1638,9 +2305,19 @@ mod tests {
         let r = &result.receipt;
 
         // CHECK stage should have policy_trace with RB votes
-        let check_stage = r.stages.iter().find(|s| s.stage == PipelineStage::Check).unwrap();
-        assert!(!check_stage.policy_trace.is_empty(), "CHECK stage must have policy trace");
-        assert!(!check_stage.policy_trace[0].rb_results.is_empty(), "policy trace must have RB votes");
+        let check_stage = r
+            .stages
+            .iter()
+            .find(|s| s.stage == PipelineStage::Check)
+            .unwrap();
+        assert!(
+            !check_stage.policy_trace.is_empty(),
+            "CHECK stage must have policy trace"
+        );
+        assert!(
+            !check_stage.policy_trace[0].rb_results.is_empty(),
+            "policy trace must have RB votes"
+        );
     }
 
     #[tokio::test]
@@ -1663,9 +2340,19 @@ mod tests {
         let result = pipeline.process_chip(request).await.unwrap();
         let r = &result.receipt;
 
-        let tr_stage = r.stages.iter().find(|s| s.stage == PipelineStage::Transition).unwrap();
-        assert!(tr_stage.fuel_used.is_some(), "TR stage must record fuel_used");
-        assert!(tr_stage.output_cid.is_some(), "TR stage must have output_cid");
+        let tr_stage = r
+            .stages
+            .iter()
+            .find(|s| s.stage == PipelineStage::Transition)
+            .unwrap();
+        assert!(
+            tr_stage.fuel_used.is_some(),
+            "TR stage must record fuel_used"
+        );
+        assert!(
+            tr_stage.output_cid.is_some(),
+            "TR stage must have output_cid"
+        );
     }
 
     #[tokio::test]
@@ -1685,12 +2372,22 @@ mod tests {
 
         // Must be stored in ChipStore
         let stored = chip_store.get_chip(&genesis_cid).await.unwrap();
-        assert!(stored.is_some(), "Genesis chip must be in ChipStore after bootstrap");
+        assert!(
+            stored.is_some(),
+            "Genesis chip must be in ChipStore after bootstrap"
+        );
 
         let chip = stored.unwrap();
         assert_eq!(chip.chip_type, "ubl/policy.genesis");
-        assert_eq!(chip.receipt_cid.as_str(), genesis_cid, "Genesis is self-signed: receipt_cid == chip_cid");
-        assert_eq!(chip.execution_metadata.executor_did.as_str(), "did:key:genesis");
+        assert_eq!(
+            chip.receipt_cid.as_str(),
+            genesis_cid,
+            "Genesis is self-signed: receipt_cid == chip_cid"
+        );
+        assert_eq!(
+            chip.execution_metadata.executor_did.as_str(),
+            "did:key:genesis"
+        );
         assert!(chip.execution_metadata.reproducible);
     }
 
@@ -1721,13 +2418,14 @@ mod tests {
 
     #[tokio::test]
     async fn advisory_engine_produces_post_wf_chip() {
-        use ubl_chipstore::{ChipStore, InMemoryBackend};
         use crate::advisory::AdvisoryEngine;
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
 
         let policy_storage = InMemoryPolicyStorage::new();
         let backend = Arc::new(InMemoryBackend::new());
         let chip_store = Arc::new(ChipStore::new(backend.clone()));
-        let mut pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+        let mut pipeline =
+            UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
 
         let engine = Arc::new(AdvisoryEngine::new(
             "b3:test-passport".to_string(),
@@ -1766,7 +2464,10 @@ mod tests {
             offset: None,
         };
         let results = chip_store.query(&query).await.unwrap();
-        assert!(results.total_count >= 1, "At least one advisory chip should be stored (post-CHECK or post-WF)");
+        assert!(
+            results.total_count >= 1,
+            "At least one advisory chip should be stored (post-CHECK or post-WF)"
+        );
 
         let adv_chip = &results.chips[0];
         assert_eq!(adv_chip.chip_type, "ubl/advisory");
@@ -1775,13 +2476,14 @@ mod tests {
 
     #[tokio::test]
     async fn advisory_engine_fires_on_deny() {
-        use ubl_chipstore::{ChipStore, InMemoryBackend};
         use crate::advisory::AdvisoryEngine;
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
 
         let policy_storage = InMemoryPolicyStorage::new();
         let backend = Arc::new(InMemoryBackend::new());
         let chip_store = Arc::new(ChipStore::new(backend.clone()));
-        let mut pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+        let mut pipeline =
+            UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
 
         let engine = Arc::new(AdvisoryEngine::new(
             "b3:test-passport".to_string(),
@@ -1821,7 +2523,10 @@ mod tests {
             offset: None,
         };
         let results = chip_store.query(&query).await.unwrap();
-        assert!(results.total_count >= 1, "Post-CHECK advisory should fire on deny");
+        assert!(
+            results.total_count >= 1,
+            "Post-CHECK advisory should fire on deny"
+        );
 
         let adv_chip = &results.chips[0];
         assert_eq!(adv_chip.chip_data["action"], "explain_check");
@@ -1844,13 +2549,25 @@ mod tests {
 
     /// Helper: create a valid @cap for testing.
     fn test_cap(action: &str, audience: &str) -> serde_json::Value {
-        json!({
+        let sk = ubl_kms::generate_signing_key();
+        let vk = ubl_kms::verifying_key(&sk);
+        let issued_by = ubl_kms::did_from_verifying_key(&vk);
+        let payload = json!({
             "action": action,
             "audience": audience,
-            "issued_by": "did:key:z6MkTestIssuer",
+            "issued_by": issued_by,
             "issued_at": "2025-01-01T00:00:00Z",
             "expires_at": "2099-12-31T23:59:59Z",
-            "signature": "ed25519:dGVzdHNpZw"
+        });
+        let signature = ubl_kms::sign_canonical(&sk, &payload, ubl_kms::domain::CAPABILITY)
+            .expect("test capability must sign");
+        json!({
+            "action": payload["action"],
+            "audience": payload["audience"],
+            "issued_by": payload["issued_by"],
+            "issued_at": payload["issued_at"],
+            "expires_at": payload["expires_at"],
+            "signature": signature,
         })
     }
 
@@ -1861,7 +2578,11 @@ mod tests {
     }
 
     /// Helper: submit a chip and assert Allow.
-    async fn submit_allow(pipeline: &UblPipeline, chip_type: &str, body: serde_json::Value) -> PipelineResult {
+    async fn submit_allow(
+        pipeline: &UblPipeline,
+        chip_type: &str,
+        body: serde_json::Value,
+    ) -> PipelineResult {
         let request = ChipRequest {
             chip_type: chip_type.to_string(),
             body,
@@ -1869,12 +2590,20 @@ mod tests {
             operation: Some("create".to_string()),
         };
         let result = pipeline.process_chip(request).await.unwrap();
-        assert!(matches!(result.decision, Decision::Allow), "expected Allow for {}", chip_type);
+        assert!(
+            matches!(result.decision, Decision::Allow),
+            "expected Allow for {}",
+            chip_type
+        );
         result
     }
 
     /// Helper: submit a chip and assert it fails with a specific error variant.
-    async fn submit_expect_err(pipeline: &UblPipeline, chip_type: &str, body: serde_json::Value) -> PipelineError {
+    async fn submit_expect_err(
+        pipeline: &UblPipeline,
+        chip_type: &str,
+        body: serde_json::Value,
+    ) -> PipelineError {
         let request = ChipRequest {
             chip_type: chip_type.to_string(),
             body,
@@ -1968,7 +2697,11 @@ mod tests {
             "display_name": "Orphan"
         });
         let err = submit_expect_err(&pipeline, "ubl/user", user_body).await;
-        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::DependencyMissing(_)),
+            "expected DependencyMissing, got: {}",
+            err
+        );
         assert!(err.to_string().contains("nonexistent"));
     }
 
@@ -2000,7 +2733,11 @@ mod tests {
             "creator_cid": "b3:nonexistent_user_cid"
         });
         let err = submit_expect_err(&pipeline, "ubl/tenant", tenant_body).await;
-        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::DependencyMissing(_)),
+            "expected DependencyMissing, got: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2033,7 +2770,11 @@ mod tests {
             "@cap": test_cap("membership:grant", "a/mtest")
         });
         let err = submit_expect_err(&pipeline, "ubl/membership", mem_body).await;
-        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::DependencyMissing(_)),
+            "expected DependencyMissing, got: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2049,7 +2790,11 @@ mod tests {
             "kid": "did:key:z6Mk#v0"
         });
         let err = submit_expect_err(&pipeline, "ubl/token", token_body).await;
-        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::DependencyMissing(_)),
+            "expected DependencyMissing, got: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2070,7 +2815,11 @@ mod tests {
             "@cap": test_cap("registry:init", "a/duptest")
         });
         let err = submit_expect_err(&pipeline, "ubl/app", app_body2).await;
-        assert!(matches!(err, PipelineError::InvalidChip(_)), "expected InvalidChip for dup slug, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::InvalidChip(_)),
+            "expected InvalidChip for dup slug, got: {}",
+            err
+        );
         assert!(err.to_string().contains("duptest"));
     }
 
@@ -2161,7 +2910,11 @@ mod tests {
             "kid": "did:key:z6MkUser#v0"
         });
         let err = submit_expect_err(&pipeline, "ubl/token", token_body).await;
-        assert!(matches!(err, PipelineError::DependencyMissing(_)), "expected DependencyMissing for revoked user, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::DependencyMissing(_)),
+            "expected DependencyMissing for revoked user, got: {}",
+            err
+        );
         assert!(err.to_string().contains("revoked"));
     }
 
@@ -2175,7 +2928,11 @@ mod tests {
             "display_name": "No DID"
         });
         let err = submit_expect_err(&pipeline, "ubl/user", bad_user).await;
-        assert!(matches!(err, PipelineError::InvalidChip(_)), "expected InvalidChip, got: {}", err);
+        assert!(
+            matches!(err, PipelineError::InvalidChip(_)),
+            "expected InvalidChip, got: {}",
+            err
+        );
         assert!(err.to_string().contains("did"));
     }
 
@@ -2212,7 +2969,10 @@ mod tests {
         // Second submission — same (@type, @ver, @world, @id) → cached replay
         let r2 = submit_allow(&pipeline, "ubl/document", body.clone()).await;
         assert!(r2.replayed, "second submission should be replayed");
-        assert_eq!(r2.receipt.receipt_cid, r1.receipt.receipt_cid, "replayed receipt_cid must match original");
+        assert_eq!(
+            r2.receipt.receipt_cid, r1.receipt.receipt_cid,
+            "replayed receipt_cid must match original"
+        );
         assert_eq!(r2.chain, r1.chain, "replayed chain must match original");
     }
 
@@ -2235,6 +2995,9 @@ mod tests {
 
         assert!(!r1.replayed);
         assert!(!r2.replayed);
-        assert_ne!(r1.receipt.receipt_cid, r2.receipt.receipt_cid, "different @id → different execution");
+        assert_ne!(
+            r1.receipt.receipt_cid, r2.receipt.receipt_cid,
+            "different @id → different execution"
+        );
     }
 }

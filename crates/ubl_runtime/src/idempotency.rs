@@ -47,6 +47,13 @@ impl IdempotencyKey {
     pub fn to_string_key(&self) -> String {
         format!("{}|{}|{}|{}", self.at_type, self.at_ver, self.at_world, self.at_id)
     }
+
+    /// Stable durable key used by persistent idempotency backends.
+    /// Format: `blake3_hex(@type|@ver|@world|@id)`.
+    pub fn to_durable_key(&self) -> String {
+        let digest = blake3::hash(self.to_string_key().as_bytes());
+        hex::encode(digest.as_bytes())
+    }
 }
 
 impl std::fmt::Display for IdempotencyKey {

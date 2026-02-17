@@ -663,6 +663,7 @@ pub fn compare(a: &Num, b: &Num) -> Result<Num, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // --- from_decimal_str ---
 
@@ -987,5 +988,33 @@ mod tests {
         assert_eq!(RoundingMode::from_u8(0).unwrap(), RoundingMode::HalfEven);
         assert_eq!(RoundingMode::from_u8(5).unwrap(), RoundingMode::Ceil);
         assert!(RoundingMode::from_u8(6).is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn add_is_commutative_for_ints(a in any::<i64>(), b in any::<i64>()) {
+            let left = Num::Int { v: a.to_string(), u: None };
+            let right = Num::Int { v: b.to_string(), u: None };
+            let sum_lr = add(&left, &right).unwrap();
+            let sum_rl = add(&right, &left).unwrap();
+            prop_assert_eq!(sum_lr, sum_rl);
+        }
+
+        #[test]
+        fn sub_is_inverse_of_add_for_ints(a in any::<i64>(), b in any::<i64>()) {
+            let left = Num::Int { v: a.to_string(), u: None };
+            let right = Num::Int { v: b.to_string(), u: None };
+            let sum = add(&left, &right).unwrap();
+            let back = sub(&sum, &right).unwrap();
+            prop_assert_eq!(back, left);
+        }
+
+        #[test]
+        fn mul_by_zero_is_zero_for_ints(a in any::<i64>()) {
+            let left = Num::Int { v: a.to_string(), u: None };
+            let zero = Num::Int { v: "0".to_string(), u: None };
+            let result = mul(&left, &zero).unwrap();
+            prop_assert_eq!(result, zero);
+        }
     }
 }

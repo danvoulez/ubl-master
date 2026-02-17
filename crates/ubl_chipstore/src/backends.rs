@@ -1,9 +1,9 @@
 //! Storage backends for ChipStore
 
-use crate::{ChipStoreBackend, ChipStoreError, StoredChip, ChipQuery, QueryResult};
+use crate::{ChipQuery, ChipStoreBackend, ChipStoreError, QueryResult, StoredChip};
 use async_trait::async_trait;
 use serde_json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use ubl_types::Cid as TypedCid;
@@ -11,13 +11,120 @@ use ubl_types::Cid as TypedCid;
 /// In-memory backend for development and testing
 pub struct InMemoryBackend {
     chips: Arc<RwLock<HashMap<TypedCid, StoredChip>>>,
+    receipt_index: Arc<RwLock<HashMap<TypedCid, TypedCid>>>, // receipt_cid -> chip_cid
+    type_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // chip_type -> chip_cids
+    tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>,  // tag -> chip_cids
+    executor_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // executor_did -> chip_cids
 }
 
 impl InMemoryBackend {
     pub fn new() -> Self {
         Self {
             chips: Arc::new(RwLock::new(HashMap::new())),
+            receipt_index: Arc::new(RwLock::new(HashMap::new())),
+            type_index: Arc::new(RwLock::new(HashMap::new())),
+            tag_index: Arc::new(RwLock::new(HashMap::new())),
+            executor_index: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    async fn index_chip(&self, chip: &StoredChip) {
+        {
+            let mut type_index = self.type_index.write().await;
+            type_index
+                .entry(chip.chip_type.clone())
+                .or_insert_with(HashSet::new)
+                .insert(chip.cid.clone());
+        }
+        {
+            let mut tag_index = self.tag_index.write().await;
+            for tag in &chip.tags {
+                tag_index
+                    .entry(tag.clone())
+                    .or_insert_with(HashSet::new)
+                    .insert(chip.cid.clone());
+            }
+        }
+        {
+            let mut executor_index = self.executor_index.write().await;
+            executor_index
+                .entry(chip.execution_metadata.executor_did.as_str().to_string())
+                .or_insert_with(HashSet::new)
+                .insert(chip.cid.clone());
+        }
+    }
+
+    async fn remove_chip_from_indexes(&self, chip: &StoredChip) {
+        {
+            let mut type_index = self.type_index.write().await;
+            if let Some(cids) = type_index.get_mut(&chip.chip_type) {
+                cids.remove(&chip.cid);
+                if cids.is_empty() {
+                    type_index.remove(&chip.chip_type);
+                }
+            }
+        }
+        {
+            let mut tag_index = self.tag_index.write().await;
+            for tag in &chip.tags {
+                if let Some(cids) = tag_index.get_mut(tag) {
+                    cids.remove(&chip.cid);
+                    if cids.is_empty() {
+                        tag_index.remove(tag);
+                    }
+                }
+            }
+        }
+        {
+            let mut executor_index = self.executor_index.write().await;
+            let key = chip.execution_metadata.executor_did.as_str().to_string();
+            if let Some(cids) = executor_index.get_mut(&key) {
+                cids.remove(&chip.cid);
+                if cids.is_empty() {
+                    executor_index.remove(&key);
+                }
+            }
+        }
+    }
+
+    async fn candidate_cids_from_indexes(
+        &self,
+        query: &ChipQuery,
+    ) -> Result<Option<HashSet<TypedCid>>, ChipStoreError> {
+        if query.chip_type.is_none() && query.tags.is_empty() && query.executor_did.is_none() {
+            return Ok(None);
+        }
+
+        let mut candidates: Option<HashSet<TypedCid>> = None;
+
+        if let Some(ref chip_type) = query.chip_type {
+            let set = {
+                let type_index = self.type_index.read().await;
+                type_index.get(chip_type).cloned().unwrap_or_default()
+            };
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        for tag in &query.tags {
+            let set = {
+                let tag_index = self.tag_index.read().await;
+                tag_index.get(tag).cloned().unwrap_or_default()
+            };
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        if let Some(ref executor_did) = query.executor_did {
+            let set = {
+                let executor_index = self.executor_index.read().await;
+                executor_index
+                    .get(executor_did)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        Ok(Some(candidates.unwrap_or_default()))
     }
 }
 
@@ -30,8 +137,15 @@ impl Default for InMemoryBackend {
 #[async_trait]
 impl ChipStoreBackend for InMemoryBackend {
     async fn put_chip(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
-        let mut chips = self.chips.write().await;
-        chips.insert(chip.cid.clone(), chip.clone());
+        {
+            let mut chips = self.chips.write().await;
+            chips.insert(chip.cid.clone(), chip.clone());
+        }
+        {
+            let mut receipt_index = self.receipt_index.write().await;
+            receipt_index.insert(chip.receipt_cid.clone(), chip.cid.clone());
+        }
+        self.index_chip(chip).await;
         Ok(())
     }
 
@@ -41,6 +155,25 @@ impl ChipStoreBackend for InMemoryBackend {
         Ok(chips.get(&key).cloned())
     }
 
+    async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
+        let chip_cid = {
+            let receipt_index = self.receipt_index.read().await;
+            let receipt_key = TypedCid::new_unchecked(receipt_cid);
+            receipt_index.get(&receipt_key).cloned()
+        };
+
+        match chip_cid {
+            Some(cid) => {
+                let chips = self.chips.read().await;
+                Ok(chips.get(&cid).cloned())
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
         let chips = self.chips.read().await;
         let key = TypedCid::new_unchecked(cid);
@@ -48,43 +181,37 @@ impl ChipStoreBackend for InMemoryBackend {
     }
 
     async fn query_chips(&self, query: &ChipQuery) -> Result<QueryResult, ChipStoreError> {
+        let candidate_cids = self.candidate_cids_from_indexes(query).await?;
         let chips = self.chips.read().await;
-        let mut results: Vec<StoredChip> = chips
-            .values()
-            .filter(|chip| self.matches_query(chip, query))
-            .cloned()
-            .collect();
+        let mut results: Vec<StoredChip> = match candidate_cids {
+            Some(cids) => cids
+                .iter()
+                .filter_map(|cid| chips.get(cid))
+                .filter(|chip| matches_query(chip, query))
+                .cloned()
+                .collect(),
+            None => chips
+                .values()
+                .filter(|chip| matches_query(chip, query))
+                .cloned()
+                .collect(),
+        };
 
-        // Sort by creation time (newest first)
-        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        let total_count = results.len();
-        let offset = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(100);
-
-        // Apply pagination
-        let paginated_results: Vec<StoredChip> = results
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect();
-
-        let has_more = offset + paginated_results.len() < total_count;
-
-        Ok(QueryResult {
-            chips: paginated_results,
-            total_count,
-            has_more,
-        })
+        Ok(apply_pagination(&mut results, query))
     }
 
     async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        let cids = {
+            let type_index = self.type_index.read().await;
+            type_index.get(chip_type).cloned().unwrap_or_default()
+        };
         let chips = self.chips.read().await;
-        let results: Vec<StoredChip> = chips
-            .values()
-            .filter(|chip| chip.chip_type == chip_type)
+        let mut results: Vec<StoredChip> = cids
+            .iter()
+            .filter_map(|cid| chips.get(cid))
             .cloned()
             .collect();
+        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(results)
     }
 
@@ -107,157 +234,350 @@ impl ChipStoreBackend for InMemoryBackend {
     }
 
     async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError> {
-        let mut chips = self.chips.write().await;
-        let key = TypedCid::new_unchecked(cid);
-        chips.remove(&key);
+        let removed_chip = {
+            let mut chips = self.chips.write().await;
+            let key = TypedCid::new_unchecked(cid);
+            chips.remove(&key)
+        };
+        if let Some(chip) = removed_chip {
+            let mut receipt_index = self.receipt_index.write().await;
+            receipt_index.remove(&chip.receipt_cid);
+            drop(receipt_index);
+            self.remove_chip_from_indexes(&chip).await;
+        }
         Ok(())
     }
-}
 
-impl InMemoryBackend {
-    fn matches_query(&self, chip: &StoredChip, query: &ChipQuery) -> bool {
-        // Check chip type
-        if let Some(ref chip_type) = query.chip_type {
-            if chip.chip_type != *chip_type {
-                return false;
-            }
+    async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        {
+            let mut type_index = self.type_index.write().await;
+            type_index.clear();
+        }
+        {
+            let mut tag_index = self.tag_index.write().await;
+            tag_index.clear();
+        }
+        {
+            let mut executor_index = self.executor_index.write().await;
+            executor_index.clear();
         }
 
-        // Check tags
-        if !query.tags.is_empty() {
-            let has_all_tags = query.tags.iter().all(|tag| chip.tags.contains(tag));
-            if !has_all_tags {
-                return false;
-            }
+        let chips_snapshot: Vec<StoredChip> = {
+            let chips = self.chips.read().await;
+            chips.values().cloned().collect()
+        };
+        for chip in &chips_snapshot {
+            self.index_chip(chip).await;
         }
-
-        // Check date range
-        if let Some(ref after) = query.created_after {
-            if chip.created_at <= *after {
-                return false;
-            }
-        }
-
-        if let Some(ref before) = query.created_before {
-            if chip.created_at >= *before {
-                return false;
-            }
-        }
-
-        // Check executor
-        if let Some(ref executor_did) = query.executor_did {
-            if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
-                return false;
-            }
-        }
-
-        true
+        Ok(())
     }
 }
 
 /// Sled (embedded database) backend
 pub struct SledBackend {
     db: sled::Db,
+    receipt_index: sled::Tree,
+    type_index: sled::Tree,
+    tag_index: sled::Tree,
+    executor_index: sled::Tree,
 }
 
 impl SledBackend {
     pub fn new(path: &str) -> Result<Self, ChipStoreError> {
         let db = sled::open(path)
             .map_err(|e| ChipStoreError::Backend(format!("Failed to open sled DB: {}", e)))?;
-        Ok(Self { db })
+        let receipt_index = db
+            .open_tree("receipt_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open receipt index: {}", e)))?;
+        let type_index = db
+            .open_tree("type_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open type index: {}", e)))?;
+        let tag_index = db
+            .open_tree("tag_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open tag index: {}", e)))?;
+        let executor_index = db.open_tree("executor_index").map_err(|e| {
+            ChipStoreError::Backend(format!("Failed to open executor index: {}", e))
+        })?;
+        let backend = Self {
+            db,
+            receipt_index,
+            type_index,
+            tag_index,
+            executor_index,
+        };
+        backend.rebuild_indexes()?;
+        Ok(backend)
     }
 
     pub fn in_memory() -> Result<Self, ChipStoreError> {
-        let db = sled::Config::new()
-            .temporary(true)
-            .open()
-            .map_err(|e| ChipStoreError::Backend(format!("Failed to create in-memory sled DB: {}", e)))?;
-        Ok(Self { db })
+        let db = sled::Config::new().temporary(true).open().map_err(|e| {
+            ChipStoreError::Backend(format!("Failed to create in-memory sled DB: {}", e))
+        })?;
+        let receipt_index = db
+            .open_tree("receipt_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open receipt index: {}", e)))?;
+        let type_index = db
+            .open_tree("type_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open type index: {}", e)))?;
+        let tag_index = db
+            .open_tree("tag_index")
+            .map_err(|e| ChipStoreError::Backend(format!("Failed to open tag index: {}", e)))?;
+        let executor_index = db.open_tree("executor_index").map_err(|e| {
+            ChipStoreError::Backend(format!("Failed to open executor index: {}", e))
+        })?;
+        let backend = Self {
+            db,
+            receipt_index,
+            type_index,
+            tag_index,
+            executor_index,
+        };
+        backend.rebuild_indexes()?;
+        Ok(backend)
+    }
+
+    fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        self.receipt_index
+            .clear()
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        self.type_index
+            .clear()
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        self.tag_index
+            .clear()
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        self.executor_index
+            .clear()
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+
+        for entry in self.db.iter() {
+            let (_cid, value) = entry.map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            let chip: StoredChip = serde_json::from_slice(&value)
+                .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+            self.receipt_index
+                .insert(
+                    chip.receipt_cid.as_str().as_bytes(),
+                    chip.cid.as_str().as_bytes(),
+                )
+                .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            self.add_chip_to_indexes(&chip)?;
+        }
+
+        Ok(())
+    }
+
+    fn add_chip_to_indexes(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
+        self.add_index_entry(&self.type_index, &chip.chip_type, chip.cid.as_str())?;
+        for tag in &chip.tags {
+            self.add_index_entry(&self.tag_index, tag, chip.cid.as_str())?;
+        }
+        self.add_index_entry(
+            &self.executor_index,
+            chip.execution_metadata.executor_did.as_str(),
+            chip.cid.as_str(),
+        )?;
+        Ok(())
+    }
+
+    fn remove_chip_from_indexes(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
+        self.remove_index_entry(&self.type_index, &chip.chip_type, chip.cid.as_str())?;
+        for tag in &chip.tags {
+            self.remove_index_entry(&self.tag_index, tag, chip.cid.as_str())?;
+        }
+        self.remove_index_entry(
+            &self.executor_index,
+            chip.execution_metadata.executor_did.as_str(),
+            chip.cid.as_str(),
+        )?;
+        Ok(())
+    }
+
+    fn add_index_entry(
+        &self,
+        tree: &sled::Tree,
+        key: &str,
+        cid: &str,
+    ) -> Result<(), ChipStoreError> {
+        let mut set = self.read_index_set(tree, key)?;
+        set.insert(cid.to_string());
+        self.write_index_set(tree, key, &set)
+    }
+
+    fn remove_index_entry(
+        &self,
+        tree: &sled::Tree,
+        key: &str,
+        cid: &str,
+    ) -> Result<(), ChipStoreError> {
+        let mut set = self.read_index_set(tree, key)?;
+        if !set.remove(cid) {
+            return Ok(());
+        }
+        if set.is_empty() {
+            tree.remove(key.as_bytes())
+                .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            return Ok(());
+        }
+        self.write_index_set(tree, key, &set)
+    }
+
+    fn read_index_set(
+        &self,
+        tree: &sled::Tree,
+        key: &str,
+    ) -> Result<HashSet<String>, ChipStoreError> {
+        let Some(bytes) = tree
+            .get(key.as_bytes())
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?
+        else {
+            return Ok(HashSet::new());
+        };
+        let values: Vec<String> = serde_json::from_slice(&bytes)
+            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        Ok(values.into_iter().collect())
+    }
+
+    fn write_index_set(
+        &self,
+        tree: &sled::Tree,
+        key: &str,
+        set: &HashSet<String>,
+    ) -> Result<(), ChipStoreError> {
+        let mut values: Vec<String> = set.iter().cloned().collect();
+        values.sort();
+        let bytes = serde_json::to_vec(&values)
+            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        tree.insert(key.as_bytes(), bytes)
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    fn load_chip_by_cid(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
+        let Some(data) = self
+            .db
+            .get(cid.as_bytes())
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let chip: StoredChip = serde_json::from_slice(&data)
+            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        Ok(Some(chip))
+    }
+
+    fn candidate_cids_from_indexes(
+        &self,
+        query: &ChipQuery,
+    ) -> Result<Option<HashSet<String>>, ChipStoreError> {
+        if query.chip_type.is_none() && query.tags.is_empty() && query.executor_did.is_none() {
+            return Ok(None);
+        }
+
+        let mut candidates: Option<HashSet<String>> = None;
+
+        if let Some(ref chip_type) = query.chip_type {
+            let set = self.read_index_set(&self.type_index, chip_type)?;
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        for tag in &query.tags {
+            let set = self.read_index_set(&self.tag_index, tag)?;
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        if let Some(ref executor_did) = query.executor_did {
+            let set = self.read_index_set(&self.executor_index, executor_did)?;
+            candidates = Some(intersect_sets(candidates, set));
+        }
+
+        Ok(Some(candidates.unwrap_or_default()))
     }
 }
 
 #[async_trait]
 impl ChipStoreBackend for SledBackend {
     async fn put_chip(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
-        let serialized = serde_json::to_vec(chip)
-            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        let serialized =
+            serde_json::to_vec(chip).map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
 
         self.db
             .insert(chip.cid.as_str().as_bytes(), serialized)
             .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
 
+        self.receipt_index
+            .insert(
+                chip.receipt_cid.as_str().as_bytes(),
+                chip.cid.as_str().as_bytes(),
+            )
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        self.add_chip_to_indexes(chip)?;
+
         Ok(())
     }
 
     async fn get_chip(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
-        if let Some(data) = self.db
-            .get(cid.as_bytes())
-            .map_err(|e| ChipStoreError::Backend(e.to_string()))?
-        {
-            let chip: StoredChip = serde_json::from_slice(&data)
-                .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
-            Ok(Some(chip))
-        } else {
-            Ok(None)
-        }
+        self.load_chip_by_cid(cid)
+    }
+
+    async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
+        let maybe_chip_cid = self
+            .receipt_index
+            .get(receipt_cid.as_bytes())
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+
+        let Some(chip_cid) = maybe_chip_cid else {
+            return Ok(None);
+        };
+
+        let chip_cid_str = std::str::from_utf8(chip_cid.as_ref())
+            .map_err(|e| ChipStoreError::Backend(format!("Invalid receipt index UTF-8: {}", e)))?;
+        self.get_chip(chip_cid_str).await
     }
 
     async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
-        Ok(self.db
+        Ok(self
+            .db
             .contains_key(cid.as_bytes())
             .map_err(|e| ChipStoreError::Backend(e.to_string()))?)
     }
 
     async fn query_chips(&self, query: &ChipQuery) -> Result<QueryResult, ChipStoreError> {
         let mut results = Vec::new();
-
-        // Scan all entries (not optimal, but works for now)
-        // TODO: Implement proper indexing for production
-        for result in self.db.iter() {
-            let (_key, value) = result.map_err(|e| ChipStoreError::Backend(e.to_string()))?;
-            let chip: StoredChip = serde_json::from_slice(&value)
-                .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
-
-            if self.matches_query(&chip, query) {
-                results.push(chip);
+        if let Some(candidate_cids) = self.candidate_cids_from_indexes(query)? {
+            for cid in candidate_cids {
+                if let Some(chip) = self.load_chip_by_cid(&cid)? {
+                    if matches_query(&chip, query) {
+                        results.push(chip);
+                    }
+                }
+            }
+        } else {
+            for result in self.db.iter() {
+                let (_key, value) = result.map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+                let chip: StoredChip = serde_json::from_slice(&value)
+                    .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+                if matches_query(&chip, query) {
+                    results.push(chip);
+                }
             }
         }
-
-        // Sort by creation time (newest first)
-        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        let total_count = results.len();
-        let offset = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(100);
-
-        // Apply pagination
-        let paginated_results: Vec<StoredChip> = results
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect();
-
-        let has_more = offset + paginated_results.len() < total_count;
-
-        Ok(QueryResult {
-            chips: paginated_results,
-            total_count,
-            has_more,
-        })
+        Ok(apply_pagination(&mut results, query))
     }
 
     async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
-        let query = ChipQuery {
-            chip_type: Some(chip_type.to_string()),
-            tags: vec![],
-            created_after: None,
-            created_before: None,
-            executor_did: None,
-            limit: None,
-            offset: None,
-        };
-        let result = self.query_chips(&query).await?;
-        Ok(result.chips)
+        let mut results = Vec::new();
+        for cid in self.read_index_set(&self.type_index, chip_type)? {
+            if let Some(chip) = self.load_chip_by_cid(&cid)? {
+                if chip.chip_type == chip_type {
+                    results.push(chip);
+                }
+            }
+        }
+        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(results)
     }
 
     async fn get_related_chips(&self, cid: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
@@ -275,51 +595,170 @@ impl ChipStoreBackend for SledBackend {
     }
 
     async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError> {
+        if let Some(chip) = self.get_chip(cid).await? {
+            self.receipt_index
+                .remove(chip.receipt_cid.as_str().as_bytes())
+                .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            self.remove_chip_from_indexes(&chip)?;
+        }
+
         self.db
             .remove(cid.as_bytes())
             .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        SledBackend::rebuild_indexes(self)
+    }
 }
 
-impl SledBackend {
-    fn matches_query(&self, chip: &StoredChip, query: &ChipQuery) -> bool {
-        // Same logic as InMemoryBackend
-        // Check chip type
-        if let Some(ref chip_type) = query.chip_type {
-            if chip.chip_type != *chip_type {
-                return false;
-            }
-        }
+fn apply_pagination(results: &mut Vec<StoredChip>, query: &ChipQuery) -> QueryResult {
+    results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let total_count = results.len();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100);
+    let paginated_results: Vec<StoredChip> = results.drain(..).skip(offset).take(limit).collect();
+    let has_more = offset + paginated_results.len() < total_count;
+    QueryResult {
+        chips: paginated_results,
+        total_count,
+        has_more,
+    }
+}
 
-        // Check tags
-        if !query.tags.is_empty() {
-            let has_all_tags = query.tags.iter().all(|tag| chip.tags.contains(tag));
-            if !has_all_tags {
-                return false;
-            }
+fn matches_query(chip: &StoredChip, query: &ChipQuery) -> bool {
+    if let Some(ref chip_type) = query.chip_type {
+        if chip.chip_type != *chip_type {
+            return false;
         }
+    }
 
-        // Check date range
-        if let Some(ref after) = query.created_after {
-            if chip.created_at <= *after {
-                return false;
-            }
+    if !query.tags.is_empty() {
+        let has_all_tags = query.tags.iter().all(|tag| chip.tags.contains(tag));
+        if !has_all_tags {
+            return false;
         }
+    }
 
-        if let Some(ref before) = query.created_before {
-            if chip.created_at >= *before {
-                return false;
-            }
+    if let Some(ref after) = query.created_after {
+        if chip.created_at <= *after {
+            return false;
         }
+    }
 
-        // Check executor
-        if let Some(ref executor_did) = query.executor_did {
-            if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
-                return false;
-            }
+    if let Some(ref before) = query.created_before {
+        if chip.created_at >= *before {
+            return false;
         }
+    }
 
-        true
+    if let Some(ref executor_did) = query.executor_did {
+        if chip.execution_metadata.executor_did.as_str() != executor_did.as_str() {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn intersect_sets<T: std::cmp::Eq + std::hash::Hash + Clone>(
+    current: Option<HashSet<T>>,
+    next: HashSet<T>,
+) -> HashSet<T> {
+    match current {
+        Some(existing) => existing.intersection(&next).cloned().collect(),
+        None => next,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChipStore, ExecutionMetadata};
+    use serde_json::json;
+    use std::sync::Arc;
+    use ubl_types::Did as TypedDid;
+
+    fn test_metadata() -> ExecutionMetadata {
+        ExecutionMetadata {
+            runtime_version: "test-runtime".to_string(),
+            execution_time_ms: 5,
+            fuel_consumed: 11,
+            policies_applied: vec!["p0".to_string()],
+            executor_did: TypedDid::new_unchecked("did:key:zTestExecutor"),
+            reproducible: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn sled_rebuild_indexes_recovers_from_index_loss() {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!(
+            "ubl_chipstore_rebuild_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let path_str = path.to_string_lossy().to_string();
+
+        let backend = Arc::new(SledBackend::new(&path_str).expect("open sled"));
+        let store = ChipStore::new(backend.clone());
+        store
+            .store_executed_chip(
+                json!({
+                    "@type": "ubl/advisory",
+                    "@id": "adv-rebuild",
+                    "@ver": "1.0",
+                    "@world": "a/rebuild/t/prod",
+                    "passport_cid": "b3:passport-rebuild"
+                }),
+                "b3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+                test_metadata(),
+            )
+            .await
+            .expect("store advisory");
+
+        let query = ChipQuery {
+            chip_type: Some("ubl/advisory".to_string()),
+            tags: vec!["passport_cid:b3:passport-rebuild".to_string()],
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(10),
+            offset: None,
+        };
+
+        let before = store.query(&query).await.expect("query before index loss");
+        assert_eq!(before.total_count, 1);
+
+        backend
+            .type_index
+            .clear()
+            .expect("clear type index for corruption test");
+        backend
+            .tag_index
+            .clear()
+            .expect("clear tag index for corruption test");
+        backend
+            .executor_index
+            .clear()
+            .expect("clear executor index for corruption test");
+
+        let broken = store.query(&query).await.expect("query while indexes are empty");
+        assert_eq!(broken.total_count, 0);
+
+        store
+            .rebuild_indexes()
+            .await
+            .expect("rebuild indexes from primary data");
+
+        let recovered = store.query(&query).await.expect("query after rebuild");
+        assert_eq!(recovered.total_count, 1);
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

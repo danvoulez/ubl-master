@@ -66,6 +66,12 @@ pub trait ChipStoreBackend: Send + Sync {
     /// Retrieve a chip by CID
     async fn get_chip(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError>;
 
+    /// Retrieve a chip by its receipt CID.
+    async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError>;
+
     /// Check if a chip exists
     async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError>;
 
@@ -80,6 +86,9 @@ pub trait ChipStoreBackend: Send + Sync {
 
     /// Delete a chip (admin operation - breaks immutability guarantee!)
     async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError>;
+
+    /// Rebuild secondary indexes from stored chips.
+    async fn rebuild_indexes(&self) -> Result<(), ChipStoreError>;
 }
 
 /// The main ChipStore interface
@@ -113,7 +122,8 @@ impl ChipStore {
         let receipt_cid = TypedCid::new_unchecked(receipt_cid);
 
         // Extract chip type and tags
-        let chip_type = chip_data.get("@type")
+        let chip_type = chip_data
+            .get("@type")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -146,6 +156,14 @@ impl ChipStore {
         self.backend.get_chip(cid).await
     }
 
+    /// Retrieve a chip by receipt CID.
+    pub async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
+        self.backend.get_chip_by_receipt_cid(receipt_cid).await
+    }
+
     /// Check if a chip exists
     pub async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
         self.backend.exists(cid).await
@@ -157,17 +175,30 @@ impl ChipStore {
     }
 
     /// Get all chips of a specific type
-    pub async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+    pub async fn get_chips_by_type(
+        &self,
+        chip_type: &str,
+    ) -> Result<Vec<StoredChip>, ChipStoreError> {
         self.backend.get_chips_by_type(chip_type).await
     }
 
     /// Get all customers (example business logic)
     pub async fn get_customers(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
-        self.backend.get_chips_by_type("ubl/customer.register").await
+        self.backend
+            .get_chips_by_type("ubl/customer.register")
+            .await
+    }
+
+    /// Rebuild backend indexes from primary storage.
+    pub async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        self.backend.rebuild_indexes().await
     }
 
     /// Get customer by email (example index lookup)
-    pub async fn get_customer_by_email(&self, email: &str) -> Result<Option<StoredChip>, ChipStoreError> {
+    pub async fn get_customer_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
         let query = ChipQuery {
             chip_type: Some("ubl/customer.register".to_string()),
             tags: vec![format!("email:{}", email)],
@@ -186,17 +217,38 @@ impl ChipStore {
     fn extract_tags(&self, chip_data: &serde_json::Value, chip_type: &str) -> Vec<String> {
         let mut tags = vec![format!("type:{}", chip_type)];
 
-        // Extract common fields as tags
-        if let Some(email) = chip_data.get("email").and_then(|v| v.as_str()) {
-            tags.push(format!("email:{}", email));
+        // Extract common direct fields as tags.
+        for field in [
+            "email",
+            "id",
+            "slug",
+            "status",
+            "target_cid",
+            "passport_cid",
+            "actor_cid",
+            "user_cid",
+            "tenant_cid",
+            "creator_cid",
+            "app_cid",
+        ] {
+            if let Some(value) = chip_data.get(field).and_then(|v| v.as_str()) {
+                tags.push(format!("{}:{}", field, value));
+            }
         }
 
-        if let Some(id) = chip_data.get("id").and_then(|v| v.as_str()) {
+        // Anchored identity fields.
+        if let Some(id) = chip_data.get("@id").and_then(|v| v.as_str()) {
             tags.push(format!("id:{}", id));
         }
-
-        if let Some(status) = chip_data.get("status").and_then(|v| v.as_str()) {
-            tags.push(format!("status:{}", status));
+        if let Some(world) = chip_data.get("@world").and_then(|v| v.as_str()) {
+            tags.push(format!("world:{}", world));
+            let parts: Vec<&str> = world.split('/').collect();
+            if parts.len() >= 2 && parts[0] == "a" && !parts[1].is_empty() {
+                tags.push(format!("app:{}", parts[1]));
+            }
+            if parts.len() == 4 && parts[2] == "t" && !parts[3].is_empty() {
+                tags.push(format!("tenant:{}", parts[3]));
+            }
         }
 
         // Extract date tags
@@ -256,6 +308,189 @@ pub enum ChipStoreError {
     InvalidCid(String),
     #[error("Index error: {0}")]
     Index(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_metadata() -> ExecutionMetadata {
+        ExecutionMetadata {
+            runtime_version: "test-runtime".to_string(),
+            execution_time_ms: 7,
+            fuel_consumed: 42,
+            policies_applied: vec!["p0".to_string()],
+            executor_did: TypedDid::new_unchecked("did:key:zTestExecutor"),
+            reproducible: true,
+        }
+    }
+
+    fn test_chip() -> serde_json::Value {
+        json!({
+            "@type": "ubl/test",
+            "@id": "chip-1",
+            "@ver": "1.0",
+            "@world": "a/test/t/dev",
+            "status": "ok"
+        })
+    }
+
+    #[tokio::test]
+    async fn in_memory_lookup_by_receipt_cid() {
+        let store = ChipStore::new(Arc::new(InMemoryBackend::new()));
+        let receipt_cid = "b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let cid = store
+            .store_executed_chip(test_chip(), receipt_cid.to_string(), test_metadata())
+            .await
+            .expect("store chip");
+
+        let found = store
+            .get_chip_by_receipt_cid(receipt_cid)
+            .await
+            .expect("lookup by receipt cid");
+
+        let found = found.expect("chip exists");
+        assert_eq!(found.cid.as_str(), cid);
+        assert_eq!(found.receipt_cid.as_str(), receipt_cid);
+    }
+
+    #[tokio::test]
+    async fn sled_lookup_by_receipt_cid() {
+        let store = ChipStore::new(Arc::new(SledBackend::in_memory().expect("sled backend")));
+        let receipt_cid = "b3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let cid = store
+            .store_executed_chip(test_chip(), receipt_cid.to_string(), test_metadata())
+            .await
+            .expect("store chip");
+
+        let found = store
+            .get_chip_by_receipt_cid(receipt_cid)
+            .await
+            .expect("lookup by receipt cid");
+
+        let found = found.expect("chip exists");
+        assert_eq!(found.cid.as_str(), cid);
+        assert_eq!(found.receipt_cid.as_str(), receipt_cid);
+    }
+
+    #[tokio::test]
+    async fn lookup_missing_receipt_cid_returns_none() {
+        let store = ChipStore::new(Arc::new(InMemoryBackend::new()));
+        let found = store
+            .get_chip_by_receipt_cid(
+                "b3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .await
+            .expect("lookup should succeed");
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_by_target_cid_tag_returns_revocation() {
+        let store = ChipStore::new(Arc::new(InMemoryBackend::new()));
+        let revoke = json!({
+            "@type": "ubl/revoke",
+            "@id": "rev-1",
+            "@ver": "1.0",
+            "@world": "a/test/t/dev",
+            "target_cid": "b3:target123",
+            "actor_cid": "b3:user123"
+        });
+        store
+            .store_executed_chip(
+                revoke,
+                "b3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+                test_metadata(),
+            )
+            .await
+            .expect("store revoke chip");
+
+        let result = store
+            .query(&ChipQuery {
+                chip_type: Some("ubl/revoke".to_string()),
+                tags: vec!["target_cid:b3:target123".to_string()],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: Some(10),
+                offset: None,
+            })
+            .await
+            .expect("query revoke by target tag");
+
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.chips[0].chip_type, "ubl/revoke");
+    }
+
+    #[tokio::test]
+    async fn sled_rebuilds_indexes_on_reopen() {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("ubl_chipstore_idx_{}_{}", std::process::id(), nonce));
+        let path_str = path.to_string_lossy().to_string();
+
+        {
+            let store = ChipStore::new(Arc::new(SledBackend::new(&path_str).expect("open sled")));
+            let advisory = json!({
+                "@type": "ubl/advisory",
+                "@id": "adv-1",
+                "@ver": "1.0",
+                "@world": "a/acme/t/prod",
+                "passport_cid": "b3:passport123",
+                "action": "observe"
+            });
+            store
+                .store_executed_chip(
+                    advisory,
+                    "b3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                        .to_string(),
+                    test_metadata(),
+                )
+                .await
+                .expect("store advisory chip");
+        }
+
+        {
+            let store = ChipStore::new(Arc::new(SledBackend::new(&path_str).expect("reopen sled")));
+            let result = store
+                .query(&ChipQuery {
+                    chip_type: Some("ubl/advisory".to_string()),
+                    tags: vec!["passport_cid:b3:passport123".to_string()],
+                    created_after: None,
+                    created_before: None,
+                    executor_did: None,
+                    limit: Some(10),
+                    offset: None,
+                })
+                .await
+                .expect("query advisory by passport tag");
+            assert_eq!(result.total_count, 1);
+            assert_eq!(result.chips[0].chip_type, "ubl/advisory");
+
+            let app_scoped = store
+                .query(&ChipQuery {
+                    chip_type: Some("ubl/advisory".to_string()),
+                    tags: vec!["app:acme".to_string(), "tenant:prod".to_string()],
+                    created_after: None,
+                    created_before: None,
+                    executor_did: None,
+                    limit: Some(10),
+                    offset: None,
+                })
+                .await
+                .expect("query advisory by world tags");
+            assert_eq!(app_scoped.total_count, 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 /// Re-export for convenience
