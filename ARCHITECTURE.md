@@ -756,11 +756,26 @@ KNOCK stage rejects early (before WA) on:
 
 ## 15. Acceptance Criteria
 
-### 15.1 Determinism
+### 15.1 Determinism Boundary (PF-02)
 
-> Same input on 3 different machines → identical WF receipt bytes, identical CID.
+Two distinct determinism levels exist in the pipeline:
 
-Verified by: `rb_vm` golden CID tests + pipeline integration tests.
+**Chip CID — fully deterministic.**
+Same canonical content → same NRF-1 bytes → same BLAKE3 hash → same `b3:` CID.
+This holds across machines, runs, and time. Verified by `rb_vm` golden CID tests.
+
+**Receipt CID — contextually unique.**
+Receipts include `frozen_time` (WA), `nonce` (anti-replay), `timestamp` per stage,
+and `RuntimeInfo` (binary hash, build meta). These fields are *intentionally* non-reproducible:
+the receipt is proof that *this specific execution happened at this moment on this binary*.
+Same chip processed twice → same chip CID, different receipt CIDs.
+
+**Consequence:** never compare receipt CIDs for content equality. Compare chip CIDs.
+Receipt CIDs are identifiers of *events*, not *content*. The auth chain
+(`HMAC-BLAKE3` per stage) proves ordering and integrity within a single execution,
+not reproducibility across executions.
+
+Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_cid_is_deterministic` test (same inputs including forced timestamp → same CID).
 
 ### 15.2 Opcode Cost Stability
 
