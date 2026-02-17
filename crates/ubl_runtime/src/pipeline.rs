@@ -121,6 +121,8 @@ pub struct PipelineResult {
     pub decision: Decision,
     /// Unified receipt — single evolving document through all stages
     pub receipt: UnifiedReceipt,
+    /// True when this result was served from the idempotency cache (no re-execution).
+    pub replayed: bool,
 }
 
 /// A receipt in the pipeline
@@ -318,13 +320,28 @@ impl UblPipeline {
     pub async fn process_chip(&self, request: ChipRequest) -> Result<PipelineResult, PipelineError> {
         let pipeline_start = std::time::Instant::now();
 
-        // ── Idempotency check: replay returns cached result ──
+        // ── Idempotency check: replay returns cached result (no re-execution) ──
         let idem_key = IdempotencyKey::from_chip_body(&request.body);
         if let Some(ref key) = idem_key {
             if let Some(cached) = self.idempotency_store.get(key).await {
-                return Err(PipelineError::ReplayDetected(
-                    format!("idempotent replay for {}: receipt_cid={}", key, cached.receipt_cid),
-                ));
+                let decision = if cached.decision.contains("Allow") {
+                    Decision::Allow
+                } else {
+                    Decision::Deny
+                };
+                let receipt = UnifiedReceipt::from_json(&cached.response_json)
+                    .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
+                return Ok(PipelineResult {
+                    final_receipt: PipelineReceipt {
+                        body_cid: cached.receipt_cid.clone(),
+                        receipt_type: "ubl/wf".to_string(),
+                        body: cached.response_json.clone(),
+                    },
+                    chain: cached.chain.clone(),
+                    decision,
+                    receipt,
+                    replayed: true,
+                });
             }
         }
 
@@ -416,6 +433,7 @@ impl UblPipeline {
                 chain: vec![wa_receipt.body_cid.clone(), "no-tr".to_string(), wf_receipt.body_cid.clone()],
                 decision: Decision::Deny,
                 receipt,
+                replayed: false,
             });
         }
 
@@ -537,6 +555,7 @@ impl UblPipeline {
             ],
             decision: check.decision,
             receipt,
+            replayed: false,
         };
 
         // ── Cache result for idempotency ──
@@ -2170,5 +2189,52 @@ mod tests {
             "title": "Hello World"
         });
         submit_allow(&pipeline, "ubl/document", doc_body).await;
+    }
+
+    #[tokio::test]
+    async fn idempotent_replay_returns_cached_result() {
+        let storage = InMemoryPolicyStorage::new();
+        let pipeline = UblPipeline::new(Box::new(storage));
+
+        let body = json!({
+            "@type": "ubl/document",
+            "@id": "idem-001",
+            "@ver": "1.0",
+            "@world": "a/test/t/dev",
+            "title": "Idempotency test"
+        });
+
+        // First submission — fresh execution
+        let r1 = submit_allow(&pipeline, "ubl/document", body.clone()).await;
+        assert!(!r1.replayed, "first submission should not be replayed");
+        assert!(!r1.receipt.receipt_cid.is_empty());
+
+        // Second submission — same (@type, @ver, @world, @id) → cached replay
+        let r2 = submit_allow(&pipeline, "ubl/document", body.clone()).await;
+        assert!(r2.replayed, "second submission should be replayed");
+        assert_eq!(r2.receipt.receipt_cid, r1.receipt.receipt_cid, "replayed receipt_cid must match original");
+        assert_eq!(r2.chain, r1.chain, "replayed chain must match original");
+    }
+
+    #[tokio::test]
+    async fn idempotent_replay_different_id_is_fresh() {
+        let storage = InMemoryPolicyStorage::new();
+        let pipeline = UblPipeline::new(Box::new(storage));
+
+        let body1 = json!({
+            "@type": "ubl/document", "@id": "a", "@ver": "1.0", "@world": "a/x/t/y",
+            "title": "First"
+        });
+        let body2 = json!({
+            "@type": "ubl/document", "@id": "b", "@ver": "1.0", "@world": "a/x/t/y",
+            "title": "Second"
+        });
+
+        let r1 = submit_allow(&pipeline, "ubl/document", body1).await;
+        let r2 = submit_allow(&pipeline, "ubl/document", body2).await;
+
+        assert!(!r1.replayed);
+        assert!(!r2.replayed);
+        assert_ne!(r1.receipt.receipt_cid, r2.receipt.receipt_cid, "different @id → different execution");
     }
 }

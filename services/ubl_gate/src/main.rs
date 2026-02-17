@@ -98,10 +98,14 @@ async fn healthz() -> Json<Value> {
 }
 
 /// POST /v1/chips — process raw bytes through the full KNOCK→WA→CHECK→TR→WF pipeline.
+///
+/// Idempotent: if the chip was already processed (same @type/@ver/@world/@id),
+/// returns the cached result with `X-UBL-Replay: true` header and `"replayed": true`
+/// in the response body. No re-execution occurs.
 async fn create_chip(
     State(state): State<AppState>,
     body: Bytes,
-) -> (StatusCode, Json<Value>) {
+) -> impl IntoResponse {
     metrics::inc_chips_total();
     let t0 = std::time::Instant::now();
 
@@ -115,8 +119,13 @@ async fn create_chip(
                 metrics::inc_deny();
             }
             let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+            let mut headers = HeaderMap::new();
+            if result.replayed {
+                headers.insert("X-UBL-Replay", "true".parse().unwrap());
+            }
             (
                 StatusCode::OK,
+                headers,
                 Json(json!({
                     "@type": "ubl/response",
                     "status": "success",
@@ -124,6 +133,7 @@ async fn create_chip(
                     "receipt_cid": result.receipt.receipt_cid,
                     "chain": result.chain,
                     "receipt": receipt_json,
+                    "replayed": result.replayed,
                 })),
             )
         }
@@ -137,7 +147,7 @@ async fn create_chip(
             metrics::inc_error(&code_str);
             let status = StatusCode::from_u16(ubl_err.code.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(ubl_err.to_json()))
+            (status, HeaderMap::new(), Json(ubl_err.to_json()))
         }
     }
 }

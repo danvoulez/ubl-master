@@ -331,6 +331,12 @@ impl UnifiedReceipt {
         serde_json::to_value(self)
             .map_err(|e| ReceiptError::Serialization(e.to_string()))
     }
+
+    /// Deserialize from Universal Envelope JSON.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, ReceiptError> {
+        serde_json::from_value(value.clone())
+            .map_err(|e| ReceiptError::Serialization(e.to_string()))
+    }
 }
 
 /// Compute HMAC-BLAKE3 auth token for stage chain linkage.
