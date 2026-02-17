@@ -128,7 +128,7 @@ pub struct PipelineResult {
 /// A receipt in the pipeline
 #[derive(Debug, Clone)]
 pub struct PipelineReceipt {
-    pub body_cid: String,
+    pub body_cid: ubl_types::Cid,
     pub receipt_type: String,
     pub body: serde_json::Value,
 }
@@ -333,7 +333,7 @@ impl UblPipeline {
                     .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
                 return Ok(PipelineResult {
                     final_receipt: PipelineReceipt {
-                        body_cid: cached.receipt_cid.clone(),
+                        body_cid: ubl_types::Cid::new_unchecked(&cached.receipt_cid),
                         receipt_type: "ubl/wf".to_string(),
                         body: cached.response_json.clone(),
                     },
@@ -367,8 +367,8 @@ impl UblPipeline {
         receipt.append_stage(StageExecution {
             stage: PipelineStage::WriteAhead,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.clone(),
-            output_cid: Some(wa_receipt.body_cid.clone()),
+            input_cid: wa_receipt.body_cid.as_str().to_string(),
+            output_cid: Some(wa_receipt.body_cid.as_str().to_string()),
             fuel_used: None,
             policy_trace: vec![],
             auth_token: String::new(),
@@ -386,7 +386,7 @@ impl UblPipeline {
         receipt.append_stage(StageExecution {
             stage: PipelineStage::Check,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.clone(),
+            input_cid: wa_receipt.body_cid.as_str().to_string(),
             output_cid: None,
             fuel_used: None,
             policy_trace: check.trace.clone(),
@@ -397,7 +397,7 @@ impl UblPipeline {
         // Post-CHECK advisory hook (non-blocking) — explain denial
         if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
             let adv = engine.post_check_advisory(
-                &wa_receipt.body_cid,
+                wa_receipt.body_cid.as_str(),
                 if matches!(check.decision, Decision::Deny) { "deny" } else { "allow" },
                 &check.reason,
                 &check.trace.iter().map(|t| serde_json::to_value(t).unwrap_or_default()).collect::<Vec<_>>(),
@@ -426,11 +426,11 @@ impl UblPipeline {
             let wf_receipt = self.create_deny_receipt(&request, &wa_receipt, &check).await?;
 
             let deny_ms = pipeline_start.elapsed().as_millis() as i64;
-            self.publish_receipt_event(&wf_receipt, "wf", Some("deny".to_string()), Some(deny_ms), Some(world), Some(&wa_receipt.body_cid)).await;
+            self.publish_receipt_event(&wf_receipt, "wf", Some("deny".to_string()), Some(deny_ms), Some(world), Some(wa_receipt.body_cid.as_str())).await;
 
             return Ok(PipelineResult {
                 final_receipt: wf_receipt.clone(),
-                chain: vec![wa_receipt.body_cid.clone(), "no-tr".to_string(), wf_receipt.body_cid.clone()],
+                chain: vec![wa_receipt.body_cid.as_str().to_string(), "no-tr".to_string(), wf_receipt.body_cid.as_str().to_string()],
                 decision: Decision::Deny,
                 receipt,
                 replayed: false,
@@ -449,8 +449,8 @@ impl UblPipeline {
         receipt.append_stage(StageExecution {
             stage: PipelineStage::Transition,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: wa_receipt.body_cid.clone(),
-            output_cid: Some(tr_receipt.body_cid.clone()),
+            input_cid: wa_receipt.body_cid.as_str().to_string(),
+            output_cid: Some(tr_receipt.body_cid.as_str().to_string()),
             fuel_used,
             policy_trace: vec![],
             auth_token: String::new(),
@@ -458,7 +458,7 @@ impl UblPipeline {
         }).map_err(|e| PipelineError::Internal(format!("Receipt TR: {}", e)))?;
 
         // Publish TR event
-        self.publish_receipt_event(&tr_receipt, "tr", None, Some(tr_ms), Some(world), Some(&wa_receipt.body_cid)).await;
+        self.publish_receipt_event(&tr_receipt, "tr", None, Some(tr_ms), Some(world), Some(wa_receipt.body_cid.as_str())).await;
 
         // Stage 4: WF (Write-Finished)
         let wf_start = std::time::Instant::now();
@@ -468,8 +468,8 @@ impl UblPipeline {
         receipt.append_stage(StageExecution {
             stage: PipelineStage::WriteFinished,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            input_cid: tr_receipt.body_cid.clone(),
-            output_cid: Some(wf_receipt.body_cid.clone()),
+            input_cid: tr_receipt.body_cid.as_str().to_string(),
+            output_cid: Some(wf_receipt.body_cid.as_str().to_string()),
             fuel_used: None,
             policy_trace: vec![],
             auth_token: String::new(),
@@ -479,7 +479,7 @@ impl UblPipeline {
         let total_ms = pipeline_start.elapsed().as_millis() as i64;
 
         // Publish successful WF event
-        self.publish_receipt_event(&wf_receipt, "wf", Some("allow".to_string()), Some(total_ms), Some(world), Some(&tr_receipt.body_cid)).await;
+        self.publish_receipt_event(&wf_receipt, "wf", Some("allow".to_string()), Some(total_ms), Some(world), Some(tr_receipt.body_cid.as_str())).await;
 
         // Persist chip to ChipStore (best-effort — never blocks pipeline)
         if let Some(ref store) = self.chip_store {
@@ -493,7 +493,7 @@ impl UblPipeline {
             };
             if let Err(e) = store.store_executed_chip(
                 request.body.clone(),
-                wf_receipt.body_cid.clone(),
+                wf_receipt.body_cid.as_str().to_string(),
                 metadata,
             ).await {
                 eprintln!("ChipStore persist failed (non-fatal): {}", e);
@@ -510,8 +510,8 @@ impl UblPipeline {
                 event: crate::ledger::LedgerEvent::ReceiptCreated,
                 app,
                 tenant,
-                chip_cid: wf_receipt.body_cid.clone(),
-                receipt_cid: wf_receipt.body_cid.clone(),
+                chip_cid: wf_receipt.body_cid.as_str().to_string(),
+                receipt_cid: wf_receipt.body_cid.as_str().to_string(),
                 decision: "Allow".to_string(),
                 did: Some(self.did.clone()),
                 kid: Some(self.kid.clone()),
@@ -524,7 +524,7 @@ impl UblPipeline {
         // Post-WF advisory hook (non-blocking) — classify and summarize
         if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
             let adv = engine.post_wf_advisory(
-                &wf_receipt.body_cid,
+                wf_receipt.body_cid.as_str(),
                 &request.chip_type,
                 "allow",
                 total_ms,
@@ -549,9 +549,9 @@ impl UblPipeline {
         let result = PipelineResult {
             final_receipt: wf_receipt.clone(),
             chain: vec![
-                wa_receipt.body_cid,
-                tr_receipt.body_cid,
-                wf_receipt.body_cid.clone(),
+                wa_receipt.body_cid.as_str().to_string(),
+                tr_receipt.body_cid.as_str().to_string(),
+                wf_receipt.body_cid.as_str().to_string(),
             ],
             decision: check.decision,
             receipt,
@@ -613,7 +613,7 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("WA CID: {}", e)))?;
 
         Ok(PipelineReceipt {
-            body_cid: cid,
+            body_cid: ubl_types::Cid::new_unchecked(&cid),
             receipt_type: "ubl/wa".to_string(),
             body: body_json,
         })
@@ -759,7 +759,7 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("TR CID: {}", e)))?;
 
         Ok(PipelineReceipt {
-            body_cid: cid,
+            body_cid: ubl_types::Cid::new_unchecked(&cid),
             receipt_type: "ubl/transition".to_string(),
             body: tr_body,
         })
@@ -784,8 +784,8 @@ impl UblPipeline {
 
         let wf_body = WfReceiptBody {
             decision: check.decision.clone(),
-            wa_cid: wa_receipt.body_cid.clone(),
-            tr_cid: Some(tr_receipt.body_cid.clone()),
+            wa_cid: wa_receipt.body_cid.as_str().to_string(),
+            tr_cid: Some(tr_receipt.body_cid.as_str().to_string()),
             artifacts,
             duration_ms: 50, // Overwritten by caller with real timing
             policy_trace: check.trace.clone(),
@@ -801,7 +801,7 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("WF CID: {}", e)))?;
 
         Ok(PipelineReceipt {
-            body_cid: cid,
+            body_cid: ubl_types::Cid::new_unchecked(&cid),
             receipt_type: "ubl/wf".to_string(),
             body: body_json,
         })
@@ -816,7 +816,7 @@ impl UblPipeline {
     ) -> Result<PipelineReceipt, PipelineError> {
         let wf_body = WfReceiptBody {
             decision: Decision::Deny,
-            wa_cid: wa_receipt.body_cid.clone(),
+            wa_cid: wa_receipt.body_cid.as_str().to_string(),
             tr_cid: None, // No transition executed
             artifacts: HashMap::new(),
             duration_ms: 10,
@@ -833,7 +833,7 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("WF DENY CID: {}", e)))?;
 
         Ok(PipelineReceipt {
-            body_cid: cid,
+            body_cid: ubl_types::Cid::new_unchecked(&cid),
             receipt_type: "ubl/wf".to_string(),
             body: body_json,
         })
@@ -855,7 +855,7 @@ impl UblPipeline {
     ) {
         let mut event = ReceiptEvent::new(
             &format!("ubl.receipt.{}", pipeline_stage),
-            &receipt.body_cid,
+            receipt.body_cid.as_str(),
             &receipt.receipt_type,
             pipeline_stage,
             receipt.body.clone(),
@@ -865,7 +865,7 @@ impl UblPipeline {
 
         // ── Canonical stage event fields (P1.5) ──
         event.input_cid = input_cid.map(|s| s.to_string());
-        event.output_cid = Some(receipt.body_cid.clone());
+        event.output_cid = Some(receipt.body_cid.as_str().to_string());
         event.binary_hash = Some(self.runtime_info.binary_hash.clone());
         event.build_meta = serde_json::to_value(&self.runtime_info.build).ok();
         event.world = world.map(|s| s.to_string());
@@ -1414,7 +1414,7 @@ mod tests {
         assert!(stored.is_some(), "chip must be persisted after allow");
         let stored = stored.unwrap();
         assert_eq!(stored.chip_type, "ubl/document");
-        assert_eq!(stored.receipt_cid.as_str(), result.final_receipt.body_cid);
+        assert_eq!(stored.receipt_cid.as_str(), result.final_receipt.body_cid.as_str());
     }
 
     #[tokio::test]
