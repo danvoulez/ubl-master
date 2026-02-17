@@ -58,7 +58,6 @@ pub struct ReceiptEvent {
     pub metadata: serde_json::Value,
 
     // ── Canonical stage event fields (P1.5) ──
-
     /// Input CID for this stage (chip body CID or previous stage output)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cid: Option<String>,
@@ -215,13 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_serializes_with_at_type() {
-        let event = ReceiptEvent::new(
-            "ubl.receipt.wa",
-            "b3:abc",
-            "ubl/user",
-            "wa",
-            json!({}),
-        );
+        let event = ReceiptEvent::new("ubl.receipt.wa", "b3:abc", "ubl/user", "wa", json!({}));
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["@type"], "ubl/event");
         assert_eq!(json["schema_version"], "1.0");

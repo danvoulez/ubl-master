@@ -78,16 +78,16 @@ impl TransitionRegistry {
         if let Ok(raw) = std::env::var("UBL_TR_BYTECODE_MAP_JSON") {
             let map: Value = serde_json::from_str(&raw)
                 .map_err(|e| TransitionRegistryError::InvalidConfig(e.to_string()))?;
-            let obj = map
-                .as_object()
-                .ok_or_else(|| TransitionRegistryError::InvalidConfig("bytecode map must be object".to_string()))?;
+            let obj = map.as_object().ok_or_else(|| {
+                TransitionRegistryError::InvalidConfig("bytecode map must be object".to_string())
+            })?;
             for (chip_type, hex_raw) in obj {
-                let hex_raw = hex_raw
-                    .as_str()
-                    .ok_or_else(|| TransitionRegistryError::InvalidConfig(format!(
+                let hex_raw = hex_raw.as_str().ok_or_else(|| {
+                    TransitionRegistryError::InvalidConfig(format!(
                         "bytecode for '{}' must be string",
                         chip_type
-                    )))?;
+                    ))
+                })?;
                 registry
                     .bytecode_overrides
                     .insert(chip_type.clone(), parse_hex_bytecode(hex_raw)?);
@@ -97,19 +97,22 @@ impl TransitionRegistry {
         if let Ok(raw) = std::env::var("UBL_TR_PROFILE_MAP_JSON") {
             let map: Value = serde_json::from_str(&raw)
                 .map_err(|e| TransitionRegistryError::InvalidConfig(e.to_string()))?;
-            let obj = map
-                .as_object()
-                .ok_or_else(|| TransitionRegistryError::InvalidConfig("profile map must be object".to_string()))?;
+            let obj = map.as_object().ok_or_else(|| {
+                TransitionRegistryError::InvalidConfig("profile map must be object".to_string())
+            })?;
             for (chip_type, profile_raw) in obj {
-                let profile_raw = profile_raw
-                    .as_str()
-                    .ok_or_else(|| TransitionRegistryError::InvalidConfig(format!(
+                let profile_raw = profile_raw.as_str().ok_or_else(|| {
+                    TransitionRegistryError::InvalidConfig(format!(
                         "profile for '{}' must be string",
                         chip_type
-                    )))?;
-                let profile = TrBytecodeProfile::parse(profile_raw)
-                    .ok_or_else(|| TransitionRegistryError::InvalidProfile(profile_raw.to_string()))?;
-                registry.profile_overrides.insert(chip_type.clone(), profile);
+                    ))
+                })?;
+                let profile = TrBytecodeProfile::parse(profile_raw).ok_or_else(|| {
+                    TransitionRegistryError::InvalidProfile(profile_raw.to_string())
+                })?;
+                registry
+                    .profile_overrides
+                    .insert(chip_type.clone(), profile);
             }
         }
 
@@ -119,9 +122,8 @@ impl TransitionRegistry {
     pub fn default_profile_for(chip_type: &str) -> TrBytecodeProfile {
         match chip_type {
             // Onboarding/security-sensitive flows use explicit audit profile.
-            "ubl/app" | "ubl/user" | "ubl/tenant" | "ubl/membership" | "ubl/token" | "ubl/revoke" => {
-                TrBytecodeProfile::AuditV1
-            }
+            "ubl/app" | "ubl/user" | "ubl/tenant" | "ubl/membership" | "ubl/token"
+            | "ubl/revoke" | "ubl/key.rotate" => TrBytecodeProfile::AuditV1,
             _ => TrBytecodeProfile::PassV1,
         }
     }
@@ -204,7 +206,9 @@ fn parse_hex_bytecode(raw: &str) -> Result<Vec<u8>, TransitionRegistryError> {
     hex::decode(compact).map_err(|e| TransitionRegistryError::InvalidHex(e.to_string()))
 }
 
-fn parse_chip_tr_directive(body: &Value) -> Result<Option<ChipTrDirective>, TransitionRegistryError> {
+fn parse_chip_tr_directive(
+    body: &Value,
+) -> Result<Option<ChipTrDirective>, TransitionRegistryError> {
     let Some(tr) = body.get("@tr") else {
         return Ok(None);
     };
@@ -244,6 +248,10 @@ mod tests {
             TransitionRegistry::default_profile_for("ubl/token"),
             TrBytecodeProfile::AuditV1
         );
+        assert_eq!(
+            TransitionRegistry::default_profile_for("ubl/key.rotate"),
+            TrBytecodeProfile::AuditV1
+        );
     }
 
     #[test]
@@ -255,7 +263,10 @@ mod tests {
 
         let resolved = registry.resolve("ubl/document", &body).unwrap();
         assert_eq!(resolved.source, "chip:@tr.bytecode_hex");
-        assert_eq!(resolved.bytecode, vec![0x12, 0x00, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(
+            resolved.bytecode,
+            vec![0x12, 0x00, 0x02, 0x00, 0x00, 0x10, 0x00, 0x00]
+        );
     }
 
     #[test]

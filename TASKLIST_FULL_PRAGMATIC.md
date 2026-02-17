@@ -96,30 +96,30 @@
 - ✅ `(x)` P0 canon unification: `ubl_canon` NRF-only CID/sign/verify in critical paths
 - ✅ `(x)` P0 rich URL real verify (CID + DID signature + `rt_hash`) with shadow/strict modes
 - ✅ `(x)` P0/P1 TR bytecode registry: `transition_registry` (`@tr` override + env maps + profile defaults)
-- 🟨 `( )` H6 Parse-Don’t-Validate expansion in critical runtime paths
+- ✅ `(x)` H6 Parse-Don’t-Validate expansion in critical runtime paths (typed request world + adapter parse + typed onboarding dependency checks)
 - 🟨 `( )` F4 property testing expansion (canon + numeric edge cases) — started with proptests in `ubl_canon` + `ubl_unc1`
-- ⬜ `( )` Cross-platform reproducibility CI matrix (Linux + macOS)
+- ✅ `(x)` Cross-platform reproducibility CI matrix (Linux + macOS) — `.github/workflows/repro-matrix.yml`
 
 ### Phase M3 — Indexed Data Plane (April 19 → May 23, 2026)
 
 - ✅ `(x)` N7 indexed receipt lookup path for gate endpoints
 - ✅ `(x)` Replace scan-heavy store queries with indexes (`chip_type`, `receipt_cid`, revoke target, tags, executor DID)
 - ✅ `(x)` Index rebuild tooling + corruption recovery tests (backend `rebuild_indexes` + recovery test after index loss)
-- ⬜ `( )` Load validation with large chip volume (no O(n) hot-path behavior)
+- ✅ `(x)` Load validation with large chip volume (no O(n) hot-path behavior) — `ubl_chipstore` 100k ignored load test + manual run (`~31s`)
 
 ### Phase M4 — Runtime Operations (May 24 → June 27, 2026)
 
 - ✅ `(x)` P0 durability boundary: SQLite transactional commit (`receipts + idempotency + outbox`)
 - ✅ `(x)` P0 durable idempotency: replay survives restart
 - ✅ `(x)` P0 outbox dispatcher: claim/ack/nack + retry/backoff workers
-- ⬜ `( )` F1 PS3 runtime certification implementation
+- ✅ `(x)` F1 PS3 runtime certification implementation (`RuntimeInfo` now carries `runtime_hash` + `certs`; signed `SelfAttestation` implemented in `ubl_runtime::runtime_cert`; gate endpoint `GET /v1/runtime/attestation` + OpenAPI path)
 - ✅ `(x)` F2 PS4 structured tracing and stage spans (runtime + gate moved to `tracing`; per-stage pipeline logs wired)
-- ⬜ `( )` Alerting/SLO dashboard + incident drill runbook
-- ⬜ `( )` F9 key rotation as chip (`ubl/key.rotate`)
+- ✅ `(x)` Alerting/SLO dashboard + incident drill runbook (`ops/prometheus/ubl-alerts.yml`, `ops/grafana/ubl-slo-dashboard.json`, `docs/ops/INCIDENT_RUNBOOK.md`)
+- ✅ `(x)` F9 key rotation as chip (`ubl/key.rotate` with typed validation + `key:rotate` capability, deterministic key material derivation in TR, and persisted `ubl/key.map` old→new mapping)
 
 ### Phase M5 — Production Slice (June 28 → August 15, 2026)
 
-- ⬜ `( )` H4 automate P0→P1 rollout mechanics
+- ✅ `(x)` H4 automate P0→P1 rollout mechanics (`scripts/rollout_p0_p1_check.sh` + `make rollout-check`; validates runtime hash allowlist, activation window, quorum, and break-glass mode)
 - ⬜ `( )` Launch one narrow production workflow end-to-end
 - ⬜ `( )` Hold 30-day stability window with SLO compliance
 - ⬜ `( )` Publish “Achieved” acceptance review against gates

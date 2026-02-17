@@ -66,9 +66,10 @@ impl Role {
         match s {
             "admin" => Ok(Role::Admin),
             "member" => Ok(Role::Member),
-            other => Err(AuthError::InvalidField(
-                format!("Role must be 'admin' or 'member', got '{}'", other),
-            )),
+            other => Err(AuthError::InvalidField(format!(
+                "Role must be 'admin' or 'member', got '{}'",
+                other
+            ))),
         }
     }
 
@@ -96,38 +97,49 @@ pub struct AppRegistration {
 
 impl AppRegistration {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let slug = body.get("slug")
+        let slug = body
+            .get("slug")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("slug".into()))?
             .to_string();
 
         if slug.is_empty() || slug.contains('/') || slug.contains(' ') {
-            return Err(AuthError::InvalidField(
-                format!("slug must be non-empty, no spaces or slashes: '{}'", slug),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "slug must be non-empty, no spaces or slashes: '{}'",
+                slug
+            )));
         }
 
-        let display_name = body.get("display_name")
+        let display_name = body
+            .get("display_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("display_name".into()))?
             .to_string();
 
         if display_name.is_empty() {
-            return Err(AuthError::InvalidField("display_name cannot be empty".into()));
+            return Err(AuthError::InvalidField(
+                "display_name cannot be empty".into(),
+            ));
         }
 
-        let owner_did = body.get("owner_did")
+        let owner_did = body
+            .get("owner_did")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("owner_did".into()))?
             .to_string();
 
         if !owner_did.starts_with("did:") {
-            return Err(AuthError::InvalidField(
-                format!("owner_did must start with 'did:': '{}'", owner_did),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "owner_did must start with 'did:': '{}'",
+                owner_did
+            )));
         }
 
-        Ok(Self { slug, display_name, owner_did })
+        Ok(Self {
+            slug,
+            display_name,
+            owner_did,
+        })
     }
 
     pub fn to_chip_body(&self, id: &str) -> Value {
@@ -162,24 +174,29 @@ pub struct UserIdentity {
 
 impl UserIdentity {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let did = body.get("did")
+        let did = body
+            .get("did")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("did".into()))?
             .to_string();
 
         if !did.starts_with("did:") {
-            return Err(AuthError::InvalidField(
-                format!("DID must start with 'did:': '{}'", did),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "DID must start with 'did:': '{}'",
+                did
+            )));
         }
 
-        let display_name = body.get("display_name")
+        let display_name = body
+            .get("display_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("display_name".into()))?
             .to_string();
 
         if display_name.is_empty() {
-            return Err(AuthError::InvalidField("display_name cannot be empty".into()));
+            return Err(AuthError::InvalidField(
+                "display_name cannot be empty".into(),
+            ));
         }
 
         Ok(Self { did, display_name })
@@ -213,38 +230,49 @@ pub struct TenantCircle {
 
 impl TenantCircle {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let slug = body.get("slug")
+        let slug = body
+            .get("slug")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("slug".into()))?
             .to_string();
 
         if slug.is_empty() || slug.contains('/') || slug.contains(' ') {
-            return Err(AuthError::InvalidField(
-                format!("slug must be non-empty, no spaces or slashes: '{}'", slug),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "slug must be non-empty, no spaces or slashes: '{}'",
+                slug
+            )));
         }
 
-        let display_name = body.get("display_name")
+        let display_name = body
+            .get("display_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("display_name".into()))?
             .to_string();
 
         if display_name.is_empty() {
-            return Err(AuthError::InvalidField("display_name cannot be empty".into()));
+            return Err(AuthError::InvalidField(
+                "display_name cannot be empty".into(),
+            ));
         }
 
-        let creator_cid = body.get("creator_cid")
+        let creator_cid = body
+            .get("creator_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("creator_cid".into()))?
             .to_string();
 
         if !creator_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("creator_cid must start with 'b3:': '{}'", creator_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "creator_cid must start with 'b3:': '{}'",
+                creator_cid
+            )));
         }
 
-        Ok(Self { slug, display_name, creator_cid })
+        Ok(Self {
+            slug,
+            display_name,
+            creator_cid,
+        })
     }
 
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
@@ -275,35 +303,44 @@ pub struct Membership {
 
 impl Membership {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let user_cid = body.get("user_cid")
+        let user_cid = body
+            .get("user_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("user_cid".into()))?
             .to_string();
 
         if !user_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("user_cid must start with 'b3:': '{}'", user_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "user_cid must start with 'b3:': '{}'",
+                user_cid
+            )));
         }
 
-        let tenant_cid = body.get("tenant_cid")
+        let tenant_cid = body
+            .get("tenant_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("tenant_cid".into()))?
             .to_string();
 
         if !tenant_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("tenant_cid must start with 'b3:': '{}'", tenant_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "tenant_cid must start with 'b3:': '{}'",
+                tenant_cid
+            )));
         }
 
-        let role_str = body.get("role")
+        let role_str = body
+            .get("role")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("role".into()))?;
 
         let role = Role::from_str(role_str)?;
 
-        Ok(Self { user_cid, tenant_cid, role })
+        Ok(Self {
+            user_cid,
+            tenant_cid,
+            role,
+        })
     }
 
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
@@ -337,33 +374,47 @@ pub struct SessionToken {
 
 impl SessionToken {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let user_cid = body.get("user_cid")
+        let user_cid = body
+            .get("user_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("user_cid".into()))?
             .to_string();
 
         if !user_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("user_cid must start with 'b3:': '{}'", user_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "user_cid must start with 'b3:': '{}'",
+                user_cid
+            )));
         }
 
-        let scope = body.get("scope")
+        let scope = body
+            .get("scope")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| vec!["read".to_string()]);
 
-        let expires_at = body.get("expires_at")
+        let expires_at = body
+            .get("expires_at")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("expires_at".into()))?
             .to_string();
 
-        let kid = body.get("kid")
+        let kid = body
+            .get("kid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("kid".into()))?
             .to_string();
 
-        Ok(Self { user_cid, scope, expires_at, kid })
+        Ok(Self {
+            user_cid,
+            scope,
+            expires_at,
+            kid,
+        })
     }
 
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
@@ -404,18 +455,21 @@ pub struct Revocation {
 
 impl Revocation {
     pub fn from_chip_body(body: &Value) -> Result<Self, AuthError> {
-        let target_cid = body.get("target_cid")
+        let target_cid = body
+            .get("target_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("target_cid".into()))?
             .to_string();
 
         if !target_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("target_cid must start with 'b3:': '{}'", target_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "target_cid must start with 'b3:': '{}'",
+                target_cid
+            )));
         }
 
-        let reason = body.get("reason")
+        let reason = body
+            .get("reason")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("reason".into()))?
             .to_string();
@@ -424,18 +478,24 @@ impl Revocation {
             return Err(AuthError::InvalidField("reason cannot be empty".into()));
         }
 
-        let actor_cid = body.get("actor_cid")
+        let actor_cid = body
+            .get("actor_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("actor_cid".into()))?
             .to_string();
 
         if !actor_cid.starts_with("b3:") {
-            return Err(AuthError::InvalidField(
-                format!("actor_cid must start with 'b3:': '{}'", actor_cid),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "actor_cid must start with 'b3:': '{}'",
+                actor_cid
+            )));
         }
 
-        Ok(Self { target_cid, reason, actor_cid })
+        Ok(Self {
+            target_cid,
+            reason,
+            actor_cid,
+        })
     }
 
     pub fn to_chip_body(&self, id: &str, world: &str) -> Value {
@@ -466,9 +526,10 @@ impl WorldScope {
         let parts: Vec<&str> = world.split('/').collect();
 
         if parts.len() < 2 || parts[0] != "a" {
-            return Err(AuthError::InvalidField(
-                format!("@world must start with 'a/{{app}}': '{}'", world),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "@world must start with 'a/{{app}}': '{}'",
+                world
+            )));
         }
 
         let app = parts[1].to_string();
@@ -479,15 +540,18 @@ impl WorldScope {
         let tenant = if parts.len() >= 4 && parts[2] == "t" {
             let t = parts[3].to_string();
             if t.is_empty() {
-                return Err(AuthError::InvalidField("tenant slug cannot be empty".into()));
+                return Err(AuthError::InvalidField(
+                    "tenant slug cannot be empty".into(),
+                ));
             }
             Some(t)
         } else if parts.len() == 2 {
             None
         } else {
-            return Err(AuthError::InvalidField(
-                format!("@world format must be 'a/{{app}}' or 'a/{{app}}/t/{{tenant}}': '{}'", world),
-            ));
+            return Err(AuthError::InvalidField(format!(
+                "@world format must be 'a/{{app}}' or 'a/{{app}}/t/{{tenant}}': '{}'",
+                world
+            )));
         };
 
         Ok(Self { app, tenant })
@@ -521,7 +585,10 @@ impl PermissionContext {
     pub fn to_eval_context(&self) -> std::collections::HashMap<String, String> {
         let mut ctx = std::collections::HashMap::new();
         ctx.insert("actor.did".to_string(), self.actor_did.clone());
-        ctx.insert("actor.role".to_string(), self.actor_role.as_str().to_string());
+        ctx.insert(
+            "actor.role".to_string(),
+            self.actor_role.as_str().to_string(),
+        );
         ctx.insert("token.scopes".to_string(), self.token_scopes.join(","));
         ctx.insert("chip.@type".to_string(), self.chip_type.clone());
         ctx.insert("chip.@world".to_string(), self.world.clone());
@@ -535,13 +602,13 @@ impl PermissionContext {
         }
 
         // Members can read and write, but not admin-level operations
-        let needs_admin = self.chip_type == "ubl/revoke"
-            || self.chip_type == "ubl/membership";
+        let needs_admin = self.chip_type == "ubl/revoke" || self.chip_type == "ubl/membership";
 
         if needs_admin {
-            return Err(AuthError::Unauthorized(
-                format!("'{}' requires admin role", self.chip_type),
-            ));
+            return Err(AuthError::Unauthorized(format!(
+                "'{}' requires admin role",
+                self.chip_type
+            )));
         }
 
         Ok(())
@@ -565,22 +632,42 @@ pub fn is_onboarding_type(chip_type: &str) -> bool {
     ONBOARDING_TYPES.contains(&chip_type)
 }
 
-/// Validate an onboarding chip body based on its @type.
-pub fn validate_onboarding_chip(body: &Value) -> Result<(), AuthError> {
-    let chip_type = body.get("@type")
+/// Strongly-typed onboarding chip payloads.
+#[derive(Debug, Clone)]
+pub enum OnboardingChip {
+    App(AppRegistration),
+    User(UserIdentity),
+    Tenant(TenantCircle),
+    Membership(Membership),
+    Token(SessionToken),
+    Revoke(Revocation),
+}
+
+/// Parse onboarding chip payload into a typed structure.
+pub fn parse_onboarding_chip(body: &Value) -> Result<Option<OnboardingChip>, AuthError> {
+    let chip_type = body
+        .get("@type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AuthError::MissingField("@type".into()))?;
 
-    match chip_type {
-        "ubl/app" => { AppRegistration::from_chip_body(body)?; }
-        "ubl/user" => { UserIdentity::from_chip_body(body)?; }
-        "ubl/tenant" => { TenantCircle::from_chip_body(body)?; }
-        "ubl/membership" => { Membership::from_chip_body(body)?; }
-        "ubl/token" => { SessionToken::from_chip_body(body)?; }
-        "ubl/revoke" => { Revocation::from_chip_body(body)?; }
-        _ => {} // not an onboarding type, skip
-    }
+    let parsed = match chip_type {
+        "ubl/app" => Some(OnboardingChip::App(AppRegistration::from_chip_body(body)?)),
+        "ubl/user" => Some(OnboardingChip::User(UserIdentity::from_chip_body(body)?)),
+        "ubl/tenant" => Some(OnboardingChip::Tenant(TenantCircle::from_chip_body(body)?)),
+        "ubl/membership" => Some(OnboardingChip::Membership(Membership::from_chip_body(
+            body,
+        )?)),
+        "ubl/token" => Some(OnboardingChip::Token(SessionToken::from_chip_body(body)?)),
+        "ubl/revoke" => Some(OnboardingChip::Revoke(Revocation::from_chip_body(body)?)),
+        _ => None,
+    };
 
+    Ok(parsed)
+}
+
+/// Validate an onboarding chip body based on its @type.
+pub fn validate_onboarding_chip(body: &Value) -> Result<(), AuthError> {
+    let _ = parse_onboarding_chip(body)?;
     Ok(())
 }
 
@@ -939,6 +1026,28 @@ mod tests {
             "display_name": "Alice",
         });
         assert!(validate_onboarding_chip(&body).is_err());
+    }
+
+    #[test]
+    fn parse_onboarding_chip_returns_typed_variant() {
+        let body = json!({
+            "@type": "ubl/membership",
+            "user_cid": "b3:user",
+            "tenant_cid": "b3:tenant",
+            "role": "admin",
+        });
+        let parsed = parse_onboarding_chip(&body).unwrap();
+        assert!(matches!(parsed, Some(OnboardingChip::Membership(_))));
+    }
+
+    #[test]
+    fn parse_onboarding_chip_returns_none_for_non_onboarding_type() {
+        let body = json!({
+            "@type": "ubl/advisory",
+            "hook": "post-wf",
+        });
+        let parsed = parse_onboarding_chip(&body).unwrap();
+        assert!(parsed.is_none());
     }
 
     #[test]

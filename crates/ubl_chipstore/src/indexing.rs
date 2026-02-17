@@ -78,7 +78,10 @@ impl ChipIndexer {
     }
 
     /// Get CIDs for chips executed by a specific executor
-    pub async fn get_cids_by_executor(&self, executor_did: &str) -> Result<Vec<TypedCid>, ChipStoreError> {
+    pub async fn get_cids_by_executor(
+        &self,
+        executor_did: &str,
+    ) -> Result<Vec<TypedCid>, ChipStoreError> {
         let executor_index = self.executor_index.read().await;
         Ok(executor_index
             .get(executor_did)

@@ -405,14 +405,30 @@ impl fmt::Display for TypeParseError {
             Self::InvalidPrefix { expected, got } => {
                 write!(f, "expected prefix '{}', got '{}'", expected, got)
             }
-            Self::InvalidFormat { kind, expected, got } => {
-                write!(f, "invalid {}: expected '{}', got '{}'", kind, expected, got)
+            Self::InvalidFormat {
+                kind,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "invalid {}: expected '{}', got '{}'",
+                    kind, expected, got
+                )
             }
             Self::InvalidChars { kind, got } => {
                 write!(f, "invalid characters in {}: '{}'", kind, got)
             }
-            Self::InvalidLength { kind, expected, got } => {
-                write!(f, "invalid {} length: expected {}, got {}", kind, expected, got)
+            Self::InvalidLength {
+                kind,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "invalid {} length: expected {}, got {}",
+                    kind, expected, got
+                )
             }
             Self::Empty(kind) => {
                 write!(f, "{} cannot be empty", kind)

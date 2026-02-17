@@ -1,0 +1,82 @@
+groups:
+  - name: ubl-gate-slo
+    interval: 30s
+    rules:
+      - alert: UblGateDown
+        expr: up{job="ubl-gate"} == 0
+        for: 2m
+        labels:
+          severity: page
+          service: ubl-gate
+        annotations:
+          summary: "UBL Gate is down"
+          description: "No healthy targets for job=ubl-gate for 2 minutes."
+
+      - alert: UblPipelineP99LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(ubl_pipeline_seconds_bucket[10m])) by (le)
+          ) > 1.0
+        for: 15m
+        labels:
+          severity: page
+          service: ubl-gate
+        annotations:
+          summary: "UBL pipeline p99 latency above 1s"
+          description: "p99 over 10m is above 1.0s for 15m."
+
+      - alert: UblPipelineErrorRateHigh
+        expr: |
+          (
+            sum(rate(ubl_errors_total[5m]))
+            /
+            clamp_min(sum(rate(ubl_chips_total[5m])), 1)
+          ) > 0.02
+        for: 10m
+        labels:
+          severity: page
+          service: ubl-gate
+        annotations:
+          summary: "UBL error rate above 2%"
+          description: "Pipeline error ratio >2% for 10m."
+
+      - alert: UblOutboxBacklogGrowing
+        expr: ubl_outbox_pending > 500
+        for: 10m
+        labels:
+          severity: ticket
+          service: ubl-gate
+        annotations:
+          summary: "UBL outbox backlog high"
+          description: "Pending outbox events > 500 for 10m."
+
+      - alert: UblOutboxRetrySpike
+        expr: increase(ubl_outbox_retry_total[15m]) > 100
+        for: 5m
+        labels:
+          severity: ticket
+          service: ubl-gate
+        annotations:
+          summary: "UBL outbox retries spiking"
+          description: "Outbox retries increased by >100 in 15m."
+
+      - alert: UblCryptoVerifyFailures
+        expr: increase(ubl_crypto_verify_fail_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: ticket
+          service: ubl-gate
+        annotations:
+          summary: "UBL crypto verification failures detected"
+          description: "One or more cryptographic verification failures occurred in 10m."
+
+      - alert: UblCanonDivergenceDetected
+        expr: increase(ubl_canon_divergence_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+          service: ubl-gate
+        annotations:
+          summary: "UBL canon divergence detected"
+          description: "Canonicalization divergence counter increased in the last 10m."

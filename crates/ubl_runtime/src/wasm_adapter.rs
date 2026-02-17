@@ -98,14 +98,19 @@ impl std::fmt::Display for WasmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WasmError::CompileError(e) => write!(f, "WASM compile error: {}", e),
-            WasmError::FuelExhausted { limit, consumed } =>
-                write!(f, "WASM fuel exhausted: limit={}, consumed={}", limit, consumed),
-            WasmError::MemoryExceeded { limit } =>
-                write!(f, "WASM memory exceeded: limit={} bytes", limit),
+            WasmError::FuelExhausted { limit, consumed } => write!(
+                f,
+                "WASM fuel exhausted: limit={}, consumed={}",
+                limit, consumed
+            ),
+            WasmError::MemoryExceeded { limit } => {
+                write!(f, "WASM memory exceeded: limit={} bytes", limit)
+            }
             WasmError::InvalidOutput(e) => write!(f, "WASM invalid output: {}", e),
             WasmError::ModuleNotFound(cid) => write!(f, "WASM module not found: {}", cid),
-            WasmError::AbiMismatch { expected, got } =>
-                write!(f, "WASM ABI mismatch: expected {}, got {}", expected, got),
+            WasmError::AbiMismatch { expected, got } => {
+                write!(f, "WASM ABI mismatch: expected {}, got {}", expected, got)
+            }
             WasmError::Runtime(e) => write!(f, "WASM runtime error: {}", e),
         }
     }
@@ -147,17 +152,20 @@ pub struct AdapterRegistration {
 impl AdapterRegistration {
     /// Parse an adapter registration from a `ubl/adapter` chip body.
     pub fn from_chip_body(body: &Value) -> Result<Self, WasmError> {
-        let wasm_cid = body.get("wasm_cid")
+        let wasm_cid = body
+            .get("wasm_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| WasmError::Runtime("Missing wasm_cid".into()))?
             .to_string();
 
-        let wasm_sha256 = body.get("wasm_sha256")
+        let wasm_sha256 = body
+            .get("wasm_sha256")
             .and_then(|v| v.as_str())
             .ok_or_else(|| WasmError::Runtime("Missing wasm_sha256".into()))?
             .to_string();
 
-        let abi_version = body.get("abi_version")
+        let abi_version = body
+            .get("abi_version")
             .and_then(|v| v.as_str())
             .unwrap_or("1.0")
             .to_string();
@@ -169,21 +177,35 @@ impl AdapterRegistration {
             });
         }
 
-        let fuel_budget = body.get("fuel_budget")
+        let fuel_budget = body
+            .get("fuel_budget")
             .and_then(|v| v.as_u64())
             .unwrap_or(WASM_DEFAULT_FUEL);
 
-        let capabilities = body.get("capabilities")
+        let capabilities = body
+            .get("capabilities")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let description = body.get("description")
+        let description = body
+            .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        Ok(Self { wasm_cid, wasm_sha256, abi_version, fuel_budget, capabilities, description })
+        Ok(Self {
+            wasm_cid,
+            wasm_sha256,
+            abi_version,
+            fuel_budget,
+            capabilities,
+            description,
+        })
     }
 
     /// Produce the canonical chip body for this adapter registration.
@@ -246,7 +268,9 @@ pub struct AdapterRegistry {
 
 impl AdapterRegistry {
     pub fn new() -> Self {
-        Self { adapters: std::collections::HashMap::new() }
+        Self {
+            adapters: std::collections::HashMap::new(),
+        }
     }
 
     /// Register an adapter for a set of capabilities.

@@ -83,7 +83,10 @@ impl Num {
                         return Err("unit_mismatch".into());
                     }
                 }
-                Ok(Num::Int { v, u: Some(unit.to_string()) })
+                Ok(Num::Int {
+                    v,
+                    u: Some(unit.to_string()),
+                })
             }
             Num::Dec { m, s, u } => {
                 if let Some(ref old) = u {
@@ -91,7 +94,11 @@ impl Num {
                         return Err("unit_mismatch".into());
                     }
                 }
-                Ok(Num::Dec { m, s, u: Some(unit.to_string()) })
+                Ok(Num::Dec {
+                    m,
+                    s,
+                    u: Some(unit.to_string()),
+                })
             }
             Num::Rat { p, q, u } => {
                 if let Some(ref old) = u {
@@ -99,7 +106,11 @@ impl Num {
                         return Err("unit_mismatch".into());
                     }
                 }
-                Ok(Num::Rat { p, q, u: Some(unit.to_string()) })
+                Ok(Num::Rat {
+                    p,
+                    q,
+                    u: Some(unit.to_string()),
+                })
             }
             Num::Bnd { lo, hi, u } => {
                 if let Some(ref old) = u {
@@ -107,7 +118,11 @@ impl Num {
                         return Err("unit_mismatch".into());
                     }
                 }
-                Ok(Num::Bnd { lo, hi, u: Some(unit.to_string()) })
+                Ok(Num::Bnd {
+                    lo,
+                    hi,
+                    u: Some(unit.to_string()),
+                })
             }
         }
     }
@@ -125,9 +140,20 @@ impl Num {
 
     fn strip_unit(&self) -> Self {
         match self {
-            Num::Int { v, .. } => Num::Int { v: v.clone(), u: None },
-            Num::Dec { m, s, .. } => Num::Dec { m: m.clone(), s: *s, u: None },
-            Num::Rat { p, q, .. } => Num::Rat { p: p.clone(), q: q.clone(), u: None },
+            Num::Int { v, .. } => Num::Int {
+                v: v.clone(),
+                u: None,
+            },
+            Num::Dec { m, s, .. } => Num::Dec {
+                m: m.clone(),
+                s: *s,
+                u: None,
+            },
+            Num::Rat { p, q, .. } => Num::Rat {
+                p: p.clone(),
+                q: q.clone(),
+                u: None,
+            },
             Num::Bnd { lo, hi, .. } => Num::Bnd {
                 lo: Box::new(lo.strip_unit()),
                 hi: Box::new(hi.strip_unit()),
@@ -161,7 +187,8 @@ impl Num {
 // ---------------------------------------------------------------------------
 
 fn parse_bigint(s: &str) -> Result<BigInt, String> {
-    s.parse::<BigInt>().map_err(|e| format!("invalid bigint '{}': {}", s, e))
+    s.parse::<BigInt>()
+        .map_err(|e| format!("invalid bigint '{}': {}", s, e))
 }
 
 fn to_rational(n: &Num) -> Result<BigRational, String> {
@@ -189,7 +216,10 @@ fn to_rational(n: &Num) -> Result<BigRational, String> {
 
 fn rational_to_int(r: &BigRational) -> Option<Num> {
     if r.is_integer() {
-        Some(Num::Int { v: r.numer().to_string(), u: None })
+        Some(Num::Int {
+            v: r.numer().to_string(),
+            u: None,
+        })
     } else {
         None
     }
@@ -238,15 +268,15 @@ fn round_rational_to_dec(r: &BigRational, scale: u32, rm: RoundingMode) -> Num {
             // Toward +∞
             ceil_div(scaled.numer(), scaled.denom())
         }
-        RoundingMode::HalfUp => {
-            half_up(scaled.numer(), scaled.denom())
-        }
-        RoundingMode::HalfEven => {
-            half_even(scaled.numer(), scaled.denom())
-        }
+        RoundingMode::HalfUp => half_up(scaled.numer(), scaled.denom()),
+        RoundingMode::HalfEven => half_even(scaled.numer(), scaled.denom()),
     };
 
-    Num::Dec { m: m.to_string(), s: scale, u: None }
+    Num::Dec {
+        m: m.to_string(),
+        s: scale,
+        u: None,
+    }
 }
 
 fn floor_div(n: &BigInt, d: &BigInt) -> BigInt {
@@ -273,8 +303,16 @@ fn half_up(n: &BigInt, d: &BigInt) -> BigInt {
     let abs_n = n.abs();
     let (q, r) = abs_n.div_rem(&abs_d);
     let doubled_r = &r * BigInt::from(2);
-    let result = if doubled_r >= abs_d { q + BigInt::one() } else { q };
-    if n.is_negative() { -result } else { result }
+    let result = if doubled_r >= abs_d {
+        q + BigInt::one()
+    } else {
+        q
+    };
+    if n.is_negative() {
+        -result
+    } else {
+        result
+    }
 }
 
 fn half_even(n: &BigInt, d: &BigInt) -> BigInt {
@@ -287,11 +325,19 @@ fn half_even(n: &BigInt, d: &BigInt) -> BigInt {
         q.clone() + BigInt::one()
     } else if doubled_r == abs_d {
         // Tie: round to even
-        if &q % BigInt::from(2) == BigInt::zero() { q.clone() } else { q.clone() + BigInt::one() }
+        if &q % BigInt::from(2) == BigInt::zero() {
+            q.clone()
+        } else {
+            q.clone() + BigInt::one()
+        }
     } else {
         q.clone()
     };
-    if n.is_negative() { -result } else { result }
+    if n.is_negative() {
+        -result
+    } else {
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,8 +407,16 @@ pub fn from_f64_bits(bits: u64) -> Result<Num, String> {
     if f == 0.0 {
         // ±0 → exact zero interval
         return Ok(Num::Bnd {
-            lo: Box::new(Num::Dec { m: "0".into(), s: 1, u: None }),
-            hi: Box::new(Num::Dec { m: "0".into(), s: 1, u: None }),
+            lo: Box::new(Num::Dec {
+                m: "0".into(),
+                s: 1,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "0".into(),
+                s: 1,
+                u: None,
+            }),
             u: None,
         });
     }
@@ -628,10 +682,16 @@ pub fn compare(a: &Num, b: &Num) -> Result<Num, String> {
         let (b_lo, b_hi) = bnd_bounds(b)?;
         // If intervals don't overlap, we can compare
         if a_hi < b_lo {
-            return Ok(Num::Int { v: "-1".into(), u: None });
+            return Ok(Num::Int {
+                v: "-1".into(),
+                u: None,
+            });
         }
         if a_lo > b_hi {
-            return Ok(Num::Int { v: "1".into(), u: None });
+            return Ok(Num::Int {
+                v: "1".into(),
+                u: None,
+            });
         }
         // Overlapping intervals → compare midpoints
         let two = BigRational::from_integer(BigInt::from(2));
@@ -643,7 +703,10 @@ pub fn compare(a: &Num, b: &Num) -> Result<Num, String> {
             std::cmp::Ordering::Equal => "0",
             std::cmp::Ordering::Greater => "1",
         };
-        return Ok(Num::Int { v: v.into(), u: None });
+        return Ok(Num::Int {
+            v: v.into(),
+            u: None,
+        });
     }
 
     let ra = promote_to_rat(&a.strip_unit())?;
@@ -653,7 +716,10 @@ pub fn compare(a: &Num, b: &Num) -> Result<Num, String> {
         std::cmp::Ordering::Equal => "0",
         std::cmp::Ordering::Greater => "1",
     };
-    Ok(Num::Int { v: v.into(), u: None })
+    Ok(Num::Int {
+        v: v.into(),
+        u: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -670,19 +736,40 @@ mod tests {
     #[test]
     fn parse_decimal_integer() {
         let n = from_decimal_str("42").unwrap();
-        assert_eq!(n, Num::Dec { m: "42".into(), s: 0, u: None });
+        assert_eq!(
+            n,
+            Num::Dec {
+                m: "42".into(),
+                s: 0,
+                u: None
+            }
+        );
     }
 
     #[test]
     fn parse_decimal_fractional() {
         let n = from_decimal_str("12.345").unwrap();
-        assert_eq!(n, Num::Dec { m: "12345".into(), s: 3, u: None });
+        assert_eq!(
+            n,
+            Num::Dec {
+                m: "12345".into(),
+                s: 3,
+                u: None
+            }
+        );
     }
 
     #[test]
     fn parse_decimal_negative() {
         let n = from_decimal_str("-0.5").unwrap();
-        assert_eq!(n, Num::Dec { m: "-05".into(), s: 1, u: None });
+        assert_eq!(
+            n,
+            Num::Dec {
+                m: "-05".into(),
+                s: 1,
+                u: None
+            }
+        );
     }
 
     #[test]
@@ -695,37 +782,91 @@ mod tests {
 
     #[test]
     fn add_int_int() {
-        let a = Num::Int { v: "10".into(), u: None };
-        let b = Num::Int { v: "32".into(), u: None };
+        let a = Num::Int {
+            v: "10".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "32".into(),
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Int { v: "42".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Int {
+                v: "42".into(),
+                u: None
+            }
+        );
     }
 
     #[test]
     fn add_int_negative() {
-        let a = Num::Int { v: "5".into(), u: None };
-        let b = Num::Int { v: "-3".into(), u: None };
+        let a = Num::Int {
+            v: "5".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "-3".into(),
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Int { v: "2".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Int {
+                v: "2".into(),
+                u: None
+            }
+        );
     }
 
     // --- add: DEC + DEC (KAT: 0.1 + 0.2 = 0.3) ---
 
     #[test]
     fn add_dec_dec_kat() {
-        let a = Num::Dec { m: "1".into(), s: 1, u: None };
-        let b = Num::Dec { m: "2".into(), s: 1, u: None };
+        let a = Num::Dec {
+            m: "1".into(),
+            s: 1,
+            u: None,
+        };
+        let b = Num::Dec {
+            m: "2".into(),
+            s: 1,
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Dec { m: "3".into(), s: 1, u: None });
+        assert_eq!(
+            r,
+            Num::Dec {
+                m: "3".into(),
+                s: 1,
+                u: None
+            }
+        );
     }
 
     #[test]
     fn add_dec_different_scales() {
         // 1.5 + 0.25 = 1.75
-        let a = Num::Dec { m: "15".into(), s: 1, u: None };
-        let b = Num::Dec { m: "25".into(), s: 2, u: None };
+        let a = Num::Dec {
+            m: "15".into(),
+            s: 1,
+            u: None,
+        };
+        let b = Num::Dec {
+            m: "25".into(),
+            s: 2,
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Dec { m: "175".into(), s: 2, u: None });
+        assert_eq!(
+            r,
+            Num::Dec {
+                m: "175".into(),
+                s: 2,
+                u: None
+            }
+        );
     }
 
     // --- add: RAT + RAT ---
@@ -733,10 +874,25 @@ mod tests {
     #[test]
     fn add_rat_rat() {
         // 1/3 + 1/6 = 1/2
-        let a = Num::Rat { p: "1".into(), q: "3".into(), u: None };
-        let b = Num::Rat { p: "1".into(), q: "6".into(), u: None };
+        let a = Num::Rat {
+            p: "1".into(),
+            q: "3".into(),
+            u: None,
+        };
+        let b = Num::Rat {
+            p: "1".into(),
+            q: "6".into(),
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Rat { p: "1".into(), q: "2".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Rat {
+                p: "1".into(),
+                q: "2".into(),
+                u: None
+            }
+        );
     }
 
     // --- mixed promotion: DEC + INT → DEC ---
@@ -744,10 +900,24 @@ mod tests {
     #[test]
     fn add_mixed_dec_int() {
         // 2.5 + 2 = 4.5
-        let a = Num::Dec { m: "25".into(), s: 1, u: None };
-        let b = Num::Int { v: "2".into(), u: None };
+        let a = Num::Dec {
+            m: "25".into(),
+            s: 1,
+            u: None,
+        };
+        let b = Num::Int {
+            v: "2".into(),
+            u: None,
+        };
         let r = add(&a, &b).unwrap();
-        assert_eq!(r, Num::Dec { m: "45".into(), s: 1, u: None });
+        assert_eq!(
+            r,
+            Num::Dec {
+                m: "45".into(),
+                s: 1,
+                u: None
+            }
+        );
     }
 
     // --- mixed promotion: DEC * INT → DEC (KAT) ---
@@ -755,20 +925,46 @@ mod tests {
     #[test]
     fn mul_dec_int_kat() {
         // 2.5 * 2 = 5.0
-        let a = Num::Dec { m: "25".into(), s: 1, u: None };
-        let b = Num::Int { v: "2".into(), u: None };
+        let a = Num::Dec {
+            m: "25".into(),
+            s: 1,
+            u: None,
+        };
+        let b = Num::Int {
+            v: "2".into(),
+            u: None,
+        };
         let r = mul(&a, &b).unwrap();
-        assert_eq!(r, Num::Dec { m: "50".into(), s: 1, u: None });
+        assert_eq!(
+            r,
+            Num::Dec {
+                m: "50".into(),
+                s: 1,
+                u: None
+            }
+        );
     }
 
     // --- sub ---
 
     #[test]
     fn sub_int_int() {
-        let a = Num::Int { v: "10".into(), u: None };
-        let b = Num::Int { v: "3".into(), u: None };
+        let a = Num::Int {
+            v: "10".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "3".into(),
+            u: None,
+        };
         let r = sub(&a, &b).unwrap();
-        assert_eq!(r, Num::Int { v: "7".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Int {
+                v: "7".into(),
+                u: None
+            }
+        );
     }
 
     // --- div ---
@@ -776,25 +972,56 @@ mod tests {
     #[test]
     fn div_int_int_exact() {
         // 10 / 5 = 2
-        let a = Num::Int { v: "10".into(), u: None };
-        let b = Num::Int { v: "5".into(), u: None };
+        let a = Num::Int {
+            v: "10".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "5".into(),
+            u: None,
+        };
         let r = div(&a, &b).unwrap();
-        assert_eq!(r, Num::Int { v: "2".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Int {
+                v: "2".into(),
+                u: None
+            }
+        );
     }
 
     #[test]
     fn div_int_int_inexact() {
         // 1 / 3 → RAT 1/3
-        let a = Num::Int { v: "1".into(), u: None };
-        let b = Num::Int { v: "3".into(), u: None };
+        let a = Num::Int {
+            v: "1".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "3".into(),
+            u: None,
+        };
         let r = div(&a, &b).unwrap();
-        assert_eq!(r, Num::Rat { p: "1".into(), q: "3".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Rat {
+                p: "1".into(),
+                q: "3".into(),
+                u: None
+            }
+        );
     }
 
     #[test]
     fn div_by_zero() {
-        let a = Num::Int { v: "1".into(), u: None };
-        let b = Num::Int { v: "0".into(), u: None };
+        let a = Num::Int {
+            v: "1".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "0".into(),
+            u: None,
+        };
         assert!(div(&a, &b).is_err());
     }
 
@@ -802,28 +1029,72 @@ mod tests {
 
     #[test]
     fn to_dec_rat_down_kat() {
-        let r = Num::Rat { p: "1".into(), q: "3".into(), u: None };
+        let r = Num::Rat {
+            p: "1".into(),
+            q: "3".into(),
+            u: None,
+        };
         let d = to_dec(&r, 2, RoundingMode::Down).unwrap();
-        assert_eq!(d, Num::Dec { m: "33".into(), s: 2, u: None });
+        assert_eq!(
+            d,
+            Num::Dec {
+                m: "33".into(),
+                s: 2,
+                u: None
+            }
+        );
     }
 
     #[test]
     fn to_dec_rat_up_kat() {
-        let r = Num::Rat { p: "1".into(), q: "3".into(), u: None };
+        let r = Num::Rat {
+            p: "1".into(),
+            q: "3".into(),
+            u: None,
+        };
         let d = to_dec(&r, 2, RoundingMode::Up).unwrap();
-        assert_eq!(d, Num::Dec { m: "34".into(), s: 2, u: None });
+        assert_eq!(
+            d,
+            Num::Dec {
+                m: "34".into(),
+                s: 2,
+                u: None
+            }
+        );
     }
 
     #[test]
     fn to_dec_half_even() {
         // 0.5 → 0 (round to even), 1.5 → 2 (round to even)
-        let half = Num::Rat { p: "1".into(), q: "2".into(), u: None };
+        let half = Num::Rat {
+            p: "1".into(),
+            q: "2".into(),
+            u: None,
+        };
         let d = to_dec(&half, 0, RoundingMode::HalfEven).unwrap();
-        assert_eq!(d, Num::Dec { m: "0".into(), s: 0, u: None });
+        assert_eq!(
+            d,
+            Num::Dec {
+                m: "0".into(),
+                s: 0,
+                u: None
+            }
+        );
 
-        let one_half = Num::Rat { p: "3".into(), q: "2".into(), u: None };
+        let one_half = Num::Rat {
+            p: "3".into(),
+            q: "2".into(),
+            u: None,
+        };
         let d2 = to_dec(&one_half, 0, RoundingMode::HalfEven).unwrap();
-        assert_eq!(d2, Num::Dec { m: "2".into(), s: 0, u: None });
+        assert_eq!(
+            d2,
+            Num::Dec {
+                m: "2".into(),
+                s: 0,
+                u: None
+            }
+        );
     }
 
     // --- to_rat ---
@@ -831,17 +1102,39 @@ mod tests {
     #[test]
     fn to_rat_from_dec() {
         // 0.5 → 1/2
-        let d = Num::Dec { m: "5".into(), s: 1, u: None };
+        let d = Num::Dec {
+            m: "5".into(),
+            s: 1,
+            u: None,
+        };
         let r = to_rat(&d, 1000).unwrap();
-        assert_eq!(r, Num::Rat { p: "1".into(), q: "2".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Rat {
+                p: "1".into(),
+                q: "2".into(),
+                u: None
+            }
+        );
     }
 
     #[test]
     fn to_rat_with_limit() {
         // 355/113 ≈ π, but with limit_den=10 → 22/7
-        let pi_approx = Num::Rat { p: "355".into(), q: "113".into(), u: None };
+        let pi_approx = Num::Rat {
+            p: "355".into(),
+            q: "113".into(),
+            u: None,
+        };
         let r = to_rat(&pi_approx, 10).unwrap();
-        assert_eq!(r, Num::Rat { p: "22".into(), q: "7".into(), u: None });
+        assert_eq!(
+            r,
+            Num::Rat {
+                p: "22".into(),
+                q: "7".into(),
+                u: None
+            }
+        );
     }
 
     // --- from_f64_bits ---
@@ -889,35 +1182,85 @@ mod tests {
 
     #[test]
     fn compare_int() {
-        let a = Num::Int { v: "5".into(), u: None };
-        let b = Num::Int { v: "3".into(), u: None };
-        assert_eq!(compare(&a, &b).unwrap(), Num::Int { v: "1".into(), u: None });
-        assert_eq!(compare(&b, &a).unwrap(), Num::Int { v: "-1".into(), u: None });
-        assert_eq!(compare(&a, &a).unwrap(), Num::Int { v: "0".into(), u: None });
+        let a = Num::Int {
+            v: "5".into(),
+            u: None,
+        };
+        let b = Num::Int {
+            v: "3".into(),
+            u: None,
+        };
+        assert_eq!(
+            compare(&a, &b).unwrap(),
+            Num::Int {
+                v: "1".into(),
+                u: None
+            }
+        );
+        assert_eq!(
+            compare(&b, &a).unwrap(),
+            Num::Int {
+                v: "-1".into(),
+                u: None
+            }
+        );
+        assert_eq!(
+            compare(&a, &a).unwrap(),
+            Num::Int {
+                v: "0".into(),
+                u: None
+            }
+        );
     }
 
     #[test]
     fn compare_mixed() {
         // 0.5 DEC vs 1/3 RAT → 0.5 > 1/3 → 1
-        let a = Num::Dec { m: "5".into(), s: 1, u: None };
-        let b = Num::Rat { p: "1".into(), q: "3".into(), u: None };
-        assert_eq!(compare(&a, &b).unwrap(), Num::Int { v: "1".into(), u: None });
+        let a = Num::Dec {
+            m: "5".into(),
+            s: 1,
+            u: None,
+        };
+        let b = Num::Rat {
+            p: "1".into(),
+            q: "3".into(),
+            u: None,
+        };
+        assert_eq!(
+            compare(&a, &b).unwrap(),
+            Num::Int {
+                v: "1".into(),
+                u: None
+            }
+        );
     }
 
     // --- units ---
 
     #[test]
     fn add_same_unit() {
-        let a = Num::Int { v: "10".into(), u: Some("USD".into()) };
-        let b = Num::Int { v: "5".into(), u: Some("USD".into()) };
+        let a = Num::Int {
+            v: "10".into(),
+            u: Some("USD".into()),
+        };
+        let b = Num::Int {
+            v: "5".into(),
+            u: Some("USD".into()),
+        };
         let r = add(&a, &b).unwrap();
         assert_eq!(r.unit(), &Some("USD".into()));
     }
 
     #[test]
     fn add_mismatched_units() {
-        let a = Num::Int { v: "10".into(), u: Some("USD".into()) };
-        let b = Num::Int { v: "5".into(), u: Some("EUR".into()) };
+        let a = Num::Int {
+            v: "10".into(),
+            u: Some("USD".into()),
+        };
+        let b = Num::Int {
+            v: "5".into(),
+            u: Some("EUR".into()),
+        };
         assert!(add(&a, &b).is_err());
     }
 
@@ -927,13 +1270,29 @@ mod tests {
     fn add_bnd_bnd() {
         // [0.1, 0.2] + [0.2, 0.3] → [0.3, 0.5]
         let a = Num::Bnd {
-            lo: Box::new(Num::Dec { m: "1".into(), s: 1, u: None }),
-            hi: Box::new(Num::Dec { m: "2".into(), s: 1, u: None }),
+            lo: Box::new(Num::Dec {
+                m: "1".into(),
+                s: 1,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "2".into(),
+                s: 1,
+                u: None,
+            }),
             u: None,
         };
         let b = Num::Bnd {
-            lo: Box::new(Num::Dec { m: "2".into(), s: 1, u: None }),
-            hi: Box::new(Num::Dec { m: "3".into(), s: 1, u: None }),
+            lo: Box::new(Num::Dec {
+                m: "2".into(),
+                s: 1,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "3".into(),
+                s: 1,
+                u: None,
+            }),
             u: None,
         };
         let r = add(&a, &b).unwrap();
@@ -954,7 +1313,10 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_int() {
-        let n = Num::Int { v: "42".into(), u: None };
+        let n = Num::Int {
+            v: "42".into(),
+            u: None,
+        };
         let json = serde_json::to_string(&n).unwrap();
         assert!(json.contains("\"@num\":\"int/1\""));
         let back: Num = serde_json::from_str(&json).unwrap();
@@ -963,7 +1325,11 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_dec_with_unit() {
-        let n = Num::Dec { m: "1234".into(), s: 2, u: Some("USD".into()) };
+        let n = Num::Dec {
+            m: "1234".into(),
+            s: 2,
+            u: Some("USD".into()),
+        };
         let json = serde_json::to_string(&n).unwrap();
         let back: Num = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
@@ -972,8 +1338,16 @@ mod tests {
     #[test]
     fn serde_roundtrip_bnd() {
         let n = Num::Bnd {
-            lo: Box::new(Num::Dec { m: "1".into(), s: 1, u: None }),
-            hi: Box::new(Num::Dec { m: "2".into(), s: 1, u: None }),
+            lo: Box::new(Num::Dec {
+                m: "1".into(),
+                s: 1,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "2".into(),
+                s: 1,
+                u: None,
+            }),
             u: None,
         };
         let json = serde_json::to_string(&n).unwrap();

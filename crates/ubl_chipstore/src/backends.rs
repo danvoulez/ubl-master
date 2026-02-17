@@ -13,7 +13,7 @@ pub struct InMemoryBackend {
     chips: Arc<RwLock<HashMap<TypedCid, StoredChip>>>,
     receipt_index: Arc<RwLock<HashMap<TypedCid, TypedCid>>>, // receipt_cid -> chip_cid
     type_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // chip_type -> chip_cids
-    tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>,  // tag -> chip_cids
+    tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // tag -> chip_cids
     executor_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // executor_did -> chip_cids
 }
 
@@ -398,9 +398,9 @@ impl SledBackend {
         key: &str,
         cid: &str,
     ) -> Result<(), ChipStoreError> {
-        let mut set = self.read_index_set(tree, key)?;
-        set.insert(cid.to_string());
-        self.write_index_set(tree, key, &set)
+        tree.insert(index_composite_key(key, cid), &[])
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     fn remove_index_entry(
@@ -409,16 +409,9 @@ impl SledBackend {
         key: &str,
         cid: &str,
     ) -> Result<(), ChipStoreError> {
-        let mut set = self.read_index_set(tree, key)?;
-        if !set.remove(cid) {
-            return Ok(());
-        }
-        if set.is_empty() {
-            tree.remove(key.as_bytes())
-                .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
-            return Ok(());
-        }
-        self.write_index_set(tree, key, &set)
+        tree.remove(index_composite_key(key, cid))
+            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     fn read_index_set(
@@ -426,30 +419,20 @@ impl SledBackend {
         tree: &sled::Tree,
         key: &str,
     ) -> Result<HashSet<String>, ChipStoreError> {
-        let Some(bytes) = tree
-            .get(key.as_bytes())
-            .map_err(|e| ChipStoreError::Backend(e.to_string()))?
-        else {
-            return Ok(HashSet::new());
-        };
-        let values: Vec<String> = serde_json::from_slice(&bytes)
-            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
-        Ok(values.into_iter().collect())
-    }
-
-    fn write_index_set(
-        &self,
-        tree: &sled::Tree,
-        key: &str,
-        set: &HashSet<String>,
-    ) -> Result<(), ChipStoreError> {
-        let mut values: Vec<String> = set.iter().cloned().collect();
-        values.sort();
-        let bytes = serde_json::to_vec(&values)
-            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
-        tree.insert(key.as_bytes(), bytes)
-            .map_err(|e| ChipStoreError::Backend(e.to_string()))?;
-        Ok(())
+        let prefix = index_prefix(key);
+        let mut values = HashSet::new();
+        for item in tree.scan_prefix(&prefix) {
+            let (raw_key, _) = item.map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            if raw_key.len() < prefix.len() {
+                continue;
+            }
+            let suffix = &raw_key[prefix.len()..];
+            let cid = std::str::from_utf8(suffix).map_err(|e| {
+                ChipStoreError::Backend(format!("Invalid index CID UTF-8 for key '{}': {}", key, e))
+            })?;
+            values.insert(cid.to_string());
+        }
+        Ok(values)
     }
 
     fn load_chip_by_cid(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
@@ -672,6 +655,21 @@ fn intersect_sets<T: std::cmp::Eq + std::hash::Hash + Clone>(
     }
 }
 
+fn index_prefix(key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + 1);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0);
+    out
+}
+
+fn index_composite_key(key: &str, cid: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + cid.len() + 1);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0);
+    out.extend_from_slice(cid.as_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,7 +746,10 @@ mod tests {
             .clear()
             .expect("clear executor index for corruption test");
 
-        let broken = store.query(&query).await.expect("query while indexes are empty");
+        let broken = store
+            .query(&query)
+            .await
+            .expect("query while indexes are empty");
         assert_eq!(broken.total_count, 0);
 
         store

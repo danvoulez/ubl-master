@@ -61,9 +61,7 @@ impl ReasoningBit {
 
         let reason = format!(
             "{} evaluated to {} → {:?}",
-            self.name,
-            condition_result,
-            decision
+            self.name, condition_result, decision
         );
 
         let inputs_used = self.condition.inputs_used();
@@ -85,24 +83,20 @@ impl Expression {
         match self {
             Expression::Always(value) => *value,
             Expression::ContextHas(key) => context.variables.contains_key(key),
-            Expression::ContextEquals(key, expected) => {
-                context.variables.get(key)
-                    .map(|v| v == expected)
-                    .unwrap_or(false)
-            },
+            Expression::ContextEquals(key, expected) => context
+                .variables
+                .get(key)
+                .map(|v| v == expected)
+                .unwrap_or(false),
             Expression::BodySizeLte(limit) => context.body_size <= *limit,
-            Expression::TypeEquals(expected_type) => {
-                context.chip.get("@type")
-                    .and_then(|v| v.as_str())
-                    .map(|t| t == expected_type)
-                    .unwrap_or(false)
-            },
-            Expression::And(expressions) => {
-                expressions.iter().all(|e| e.evaluate(context))
-            },
-            Expression::Or(expressions) => {
-                expressions.iter().any(|e| e.evaluate(context))
-            },
+            Expression::TypeEquals(expected_type) => context
+                .chip
+                .get("@type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == expected_type)
+                .unwrap_or(false),
+            Expression::And(expressions) => expressions.iter().all(|e| e.evaluate(context)),
+            Expression::Or(expressions) => expressions.iter().any(|e| e.evaluate(context)),
             Expression::Not(expr) => !expr.evaluate(context),
         }
     }
@@ -120,19 +114,19 @@ impl Expression {
         match self {
             Expression::ContextHas(key) | Expression::ContextEquals(key, _) => {
                 inputs.push(key.clone());
-            },
+            }
             Expression::TypeEquals(_) => {
                 inputs.push("@type".to_string());
-            },
+            }
             Expression::And(exprs) | Expression::Or(exprs) => {
                 for expr in exprs {
                     expr.collect_inputs(inputs);
                 }
-            },
+            }
             Expression::Not(expr) => {
                 expr.collect_inputs(inputs);
-            },
-            Expression::Always(_) | Expression::BodySizeLte(_) => {},
+            }
+            Expression::Always(_) | Expression::BodySizeLte(_) => {}
         }
     }
 }
@@ -144,10 +138,14 @@ mod tests {
 
     fn test_context() -> EvalContext {
         let mut variables = HashMap::new();
-        variables.insert("body.email".to_string(),
-                        serde_json::Value::String("alice@acme.com".to_string()));
-        variables.insert("body.role".to_string(),
-                        serde_json::Value::String("admin".to_string()));
+        variables.insert(
+            "body.email".to_string(),
+            serde_json::Value::String("alice@acme.com".to_string()),
+        );
+        variables.insert(
+            "body.role".to_string(),
+            serde_json::Value::String("admin".to_string()),
+        );
 
         EvalContext {
             chip: serde_json::json!({"@type": "ubl/user", "id": "alice"}),
@@ -163,7 +161,7 @@ mod tests {
             name: "Is Admin".to_string(),
             condition: Expression::ContextEquals(
                 "body.role".to_string(),
-                serde_json::Value::String("admin".to_string())
+                serde_json::Value::String("admin".to_string()),
             ),
             on_true: Decision::Allow,
             on_false: Decision::Deny,

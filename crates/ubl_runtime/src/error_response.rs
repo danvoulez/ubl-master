@@ -69,7 +69,6 @@ pub enum ErrorCode {
     InternalError,
 
     // ── Unified taxonomy additions (P1.7) ──
-
     /// Authentication required or invalid credentials.
     #[serde(rename = "UNAUTHORIZED")]
     Unauthorized,
@@ -240,7 +239,9 @@ impl UblError {
             PipelineError::CanonError(msg) => (ErrorCode::CanonError, msg.clone()),
             PipelineError::SignError(msg) => (ErrorCode::SignError, msg.clone()),
             PipelineError::StorageError(msg) => (ErrorCode::StorageError, msg.clone()),
-            PipelineError::IdempotencyConflict(msg) => (ErrorCode::IdempotencyConflict, msg.clone()),
+            PipelineError::IdempotencyConflict(msg) => {
+                (ErrorCode::IdempotencyConflict, msg.clone())
+            }
             PipelineError::DurableCommitFailed(msg) => {
                 (ErrorCode::DurableCommitFailed, msg.clone())
             }
@@ -312,7 +313,9 @@ mod tests {
 
     #[test]
     fn knock_error_maps_to_400() {
-        let err = PipelineError::Knock("KNOCK-001: body too large (2000000 bytes, max 1048576)".to_string());
+        let err = PipelineError::Knock(
+            "KNOCK-001: body too large (2000000 bytes, max 1048576)".to_string(),
+        );
         let ubl_err = UblError::from_pipeline_error(&err);
         assert_eq!(ubl_err.code, ErrorCode::KnockBodyTooLarge);
         assert_eq!(ubl_err.code.http_status(), 400);
@@ -370,7 +373,11 @@ mod tests {
         ];
         for code in &codes {
             assert_eq!(code.http_status(), 400, "{:?} should be 400", code);
-            assert!(!code.produces_receipt(), "{:?} should not produce receipt", code);
+            assert!(
+                !code.produces_receipt(),
+                "{:?} should not produce receipt",
+                code
+            );
         }
     }
 
@@ -590,14 +597,14 @@ mod tests {
 
     #[test]
     fn mcp_code_mapping() {
-        assert_eq!(ErrorCode::InvalidChip.mcp_code(), -32602);      // BadInput
-        assert_eq!(ErrorCode::Unauthorized.mcp_code(), -32001);      // Unauthorized
-        assert_eq!(ErrorCode::PolicyDenied.mcp_code(), -32003);      // Forbidden
-        assert_eq!(ErrorCode::NotFound.mcp_code(), -32004);          // NotFound
-        assert_eq!(ErrorCode::ReplayDetected.mcp_code(), -32005);    // Conflict
-        assert_eq!(ErrorCode::TooManyRequests.mcp_code(), -32006);   // TooManyRequests
-        assert_eq!(ErrorCode::InternalError.mcp_code(), -32603);     // Internal
-        assert_eq!(ErrorCode::Unavailable.mcp_code(), -32000);       // Unavailable
+        assert_eq!(ErrorCode::InvalidChip.mcp_code(), -32602); // BadInput
+        assert_eq!(ErrorCode::Unauthorized.mcp_code(), -32001); // Unauthorized
+        assert_eq!(ErrorCode::PolicyDenied.mcp_code(), -32003); // Forbidden
+        assert_eq!(ErrorCode::NotFound.mcp_code(), -32004); // NotFound
+        assert_eq!(ErrorCode::ReplayDetected.mcp_code(), -32005); // Conflict
+        assert_eq!(ErrorCode::TooManyRequests.mcp_code(), -32006); // TooManyRequests
+        assert_eq!(ErrorCode::InternalError.mcp_code(), -32603); // Internal
+        assert_eq!(ErrorCode::Unavailable.mcp_code(), -32000); // Unavailable
     }
 
     #[test]

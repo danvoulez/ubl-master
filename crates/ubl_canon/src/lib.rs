@@ -14,6 +14,7 @@ pub mod domains {
     pub const RICH_URL: &str = "ubl/rich-url/v1";
     pub const RB_VM: &str = "ubl-rb-vm/v1";
     pub const CAPABILITY: &str = "ubl-capability/v1";
+    pub const RUNTIME_ATTESTATION: &str = "ubl/runtime-attestation/v1";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +137,8 @@ fn verify_signature(vk: &VerifyingKey, message: &[u8], sig: &str) -> Result<bool
     let sig_bytes = BASE64
         .decode(b64)
         .map_err(|e| CanonError::Signature(e.to_string()))?;
-    let sig = Signature::from_slice(&sig_bytes).map_err(|e| CanonError::Signature(e.to_string()))?;
+    let sig =
+        Signature::from_slice(&sig_bytes).map_err(|e| CanonError::Signature(e.to_string()))?;
     Ok(vk.verify(message, &sig).is_ok())
 }
 

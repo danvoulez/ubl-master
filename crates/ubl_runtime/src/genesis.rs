@@ -3,9 +3,9 @@
 //! The genesis chip is the root of all policy in the UBL system.
 //! It's self-signed and defines the fundamental rules.
 
-use crate::reasoning_bit::{ReasoningBit, Expression, Decision};
-use crate::circuit::{Circuit, CompositionMode, AggregationMode};
+use crate::circuit::{AggregationMode, Circuit, CompositionMode};
 use crate::policy_bit::{PolicyBit, PolicyScope};
+use crate::reasoning_bit::{Decision, Expression, ReasoningBit};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -71,6 +71,7 @@ fn create_type_validation_rb() -> ReasoningBit {
             Expression::TypeEquals("ubl/adapter".to_string()),
             Expression::TypeEquals("ubl/membership".to_string()),
             Expression::TypeEquals("ubl/revoke".to_string()),
+            Expression::TypeEquals("ubl/key.rotate".to_string()),
             Expression::TypeEquals("ubl/document".to_string()),
         ]),
         on_true: Decision::Allow,
@@ -112,12 +113,12 @@ fn create_no_malicious_content_rb() -> ReasoningBit {
             // No script tags
             Expression::Not(Box::new(Expression::ContextEquals(
                 "body.script".to_string(),
-                json!("*")
+                json!("*"),
             ))),
             // No obvious SQL injection attempts
             Expression::Not(Box::new(Expression::ContextEquals(
                 "body.query".to_string(),
-                json!("DROP TABLE*")
+                json!("DROP TABLE*"),
             ))),
         ]),
         on_true: Decision::Allow,
@@ -143,7 +144,7 @@ pub fn create_genesis_chip_body() -> serde_json::Value {
 
 /// Genesis chip CID - this is computed deterministically
 pub fn genesis_chip_cid() -> String {
-    use ubl_ai_nrf1::{to_nrf1_bytes, compute_cid};
+    use ubl_ai_nrf1::{compute_cid, to_nrf1_bytes};
 
     let genesis_body = create_genesis_chip_body();
     let nrf1_bytes = to_nrf1_bytes(&genesis_body).expect("Genesis chip must compile");
@@ -172,9 +173,7 @@ mod tests {
         let circuit = create_genesis_circuit();
         assert_eq!(circuit.reasoning_bits.len(), 4);
 
-        let rb_ids: Vec<&String> = circuit.reasoning_bits.iter()
-            .map(|rb| &rb.id)
-            .collect();
+        let rb_ids: Vec<&String> = circuit.reasoning_bits.iter().map(|rb| &rb.id).collect();
 
         assert!(rb_ids.contains(&&"type_validation".to_string()));
         assert!(rb_ids.contains(&&"has_logical_id".to_string()));
@@ -232,6 +231,21 @@ mod tests {
 
         let result = rb.evaluate(&context);
         assert_eq!(result.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn type_validation_rb_accepts_key_rotate() {
+        use crate::reasoning_bit::EvalContext;
+        use std::collections::HashMap;
+
+        let rb = create_type_validation_rb();
+        let context = EvalContext {
+            chip: json!({"@type": "ubl/key.rotate", "id": "rot"}),
+            body_size: 1000,
+            variables: HashMap::new(),
+        };
+        let result = rb.evaluate(&context);
+        assert_eq!(result.decision, Decision::Allow);
     }
 
     #[test]

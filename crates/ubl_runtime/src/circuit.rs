@@ -1,6 +1,6 @@
 //! Circuit composition - combining reasoning bits into logic units
 
-use crate::reasoning_bit::{ReasoningBit, Decision, EvalContext, RbResult};
+use crate::reasoning_bit::{Decision, EvalContext, RbResult, ReasoningBit};
 use serde::{Deserialize, Serialize};
 
 /// How to compose multiple reasoning bits
@@ -116,7 +116,11 @@ impl Circuit {
         self.aggregate_results(rb_results)
     }
 
-    fn evaluate_conditional(&self, context: &EvalContext, branches: &[ConditionalBranch]) -> CircuitResult {
+    fn evaluate_conditional(
+        &self,
+        context: &EvalContext,
+        branches: &[ConditionalBranch],
+    ) -> CircuitResult {
         for branch in branches {
             if branch.condition.evaluate(context) {
                 return branch.then_circuit.evaluate(context);
@@ -155,73 +159,108 @@ impl Circuit {
 
         let (decision, reason) = match &self.aggregator {
             AggregationMode::All => {
-                let denies: Vec<_> = rb_results.iter()
+                let denies: Vec<_> = rb_results
+                    .iter()
                     .filter(|r| matches!(r.decision, Decision::Deny))
                     .collect();
 
                 if !denies.is_empty() {
-                    (Decision::Deny,
-                     format!("Denied by: {}", denies.iter()
-                            .map(|r| r.rb_id.clone())
-                            .collect::<Vec<_>>()
-                            .join(", ")))
+                    (
+                        Decision::Deny,
+                        format!(
+                            "Denied by: {}",
+                            denies
+                                .iter()
+                                .map(|r| r.rb_id.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
                 } else {
-                    let requires: Vec<_> = rb_results.iter()
+                    let requires: Vec<_> = rb_results
+                        .iter()
                         .filter(|r| matches!(r.decision, Decision::Require))
                         .collect();
 
                     if !requires.is_empty() {
-                        (Decision::Require,
-                         format!("Requires consent from: {}", requires.iter()
-                                .map(|r| r.rb_id.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ")))
+                        (
+                            Decision::Require,
+                            format!(
+                                "Requires consent from: {}",
+                                requires
+                                    .iter()
+                                    .map(|r| r.rb_id.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )
                     } else {
                         (Decision::Allow, "All reasoning bits allowed".to_string())
                     }
                 }
-            },
+            }
 
             AggregationMode::Any => {
-                let allows: Vec<_> = rb_results.iter()
+                let allows: Vec<_> = rb_results
+                    .iter()
                     .filter(|r| matches!(r.decision, Decision::Allow))
                     .collect();
 
                 if !allows.is_empty() {
-                    (Decision::Allow,
-                     format!("Allowed by: {}", allows.iter()
-                            .map(|r| r.rb_id.clone())
-                            .collect::<Vec<_>>()
-                            .join(", ")))
+                    (
+                        Decision::Allow,
+                        format!(
+                            "Allowed by: {}",
+                            allows
+                                .iter()
+                                .map(|r| r.rb_id.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
                 } else {
                     (Decision::Deny, "No reasoning bit allowed".to_string())
                 }
-            },
+            }
 
             AggregationMode::Majority => {
-                let allows = rb_results.iter()
+                let allows = rb_results
+                    .iter()
                     .filter(|r| matches!(r.decision, Decision::Allow))
                     .count();
                 let total = rb_results.len();
 
                 if allows > total / 2 {
-                    (Decision::Allow, format!("Majority allowed ({}/{})", allows, total))
+                    (
+                        Decision::Allow,
+                        format!("Majority allowed ({}/{})", allows, total),
+                    )
                 } else {
-                    (Decision::Deny, format!("Majority denied ({}/{})", total - allows, total))
+                    (
+                        Decision::Deny,
+                        format!("Majority denied ({}/{})", total - allows, total),
+                    )
                 }
-            },
+            }
 
             AggregationMode::KofN { k, n } => {
-                let allows = rb_results.iter()
+                let allows = rb_results
+                    .iter()
                     .filter(|r| matches!(r.decision, Decision::Allow))
                     .count();
 
                 if allows >= *k {
-                    (Decision::Allow, format!("K-of-N satisfied ({}/{})", allows, n))
+                    (
+                        Decision::Allow,
+                        format!("K-of-N satisfied ({}/{})", allows, n),
+                    )
                 } else {
-                    (Decision::Deny, format!("K-of-N not satisfied ({}/{}, need {})", allows, n, k))
+                    (
+                        Decision::Deny,
+                        format!("K-of-N not satisfied ({}/{}, need {})", allows, n, k),
+                    )
                 }
-            },
+            }
 
             AggregationMode::FirstDecisive => {
                 for result in &rb_results {
@@ -238,8 +277,11 @@ impl Circuit {
                 }
 
                 // All were REQUIRE
-                (Decision::Require, "All reasoning bits require consent".to_string())
-            },
+                (
+                    Decision::Require,
+                    "All reasoning bits require consent".to_string(),
+                )
+            }
         };
 
         CircuitResult {
@@ -260,8 +302,10 @@ mod tests {
 
     fn test_context() -> EvalContext {
         let mut variables = HashMap::new();
-        variables.insert("body.role".to_string(),
-                        serde_json::Value::String("admin".to_string()));
+        variables.insert(
+            "body.role".to_string(),
+            serde_json::Value::String("admin".to_string()),
+        );
 
         EvalContext {
             chip: serde_json::json!({"@type": "ubl/user", "id": "alice"}),

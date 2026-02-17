@@ -69,40 +69,53 @@ impl HostedUrl {
     pub fn to_url_string(&self) -> String {
         format!(
             "{}/{}/{}/receipts/{}.json#cid={}&did={}&rt={}&sig={}",
-            self.host, self.app, self.tenant, self.receipt_id,
-            self.cid, self.did, self.rt, self.sig
+            self.host,
+            self.app,
+            self.tenant,
+            self.receipt_id,
+            self.cid,
+            self.did,
+            self.rt,
+            self.sig
         )
     }
 
     /// Parse a hosted URL string back into components.
     pub fn parse(url: &str) -> Result<Self, UrlError> {
         // Split on '#' to get path and fragment
-        let (path, fragment) = url.split_once('#')
+        let (path, fragment) = url
+            .split_once('#')
             .ok_or_else(|| UrlError::InvalidFormat("Missing # fragment".into()))?;
 
         // Parse fragment params
         let params = parse_query_params(fragment);
-        let cid = params.get("cid")
+        let cid = params
+            .get("cid")
             .ok_or_else(|| UrlError::MissingParam("cid".into()))?
             .to_string();
-        let did = params.get("did")
+        let did = params
+            .get("did")
             .ok_or_else(|| UrlError::MissingParam("did".into()))?
             .to_string();
-        let rt = params.get("rt")
+        let rt = params
+            .get("rt")
             .ok_or_else(|| UrlError::MissingParam("rt".into()))?
             .to_string();
-        let sig = params.get("sig")
+        let sig = params
+            .get("sig")
             .ok_or_else(|| UrlError::MissingParam("sig".into()))?
             .to_string();
 
         // Parse path: {host}/{app}/{tenant}/receipts/{id}.json
         // Find "/receipts/" to split
-        let receipts_idx = path.find("/receipts/")
+        let receipts_idx = path
+            .find("/receipts/")
             .ok_or_else(|| UrlError::InvalidFormat("Missing /receipts/ in path".into()))?;
 
         let base = &path[..receipts_idx];
         let receipt_file = &path[receipts_idx + "/receipts/".len()..];
-        let receipt_id = receipt_file.strip_suffix(".json")
+        let receipt_id = receipt_file
+            .strip_suffix(".json")
             .ok_or_else(|| UrlError::InvalidFormat("Receipt path must end in .json".into()))?
             .to_string();
 
@@ -111,13 +124,24 @@ impl HostedUrl {
         // We need to find the last two path segments
         let segments: Vec<&str> = base.rsplitn(3, '/').collect();
         if segments.len() < 3 {
-            return Err(UrlError::InvalidFormat("Cannot parse host/app/tenant from path".into()));
+            return Err(UrlError::InvalidFormat(
+                "Cannot parse host/app/tenant from path".into(),
+            ));
         }
         let tenant = segments[0].to_string();
         let app = segments[1].to_string();
         let host = segments[2].to_string();
 
-        Ok(Self { host, app, tenant, receipt_id, cid, did, rt, sig })
+        Ok(Self {
+            host,
+            app,
+            tenant,
+            receipt_id,
+            cid,
+            did,
+            rt,
+            sig,
+        })
     }
 
     /// Produce canonical NRF payload bytes that are signed.
@@ -181,25 +205,33 @@ impl SelfContainedUrl {
 
     /// Render the `ubl://` URL string.
     pub fn to_url_string(&self) -> String {
-        format!("ubl://{}?cid={}&did={}&sig={}", self.data_b64, self.cid, self.did, self.sig)
+        format!(
+            "ubl://{}?cid={}&did={}&sig={}",
+            self.data_b64, self.cid, self.did, self.sig
+        )
     }
 
     /// Parse a `ubl://` URL string.
     pub fn parse(url: &str) -> Result<Self, UrlError> {
-        let rest = url.strip_prefix("ubl://")
+        let rest = url
+            .strip_prefix("ubl://")
             .ok_or_else(|| UrlError::InvalidFormat("Must start with ubl://".into()))?;
 
-        let (data_b64, query) = rest.split_once('?')
+        let (data_b64, query) = rest
+            .split_once('?')
             .ok_or_else(|| UrlError::InvalidFormat("Missing ? query".into()))?;
 
         let params = parse_query_params(query);
-        let cid = params.get("cid")
+        let cid = params
+            .get("cid")
             .ok_or_else(|| UrlError::MissingParam("cid".into()))?
             .to_string();
-        let did = params.get("did")
+        let did = params
+            .get("did")
             .ok_or_else(|| UrlError::MissingParam("did".into()))?
             .to_string();
-        let sig = params.get("sig")
+        let sig = params
+            .get("sig")
             .ok_or_else(|| UrlError::MissingParam("sig".into()))?
             .to_string();
 
@@ -295,7 +327,10 @@ impl std::fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 /// Verify a hosted URL offline given the fetched receipt body.
-pub fn verify_hosted(url: &HostedUrl, receipt_body: &Value) -> Result<VerificationResult, VerifyError> {
+pub fn verify_hosted(
+    url: &HostedUrl,
+    receipt_body: &Value,
+) -> Result<VerificationResult, VerifyError> {
     // Step 1: Recompute CID from receipt body
     let computed_cid = ubl_canon::cid_of(receipt_body).unwrap_or_default();
     let cid_valid = !computed_cid.is_empty() && computed_cid == url.cid;
@@ -324,7 +359,7 @@ pub fn verify_hosted(url: &HostedUrl, receipt_body: &Value) -> Result<Verificati
     // Step 3: Runtime hash must match receipt runtime info
     let expected_rt = receipt_body
         .get("rt")
-        .and_then(|rt| rt.get("binary_hash"))
+        .and_then(|rt| rt.get("runtime_hash").or_else(|| rt.get("binary_hash")))
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
@@ -338,12 +373,20 @@ pub fn verify_hosted(url: &HostedUrl, receipt_body: &Value) -> Result<Verificati
 
     let summary = format!("VERIFIED: CID={}, DID={}", url.cid, url.did);
 
-    Ok(VerificationResult { cid_valid, sig_valid, rt_valid, verified: true, summary })
+    Ok(VerificationResult {
+        cid_valid,
+        sig_valid,
+        rt_valid,
+        verified: true,
+        summary,
+    })
 }
 
 /// Verify a self-contained URL offline.
 pub fn verify_self_contained(url: &SelfContainedUrl) -> Result<VerificationResult, VerifyError> {
-    let chip = url.extract_chip().map_err(|e| VerifyError::Decode(e.to_string()))?;
+    let chip = url
+        .extract_chip()
+        .map_err(|e| VerifyError::Decode(e.to_string()))?;
 
     let computed_cid = ubl_canon::cid_of(&chip)
         .map_err(|e| VerifyError::Decode(format!("CID computation: {}", e)))?;
@@ -365,12 +408,21 @@ pub fn verify_self_contained(url: &SelfContainedUrl) -> Result<VerificationResul
 
     let summary = format!("VERIFIED: self-contained CID={}", url.cid);
 
-    Ok(VerificationResult { cid_valid, sig_valid, rt_valid: true, verified: true, summary })
+    Ok(VerificationResult {
+        cid_valid,
+        sig_valid,
+        rt_valid: true,
+        verified: true,
+        summary,
+    })
 }
 
 /// Verify hosted URL honoring environment mode (`shadow` vs `strict`).
 /// In shadow mode, failures return `Ok(verified=false)` to support safe rollout.
-pub fn verify_hosted_by_mode(url: &HostedUrl, receipt_body: &Value) -> Result<VerificationResult, VerifyError> {
+pub fn verify_hosted_by_mode(
+    url: &HostedUrl,
+    receipt_body: &Value,
+) -> Result<VerificationResult, VerifyError> {
     match verify_hosted(url, receipt_body) {
         Ok(result) => Ok(result),
         Err(err)
@@ -378,28 +430,32 @@ pub fn verify_hosted_by_mode(url: &HostedUrl, receipt_body: &Value) -> Result<Ve
                 == RichUrlVerifyMode::Shadow =>
         {
             Ok(VerificationResult {
-            cid_valid: false,
-            sig_valid: false,
-            rt_valid: false,
-            verified: false,
-            summary: format!("SHADOW_VERIFY_FAIL: {}", err),
-        })
+                cid_valid: false,
+                sig_valid: false,
+                rt_valid: false,
+                verified: false,
+                summary: format!("SHADOW_VERIFY_FAIL: {}", err),
+            })
         }
         Err(err) => Err(err),
     }
 }
 
 /// Verify self-contained URL honoring environment mode (`shadow` vs `strict`).
-pub fn verify_self_contained_by_mode(url: &SelfContainedUrl) -> Result<VerificationResult, VerifyError> {
+pub fn verify_self_contained_by_mode(
+    url: &SelfContainedUrl,
+) -> Result<VerificationResult, VerifyError> {
     match verify_self_contained(url) {
         Ok(result) => Ok(result),
-        Err(err) if RichUrlVerifyMode::from_env() == RichUrlVerifyMode::Shadow => Ok(VerificationResult {
-            cid_valid: false,
-            sig_valid: false,
-            rt_valid: false,
-            verified: false,
-            summary: format!("SHADOW_VERIFY_FAIL: {}", err),
-        }),
+        Err(err) if RichUrlVerifyMode::from_env() == RichUrlVerifyMode::Shadow => {
+            Ok(VerificationResult {
+                cid_valid: false,
+                sig_valid: false,
+                rt_valid: false,
+                verified: false,
+                summary: format!("SHADOW_VERIFY_FAIL: {}", err),
+            })
+        }
         Err(err) => Err(err),
     }
 }
@@ -420,8 +476,9 @@ impl std::fmt::Display for UrlError {
             UrlError::InvalidFormat(e) => write!(f, "Invalid URL format: {}", e),
             UrlError::MissingParam(p) => write!(f, "Missing URL parameter: {}", p),
             UrlError::Encoding(e) => write!(f, "Encoding error: {}", e),
-            UrlError::TooLarge { size, limit } =>
-                write!(f, "URL too large: {} bytes (limit {} bytes)", size, limit),
+            UrlError::TooLarge { size, limit } => {
+                write!(f, "URL too large: {} bytes (limit {} bytes)", size, limit)
+            }
         }
     }
 }
@@ -431,7 +488,8 @@ impl std::error::Error for UrlError {}
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn parse_query_params(query: &str) -> std::collections::HashMap<String, String> {
-    query.split('&')
+    query
+        .split('&')
         .filter_map(|pair| {
             let (k, v) = pair.split_once('=')?;
             Some((k.to_string(), v.to_string()))
@@ -447,7 +505,8 @@ fn verify_signature_by_env(
     tenant: Option<&str>,
 ) -> bool {
     let v1 = ubl_canon::verify_raw_v1(payload, URL_SIGN_DOMAIN, vk, sig).unwrap_or(false);
-    let v2 = ubl_canon::verify_raw_v2_hash_first(payload, URL_SIGN_DOMAIN, vk, sig).unwrap_or(false);
+    let v2 =
+        ubl_canon::verify_raw_v2_hash_first(payload, URL_SIGN_DOMAIN, vk, sig).unwrap_or(false);
 
     let mode = std::env::var("UBL_CRYPTO_MODE").unwrap_or_else(|_| "compat_v1".to_string());
     let v2_enforce = env_bool("UBL_CRYPTO_V2_ENFORCE")
@@ -469,13 +528,21 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn scope_match_env(var_name: &str, app: Option<&str>, tenant: Option<&str>) -> bool {
-    let Some(app) = app else { return false; };
-    let Some(tenant) = tenant else { return false; };
+    let Some(app) = app else {
+        return false;
+    };
+    let Some(tenant) = tenant else {
+        return false;
+    };
     let scopes = match std::env::var(var_name) {
         Ok(v) => v,
         Err(_) => return false,
     };
-    for raw in scopes.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    for raw in scopes
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         if raw == "*/*" {
             return true;
         }
@@ -509,9 +576,11 @@ fn deflate_compress(data: &[u8]) -> Result<Vec<u8>, UrlError> {
     use flate2::Compression;
 
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(data)
+    encoder
+        .write_all(data)
         .map_err(|e| UrlError::Encoding(format!("deflate compress: {}", e)))?;
-    encoder.finish()
+    encoder
+        .finish()
         .map_err(|e| UrlError::Encoding(format!("deflate finish: {}", e)))
 }
 
@@ -520,7 +589,8 @@ fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>, UrlError> {
 
     let mut decoder = DeflateDecoder::new(data);
     let mut result = Vec::new();
-    decoder.read_to_end(&mut result)
+    decoder
+        .read_to_end(&mut result)
         .map_err(|e| UrlError::Encoding(format!("deflate decompress: {}", e)))?;
     Ok(result)
 }
@@ -582,11 +652,19 @@ mod tests {
         let vk = sk.verifying_key();
         let did = ubl_kms::did_from_verifying_key(&vk);
         let url = HostedUrl::new(
-            "https://ubl.example.com", "app", "tenant", "r1",
-            "b3:cid", &did, "b3:rt", "ed25519:placeholder",
+            "https://ubl.example.com",
+            "app",
+            "tenant",
+            "r1",
+            "b3:cid",
+            &did,
+            "b3:rt",
+            "ed25519:placeholder",
         );
         let sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
-        assert!(ubl_canon::verify_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &vk, &sig).unwrap());
+        assert!(
+            ubl_canon::verify_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &vk, &sig).unwrap()
+        );
     }
 
     #[test]
@@ -624,10 +702,7 @@ mod tests {
         fields.insert("@id".into(), json!("u1"));
         for i in 0..80 {
             let hash = blake3::hash(format!("seed-{}", i).as_bytes());
-            fields.insert(
-                format!("f{:03}", i),
-                json!(hex::encode(hash.as_bytes())),
-            );
+            fields.insert(format!("f{:03}", i), json!(hex::encode(hash.as_bytes())));
         }
         let chip = Value::Object(fields);
 
@@ -637,8 +712,14 @@ mod tests {
             "did:key:z6MktQY3amfWvZ6K2Y7fA3nQgFhR9UjS9b2m1cQm7A7kPq2L",
             "sig",
         );
-        assert!(result.is_err(), "Expected TooLarge error, got Ok with URL len {}",
-            result.as_ref().map(|u| u.to_url_string().len()).unwrap_or(0));
+        assert!(
+            result.is_err(),
+            "Expected TooLarge error, got Ok with URL len {}",
+            result
+                .as_ref()
+                .map(|u| u.to_url_string().len())
+                .unwrap_or(0)
+        );
         assert!(matches!(result, Err(UrlError::TooLarge { .. })));
     }
 
@@ -658,8 +739,14 @@ mod tests {
         let cid = ubl_canon::cid_of(&receipt).unwrap();
 
         let mut url = HostedUrl::new(
-            "https://ubl.example.com", "app", "tenant", "r1",
-            &cid, &did, rt, "",
+            "https://ubl.example.com",
+            "app",
+            "tenant",
+            "r1",
+            &cid,
+            &did,
+            rt,
+            "",
         );
         url.sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
 
@@ -678,8 +765,14 @@ mod tests {
         let vk = sk.verifying_key();
         let did = ubl_kms::did_from_verifying_key(&vk);
         let mut url = HostedUrl::new(
-            "https://ubl.example.com", "app", "tenant", "r1",
-            "b3:wrong", &did, "b3:rt", "",
+            "https://ubl.example.com",
+            "app",
+            "tenant",
+            "r1",
+            "b3:wrong",
+            &did,
+            "b3:rt",
+            "",
         );
         url.sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
 
@@ -717,13 +810,43 @@ mod tests {
         let did = ubl_kms::did_from_verifying_key(&vk);
         let cid = ubl_canon::cid_of(&receipt).unwrap();
         let mut url = HostedUrl::new(
-            "https://ubl.example.com", "app", "tenant", "r1",
-            &cid, &did, "b3:different", "",
+            "https://ubl.example.com",
+            "app",
+            "tenant",
+            "r1",
+            &cid,
+            &did,
+            "b3:different",
+            "",
         );
         url.sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
 
         let err = verify_hosted(&url, &receipt).unwrap_err();
         assert!(matches!(err, VerifyError::RuntimeHashMismatch { .. }));
+    }
+
+    #[test]
+    fn rich_url_accepts_runtime_hash_alias_field() {
+        let mut receipt = json!({"@type": "ubl/receipt", "decision": "allow"});
+        receipt["rt"] = json!({"runtime_hash":"b3:expected"});
+        let sk = SigningKey::from_bytes(&[12u8; 32]);
+        let vk = sk.verifying_key();
+        let did = ubl_kms::did_from_verifying_key(&vk);
+        let cid = ubl_canon::cid_of(&receipt).unwrap();
+        let mut url = HostedUrl::new(
+            "https://ubl.example.com",
+            "app",
+            "tenant",
+            "r1",
+            &cid,
+            &did,
+            "b3:expected",
+            "",
+        );
+        url.sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
+
+        let result = verify_hosted(&url, &receipt).unwrap();
+        assert!(result.verified);
     }
 
     #[test]
@@ -755,6 +878,8 @@ mod tests {
             sig: "sig".into(),
         };
         let sig = ubl_canon::sign_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &sk);
-        assert!(ubl_canon::verify_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &vk, &sig).unwrap());
+        assert!(
+            ubl_canon::verify_raw_v1(&url.signing_payload(), URL_SIGN_DOMAIN, &vk, &sig).unwrap()
+        );
     }
 }

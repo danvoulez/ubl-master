@@ -126,7 +126,8 @@ const RESERVED_PREFIXES: &[&str] = &["ubl/", "ubl/meta."];
 
 /// Validate and parse a `ubl/meta.register` chip body.
 pub fn parse_register(body: &Value) -> Result<RegisterChip, MetaChipError> {
-    let target_type = body.get("target_type")
+    let target_type = body
+        .get("target_type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("target_type".into()))?;
 
@@ -137,38 +138,51 @@ pub fn parse_register(body: &Value) -> Result<RegisterChip, MetaChipError> {
         }
     }
 
-    let description = body.get("description")
+    let description = body
+        .get("description")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("description".into()))?;
 
-    let schema_val = body.get("schema")
+    let schema_val = body
+        .get("schema")
         .ok_or_else(|| MetaChipError::MissingField("schema".into()))?;
     let schema: TypeSchema = serde_json::from_value(schema_val.clone())
         .map_err(|e| MetaChipError::InvalidField(format!("schema: {}", e)))?;
 
-    let kats_val = body.get("kats")
+    let kats_val = body
+        .get("kats")
         .and_then(|v| v.as_array())
         .ok_or(MetaChipError::NoKats)?;
     if kats_val.is_empty() {
         return Err(MetaChipError::NoKats);
     }
 
-    let kats: Vec<Kat> = kats_val.iter().enumerate().map(|(i, v)| {
-        serde_json::from_value::<Kat>(v.clone())
-            .map_err(|e| MetaChipError::InvalidKat(format!("KAT[{}]: {}", i, e)))
-    }).collect::<Result<Vec<_>, _>>()?;
+    let kats: Vec<Kat> = kats_val
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            serde_json::from_value::<Kat>(v.clone())
+                .map_err(|e| MetaChipError::InvalidKat(format!("KAT[{}]: {}", i, e)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Validate each KAT has the correct @type
     for (i, kat) in kats.iter().enumerate() {
-        let kat_type = kat.input.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+        let kat_type = kat
+            .input
+            .get("@type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if kat_type != target_type {
-            return Err(MetaChipError::InvalidKat(
-                format!("KAT[{}]: @type '{}' doesn't match target_type '{}'", i, kat_type, target_type),
-            ));
+            return Err(MetaChipError::InvalidKat(format!(
+                "KAT[{}]: @type '{}' doesn't match target_type '{}'",
+                i, kat_type, target_type
+            )));
         }
     }
 
-    let type_version = body.get("type_version")
+    let type_version = body
+        .get("type_version")
         .and_then(|v| v.as_str())
         .unwrap_or("1.0")
         .to_string();
@@ -184,19 +198,23 @@ pub fn parse_register(body: &Value) -> Result<RegisterChip, MetaChipError> {
 
 /// Validate and parse a `ubl/meta.describe` chip body.
 pub fn parse_describe(body: &Value) -> Result<DescribeChip, MetaChipError> {
-    let target_type = body.get("target_type")
+    let target_type = body
+        .get("target_type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("target_type".into()))?;
 
-    let description = body.get("description")
+    let description = body
+        .get("description")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("description".into()))?;
 
-    let docs_url = body.get("docs_url")
+    let docs_url = body
+        .get("docs_url")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let kats = body.get("kats")
+    let kats = body
+        .get("kats")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -215,19 +233,23 @@ pub fn parse_describe(body: &Value) -> Result<DescribeChip, MetaChipError> {
 
 /// Validate and parse a `ubl/meta.deprecate` chip body.
 pub fn parse_deprecate(body: &Value) -> Result<DeprecateChip, MetaChipError> {
-    let target_type = body.get("target_type")
+    let target_type = body
+        .get("target_type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("target_type".into()))?;
 
-    let reason = body.get("reason")
+    let reason = body
+        .get("reason")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MetaChipError::MissingField("reason".into()))?;
 
-    let replacement_type = body.get("replacement_type")
+    let replacement_type = body
+        .get("replacement_type")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let sunset_at = body.get("sunset_at")
+    let sunset_at = body
+        .get("sunset_at")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -299,7 +321,10 @@ mod tests {
             "schema": { "required_fields": [] },
             "kats": [{ "label": "x", "input": {}, "expected_decision": "allow" }]
         });
-        assert!(matches!(parse_register(&body), Err(MetaChipError::MissingField(_))));
+        assert!(matches!(
+            parse_register(&body),
+            Err(MetaChipError::MissingField(_))
+        ));
     }
 
     #[test]
@@ -309,7 +334,10 @@ mod tests {
             "schema": { "required_fields": [] },
             "kats": [{ "label": "x", "input": { "@type": "acme/test" }, "expected_decision": "allow" }]
         });
-        assert!(matches!(parse_register(&body), Err(MetaChipError::MissingField(_))));
+        assert!(matches!(
+            parse_register(&body),
+            Err(MetaChipError::MissingField(_))
+        ));
     }
 
     #[test]
@@ -341,7 +369,10 @@ mod tests {
             "schema": { "required_fields": [] },
             "kats": [{ "label": "x", "input": { "@type": "ubl/custom" }, "expected_decision": "allow" }]
         });
-        assert!(matches!(parse_register(&body), Err(MetaChipError::ReservedPrefix(_))));
+        assert!(matches!(
+            parse_register(&body),
+            Err(MetaChipError::ReservedPrefix(_))
+        ));
     }
 
     #[test]
@@ -392,14 +423,20 @@ mod tests {
         });
         let desc = parse_describe(&body).unwrap();
         assert_eq!(desc.target_type, "acme/invoice");
-        assert_eq!(desc.docs_url.as_deref(), Some("https://docs.acme.com/invoice"));
+        assert_eq!(
+            desc.docs_url.as_deref(),
+            Some("https://docs.acme.com/invoice")
+        );
         assert!(desc.kats.is_empty());
     }
 
     #[test]
     fn describe_missing_target_type() {
         let body = json!({ "description": "test" });
-        assert!(matches!(parse_describe(&body), Err(MetaChipError::MissingField(_))));
+        assert!(matches!(
+            parse_describe(&body),
+            Err(MetaChipError::MissingField(_))
+        ));
     }
 
     #[test]
@@ -420,7 +457,10 @@ mod tests {
     #[test]
     fn deprecate_missing_reason() {
         let body = json!({ "target_type": "acme/invoice" });
-        assert!(matches!(parse_deprecate(&body), Err(MetaChipError::MissingField(_))));
+        assert!(matches!(
+            parse_deprecate(&body),
+            Err(MetaChipError::MissingField(_))
+        ));
     }
 
     #[test]
@@ -436,9 +476,15 @@ mod tests {
 
     #[test]
     fn meta_chip_error_display() {
-        assert!(MetaChipError::NoKats.to_string().contains("at least one KAT"));
-        assert!(MetaChipError::ReservedPrefix("ubl/".into()).to_string().contains("reserved"));
-        assert!(MetaChipError::MissingField("x".into()).to_string().contains("missing"));
+        assert!(MetaChipError::NoKats
+            .to_string()
+            .contains("at least one KAT"));
+        assert!(MetaChipError::ReservedPrefix("ubl/".into())
+            .to_string()
+            .contains("reserved"));
+        assert!(MetaChipError::MissingField("x".into())
+            .to_string()
+            .contains("missing"));
     }
 
     #[test]

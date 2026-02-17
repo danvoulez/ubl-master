@@ -241,14 +241,26 @@ impl ChipQueryBuilder {
                 }
                 SortField::ExecutionTime => {
                     chips.sort_by(|a, b| match self.sort_order {
-                        SortOrder::Ascending => a.execution_metadata.execution_time_ms.cmp(&b.execution_metadata.execution_time_ms),
-                        SortOrder::Descending => b.execution_metadata.execution_time_ms.cmp(&a.execution_metadata.execution_time_ms),
+                        SortOrder::Ascending => a
+                            .execution_metadata
+                            .execution_time_ms
+                            .cmp(&b.execution_metadata.execution_time_ms),
+                        SortOrder::Descending => b
+                            .execution_metadata
+                            .execution_time_ms
+                            .cmp(&a.execution_metadata.execution_time_ms),
                     });
                 }
                 SortField::FuelConsumed => {
                     chips.sort_by(|a, b| match self.sort_order {
-                        SortOrder::Ascending => a.execution_metadata.fuel_consumed.cmp(&b.execution_metadata.fuel_consumed),
-                        SortOrder::Descending => b.execution_metadata.fuel_consumed.cmp(&a.execution_metadata.fuel_consumed),
+                        SortOrder::Ascending => a
+                            .execution_metadata
+                            .fuel_consumed
+                            .cmp(&b.execution_metadata.fuel_consumed),
+                        SortOrder::Descending => b
+                            .execution_metadata
+                            .fuel_consumed
+                            .cmp(&a.execution_metadata.fuel_consumed),
                     });
                 }
                 SortField::ChipType => {
@@ -277,8 +289,7 @@ pub struct CommonQueries;
 impl CommonQueries {
     /// Get all customer registrations
     pub fn customers() -> ChipQueryBuilder {
-        ChipQueryBuilder::new()
-            .chip_type("ubl/customer.register")
+        ChipQueryBuilder::new().chip_type("ubl/customer.register")
     }
 
     /// Get all email sends in the last 24 hours
@@ -291,8 +302,7 @@ impl CommonQueries {
 
     /// Get all failed operations
     pub fn failed_operations() -> ChipQueryBuilder {
-        ChipQueryBuilder::new()
-            .with_tag("status:failed")
+        ChipQueryBuilder::new().with_tag("status:failed")
     }
 
     /// Get high fuel consumption operations
@@ -304,8 +314,7 @@ impl CommonQueries {
 
     /// Get operations by a specific user
     pub fn user_operations(user_id: &str) -> ChipQueryBuilder {
-        ChipQueryBuilder::new()
-            .with_tag(format!("user:{}", user_id))
+        ChipQueryBuilder::new().with_tag(format!("user:{}", user_id))
     }
 
     /// Get all payments

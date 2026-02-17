@@ -45,8 +45,14 @@ impl std::fmt::Display for PassportError {
         match self {
             PassportError::MissingField(field) => write!(f, "Passport missing field: {}", field),
             PassportError::NotFound(cid) => write!(f, "Passport not found: {}", cid),
-            PassportError::RightDenied { action, passport_id } =>
-                write!(f, "Action '{}' not permitted for passport '{}'", action, passport_id),
+            PassportError::RightDenied {
+                action,
+                passport_id,
+            } => write!(
+                f,
+                "Action '{}' not permitted for passport '{}'",
+                action, passport_id
+            ),
         }
     }
 }
@@ -56,12 +62,14 @@ impl std::error::Error for PassportError {}
 impl AiPassport {
     /// Parse an AiPassport from a chip body (serde_json::Value).
     pub fn from_chip_body(body: &Value) -> Result<Self, PassportError> {
-        let model = body.get("model")
+        let model = body
+            .get("model")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PassportError::MissingField("model".into()))?
             .to_string();
 
-        let provider = body.get("provider")
+        let provider = body
+            .get("provider")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PassportError::MissingField("provider".into()))?
             .to_string();
@@ -74,16 +82,26 @@ impl AiPassport {
 
         let scope = extract_string_array(body, "scope").unwrap_or_default();
 
-        let fuel_limit = body.get("fuel_limit")
+        let fuel_limit = body
+            .get("fuel_limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(100_000);
 
-        let signing_key = body.get("signing_key")
+        let signing_key = body
+            .get("signing_key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PassportError::MissingField("signing_key".into()))?
             .to_string();
 
-        Ok(Self { model, provider, rights, duties, scope, fuel_limit, signing_key })
+        Ok(Self {
+            model,
+            provider,
+            rights,
+            duties,
+            scope,
+            fuel_limit,
+            signing_key,
+        })
     }
 
     /// Check whether this passport grants a specific right.
@@ -198,6 +216,9 @@ mod tests {
         let out = passport.to_chip_body("claude-v1", "a/acme/t/prod");
         assert_eq!(out["@type"], "ubl/ai.passport");
         assert_eq!(out["model"], "claude-sonnet-4");
-        assert_eq!(out["signing_key"], "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK");
+        assert_eq!(
+            out["signing_key"],
+            "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+        );
     }
 }

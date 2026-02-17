@@ -1,11 +1,11 @@
 //! UBL AI-NRF1 — Canonical binary encoding (NRF‑1.1) + CID (BLAKE3)
 //! Enhanced for UBL MASTER with Chip-as-Code support and Universal Envelope.
 
-pub mod nrf;
 pub mod chip_format;
 pub mod envelope;
+pub mod nrf;
 
 // Re-export key types and functions
 pub use chip_format::{ChipFile, ChipMetadata, CompiledChip, PolicyRef};
-pub use nrf::{to_nrf1_bytes, compute_cid, CompileError};
-pub use envelope::{UblEnvelope, EnvelopeError};
+pub use envelope::{EnvelopeError, UblEnvelope};
+pub use nrf::{compute_cid, to_nrf1_bytes, CompileError};

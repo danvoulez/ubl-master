@@ -140,7 +140,7 @@ This section is additive and does not remove any existing items above. It is the
 
 | # | Task | Location | Notes |
 |---|---|---|---|
-| H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_to_P1.md` | Sequence designed, not yet automated. Need: runtime_hash validation, activation_time window, break-glass. |
+| H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_to_P1.md` | ✅ Done. Added `scripts/rollout_p0_p1_check.sh` + `make rollout-check` preflight with runtime hash allowlist validation, activation_time lead-window checks, signature quorum checks, core type coverage checks, and explicit break-glass mode/reporting (`docs/ops/ROLLOUT_AUTOMATION.md`). |
 | H5 | **Newtype pattern** | All crates | ✅ Done. `ubl_types` crate with `Cid`, `Did`, `Kid`, `Nonce`, `ChipType`, `World` newtypes (24 tests). Migrated `StoredChip.cid`/`receipt_cid` → `TypedCid`, `ExecutionMetadata.executor_did` → `TypedDid`, `UnifiedReceipt` fields (`world`/`did`/`kid`/`nonce`/`receipt_cid`/`prev_receipt_cid`), `PipelineReceipt.body_cid` → `TypedCid`. Serde-transparent wire compat preserved. |
 | H6 | **Parse, Don't Validate** | Pipeline + chip types | `auth.rs` does this well (`from_chip_body`). Rest of pipeline still uses raw `serde_json::Value`. Adopt progressively. |
 
@@ -150,14 +150,14 @@ This section is additive and does not remove any existing items above. It is the
 
 | # | Task | Priority | Notes |
 |---|---|---|---|
-| F1 | **PS3 — Runtime certification** | Medium | `RuntimeInfo` struct (`binary_hash`, `env`, `certs`), `SelfAttestation` reports actual binary hash, `runtime_hash` in receipts. Depends on H11. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
+| F1 | **PS3 — Runtime certification** | ✅ Done | `RuntimeInfo` extended with `runtime_hash` + `certs`, signed `SelfAttestation` (`ubl_runtime::runtime_cert`) verifies against DID key, runtime metadata attached to receipts, and gate endpoint `GET /v1/runtime/attestation` exposed in OpenAPI. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
 | F2 | **PS4 — Structured tracing** | Medium | Replace `eprintln!` with `tracing` crate. Structured spans per pipeline stage. Metrics: chips/sec, fuel/chip, deny rate, p99 latency. |
 | F3 | **PS5 — LLM Observer narration** | Low | LLM Observer narrates receipt chains on demand. Already has event bus hooks — needs formatting and endpoint. |
 | F4 | **Property-based testing** | Low | Add proptest for canon edge cases (Unicode, ordering, decimal, null-stripping). |
 | F5 | **UNC-1 numeric opcodes** | Medium | `num.add`, `num.mul`, `num.to_dec`, `num.from_f64_bits`, `num.compare`, etc. for rb_vm. Depends on H9 (UNC-1 core ops). Byte assignments 0x17+ available. See `docs/vm/opcodes_num.md`. |
 | F6 | **UNC-1 KNOCK validation** | Medium | Reject raw `float`, `NaN/Inf`, malformed `@num` objects at KNOCK stage. Add `normalize_numbers_to_unc1(json)` step in `chip_format.rs` before `to_nrf1_bytes`. |
 | F7 | **UNC-1 migration flags** | Low | Gate flags `REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd\|reject`. Compat phase first, then enforce. See `docs/migration/unc1_migration.md`. |
-| F9 | **Key rotation as chip** | Medium | `ubl/key.rotate` chip type. Generates new Ed25519 keypair, emits receipt proving rotation, stores old→new mapping. Admin-only policy. Pattern from `ubl-ultimate-main/services/registry-api/src/admin.rs`. |
+| F9 | **Key rotation as chip** | ✅ Done | `ubl/key.rotate` implemented with typed payload validation, mandatory `key:rotate` capability check, deterministic Ed25519 material derivation during TR, and persisted `ubl/key.map` old→new mapping in ChipStore. Includes replay-safe flow tests. |
 | F10 | **CAS backends for ChipStore** | Low | Add `CasBackend` trait with `Fs(PathBuf)` and `S3 { bucket, prefix }` variants alongside existing in-memory + sled. Pattern from `ubl-ultimate-main/services/registry-api/src/cas.rs`. |
 | F13 | **Post-quantum signature stubs** | Low | Feature-gated `pq_mldsa3` module for ML-DSA3 (Dilithium3) dual-signing alongside Ed25519. Stub now, real when NIST PQC libraries stabilize. |
 

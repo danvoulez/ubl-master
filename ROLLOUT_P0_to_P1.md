@@ -46,3 +46,17 @@ Ancorar o sistema em **P0 (Genesis hardcoded)** e, após verificação, ativar *
 - `policy/update (P1)` aceita com 2‑de‑N.
 - Após P1: fluxo **app→user→tenant→membership→token** passa; inversões falham.
 - Advisor consegue emitir `advisory/opinion` (registrado), mas **publish/pay** exigem 2‑de‑N.
+
+## Automação (H4)
+
+Pré-flight automatizado:
+
+```bash
+RUNTIME_HASH="<sha256:...>" make rollout-check
+```
+
+Script base:
+- `scripts/rollout_p0_p1_check.sh`
+
+Referência operacional:
+- `docs/ops/ROLLOUT_AUTOMATION.md`

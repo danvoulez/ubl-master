@@ -230,6 +230,12 @@ impl ChipStore {
             "tenant_cid",
             "creator_cid",
             "app_cid",
+            "old_did",
+            "old_kid",
+            "new_did",
+            "new_kid",
+            "rotation_chip_cid",
+            "rotation_receipt_cid",
         ] {
             if let Some(value) = chip_data.get(field).and_then(|v| v.as_str()) {
                 tags.push(format!("{}:{}", field, value));
@@ -433,7 +439,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("ubl_chipstore_idx_{}_{}", std::process::id(), nonce));
+        path.push(format!(
+            "ubl_chipstore_idx_{}_{}",
+            std::process::id(),
+            nonce
+        ));
         let path_str = path.to_string_lossy().to_string();
 
         {

@@ -5,10 +5,12 @@ use crate::durable_store::{CommitInput, DurableError, DurableStore, NewOutboxEve
 use crate::event_bus::{EventBus, ReceiptEvent};
 use crate::genesis::genesis_chip_cid;
 use crate::idempotency::{CachedResult, IdempotencyKey, IdempotencyStore};
+use crate::key_rotation::{derive_material, mapping_chip, KeyRotateRequest};
 use crate::ledger::{LedgerWriter, NullLedger};
 use crate::policy_bit::PolicyResult;
 use crate::policy_loader::{ChipRequest as PolicyChipRequest, PolicyLoader, PolicyStorage};
 use crate::reasoning_bit::{Decision, EvalContext};
+use crate::runtime_cert::SelfAttestation;
 use crate::transition_registry::TransitionRegistry;
 use rb_vm::canon::CanonProvider;
 use rb_vm::tlv;
@@ -387,6 +389,17 @@ impl UblPipeline {
         self.advisory_engine = Some(engine);
     }
 
+    /// Snapshot runtime metadata used in receipts and runtime attestation.
+    pub fn runtime_info(&self) -> RuntimeInfo {
+        (*self.runtime_info).clone()
+    }
+
+    /// Issue a signed runtime self-attestation for this running instance.
+    pub fn runtime_self_attestation(&self) -> Result<SelfAttestation, PipelineError> {
+        SelfAttestation::issue(self.runtime_info(), &self.did, &self.kid, &self.signing_key)
+            .map_err(|e| PipelineError::Internal(format!("runtime attestation failed: {}", e)))
+    }
+
     /// Bootstrap the genesis chip: materialize it as a real stored chip in ChipStore.
     ///
     /// This must be called once at startup. The genesis chip is self-signed —
@@ -482,9 +495,9 @@ impl UblPipeline {
             let cached = if let (Some(durable), Some(durable_key)) =
                 (&self.durable_store, durable_idem_key.as_ref())
             {
-                durable
-                    .get_idempotent(durable_key)
-                    .map_err(|e| PipelineError::StorageError(format!("Idempotency lookup: {}", e)))?
+                durable.get_idempotent(durable_key).map_err(|e| {
+                    PipelineError::StorageError(format!("Idempotency lookup: {}", e))
+                })?
             } else {
                 self.idempotency_store.get(key).await
             };
@@ -762,7 +775,8 @@ impl UblPipeline {
         )
         .await;
 
-        // Persist chip to ChipStore (best-effort — never blocks pipeline)
+        // Persist chip to ChipStore.
+        // For `ubl/key.rotate`, mapping persistence is fail-closed.
         if let Some(ref store) = self.chip_store {
             let metadata = ExecutionMetadata {
                 runtime_version: "rb_vm/0.1".to_string(),
@@ -772,16 +786,56 @@ impl UblPipeline {
                 executor_did: ubl_types::Did::new_unchecked(&self.did),
                 reproducible: true,
             };
-            if let Err(e) = store
+            let stored_chip_res = store
                 .store_executed_chip(
                     request.body.clone(),
                     wf_receipt.body_cid.as_str().to_string(),
                     metadata,
                 )
-                .await
-            {
+                .await;
+
+            if request.chip_type == "ubl/key.rotate" {
+                let rotation_chip_cid = stored_chip_res
+                    .map_err(|e| PipelineError::StorageError(format!("key.rotate store: {}", e)))?;
+
+                let rotate_req = KeyRotateRequest::parse(&request.body)
+                    .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
+                let signing_seed = self.signing_key.to_bytes();
+                let material = derive_material(&rotate_req, &request.body, &signing_seed)
+                    .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?;
+
+                let mapping = mapping_chip(
+                    world,
+                    &rotation_chip_cid,
+                    wf_receipt.body_cid.as_str(),
+                    rotate_req.reason.as_deref(),
+                    &material,
+                );
+                let mapping_meta = ExecutionMetadata {
+                    runtime_version: "key_rotation/0.1".to_string(),
+                    execution_time_ms: total_ms,
+                    fuel_consumed: self.fuel_limit,
+                    policies_applied: check.trace.iter().map(|t| t.policy_id.clone()).collect(),
+                    executor_did: ubl_types::Did::new_unchecked(&self.did),
+                    reproducible: true,
+                };
+                store
+                    .store_executed_chip(
+                        mapping,
+                        wf_receipt.body_cid.as_str().to_string(),
+                        mapping_meta,
+                    )
+                    .await
+                    .map_err(|e| {
+                        PipelineError::StorageError(format!("key.rotate mapping store: {}", e))
+                    })?;
+            } else if let Err(e) = stored_chip_res {
                 warn!(error = %e, "ChipStore persist failed (non-fatal)");
             }
+        } else if request.chip_type == "ubl/key.rotate" {
+            return Err(PipelineError::StorageError(
+                "ubl/key.rotate requires ChipStore persistence".to_string(),
+            ));
         }
 
         // Append to audit ledger (best-effort — never blocks pipeline)
@@ -988,9 +1042,15 @@ impl UblPipeline {
 
         // ── Onboarding pre-check: validate body + dependency chain ──
         if crate::auth::is_onboarding_type(&request.chip_type) {
-            // 1. Validate chip body structure
-            crate::auth::validate_onboarding_chip(&request.body)
+            // 1. Parse chip body into typed onboarding payload
+            let onboarding = crate::auth::parse_onboarding_chip(&request.body)
                 .map_err(|e| PipelineError::InvalidChip(format!("Onboarding validation: {}", e)))?;
+            let onboarding = onboarding.ok_or_else(|| {
+                PipelineError::InvalidChip(format!(
+                    "Onboarding type '{}' not recognized",
+                    request.chip_type
+                ))
+            })?;
 
             // 2. Validate @world format
             let world_str = request
@@ -1003,13 +1063,44 @@ impl UblPipeline {
 
             // 3. Check dependency chain against ChipStore
             if let Some(ref store) = self.chip_store {
-                self.check_onboarding_dependencies(
-                    &request.chip_type,
-                    &request.body,
-                    world_str,
-                    store,
-                )
-                .await?;
+                self.check_onboarding_dependencies(&onboarding, &request.body, world_str, store)
+                    .await?;
+            }
+        }
+
+        // ── Key rotation pre-check: typed parse + capability + duplicate guard ──
+        if request.chip_type == "ubl/key.rotate" {
+            let parsed = KeyRotateRequest::parse(&request.body)
+                .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
+            let world_str = request
+                .body
+                .get("@world")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| PipelineError::InvalidChip("Key rotation missing @world".into()))?;
+
+            crate::capability::require_cap(&request.body, "key:rotate", world_str).map_err(
+                |e| PipelineError::InvalidChip(format!("ubl/key.rotate capability: {}", e)),
+            )?;
+
+            if let Some(ref store) = self.chip_store {
+                let existing = store
+                    .query(&ubl_chipstore::ChipQuery {
+                        chip_type: Some("ubl/key.map".to_string()),
+                        tags: vec![format!("old_kid:{}", parsed.old_kid)],
+                        created_after: None,
+                        created_before: None,
+                        executor_did: None,
+                        limit: Some(1),
+                        offset: None,
+                    })
+                    .await
+                    .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
+                if !existing.chips.is_empty() {
+                    return Err(PipelineError::InvalidChip(format!(
+                        "old_kid '{}' already rotated",
+                        parsed.old_kid
+                    )));
+                }
             }
         }
 
@@ -1140,8 +1231,23 @@ impl UblPipeline {
             ));
         }
 
+        let key_rotation = if request.chip_type == "ubl/key.rotate" {
+            let rotate_req = KeyRotateRequest::parse(&request.body)
+                .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
+            let signing_seed = self.signing_key.to_bytes();
+            Some(
+                derive_material(&rotate_req, &request.body, &signing_seed)
+                    .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
         let mut vm_state = serde_json::Map::new();
-        vm_state.insert("fuel_used".to_string(), serde_json::json!(outcome.fuel_used));
+        vm_state.insert(
+            "fuel_used".to_string(),
+            serde_json::json!(outcome.fuel_used),
+        );
         vm_state.insert("steps".to_string(), serde_json::json!(outcome.steps));
         vm_state.insert(
             "result".to_string(),
@@ -1159,7 +1265,10 @@ impl UblPipeline {
             "bytecode_source".to_string(),
             serde_json::json!(resolution.source),
         );
-        vm_state.insert("bytecode_hash".to_string(), serde_json::json!(bytecode_hash));
+        vm_state.insert(
+            "bytecode_hash".to_string(),
+            serde_json::json!(bytecode_hash),
+        );
         vm_state.insert(
             "bytecode_len".to_string(),
             serde_json::json!(resolution.bytecode.len()),
@@ -1187,6 +1296,16 @@ impl UblPipeline {
             "vm_sig_payload_cid": outcome.rc_payload_cid.as_ref().map(|c| c.0.clone()).unwrap_or_default(),
             "vm_state": vm_state
         });
+        let mut tr_body = tr_body;
+        if let Some(rotation) = key_rotation {
+            tr_body["key_rotation"] = serde_json::json!({
+                "old_did": rotation.old_did,
+                "old_kid": rotation.old_kid,
+                "new_did": rotation.new_did,
+                "new_kid": rotation.new_kid,
+                "new_key_cid": rotation.new_key_cid,
+            });
+        }
 
         let nrf1_bytes = ubl_ai_nrf1::to_nrf1_bytes(&tr_body)
             .map_err(|e| PipelineError::Internal(format!("TR CID: {}", e)))?;
@@ -1342,24 +1461,22 @@ impl UblPipeline {
     /// Each type requires its predecessors to already exist in ChipStore.
     async fn check_onboarding_dependencies(
         &self,
-        chip_type: &str,
+        onboarding: &crate::auth::OnboardingChip,
         body: &serde_json::Value,
         world: &str,
         store: &Arc<ubl_chipstore::ChipStore>,
     ) -> Result<(), PipelineError> {
-        match chip_type {
+        match onboarding {
             // App is the root — no dependencies, but slug must be unique.
             // Requires cap.registry:init (P0.3).
-            "ubl/app" => {
+            crate::auth::OnboardingChip::App(app) => {
                 crate::capability::require_cap(body, "registry:init", world).map_err(|e| {
                     PipelineError::InvalidChip(format!("ubl/app capability: {}", e))
                 })?;
-
-                let slug = body.get("slug").and_then(|v| v.as_str()).unwrap_or("");
                 let existing = store
                     .query(&ubl_chipstore::ChipQuery {
                         chip_type: Some("ubl/app".to_string()),
-                        tags: vec![format!("slug:{}", slug)],
+                        tags: vec![format!("slug:{}", app.slug)],
                         created_after: None,
                         created_before: None,
                         executor_did: None,
@@ -1369,12 +1486,14 @@ impl UblPipeline {
                     .await
                     .map_err(|e| PipelineError::Internal(format!("ChipStore query: {}", e)))?;
                 for chip in &existing.chips {
-                    if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(slug) {
+                    if chip.chip_data.get("slug").and_then(|v| v.as_str())
+                        == Some(app.slug.as_str())
+                    {
                         // Check if this app has been revoked
                         if !self.is_revoked(chip.cid.as_str(), store).await? {
                             return Err(PipelineError::InvalidChip(format!(
                                 "App slug '{}' already registered",
-                                slug
+                                app.slug
                             )));
                         }
                     }
@@ -1383,7 +1502,7 @@ impl UblPipeline {
 
             // User requires a valid app in @world.
             // First user for an app requires cap.registry:init (P0.3).
-            "ubl/user" => {
+            crate::auth::OnboardingChip::User(_) => {
                 let scope = crate::auth::WorldScope::parse(world)
                     .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
                 self.require_app_exists(&scope.app, store).await?;
@@ -1413,73 +1532,51 @@ impl UblPipeline {
             }
 
             // Tenant requires: app exists + creator_cid references a valid user
-            "ubl/tenant" => {
+            crate::auth::OnboardingChip::Tenant(tenant) => {
                 let scope = crate::auth::WorldScope::parse(world)
                     .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
                 self.require_app_exists(&scope.app, store).await?;
-
-                let creator_cid = body
-                    .get("creator_cid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                self.require_chip_exists(creator_cid, "ubl/user", store)
+                self.require_chip_exists(&tenant.creator_cid, "ubl/user", store)
                     .await?;
             }
 
             // Membership requires: user_cid and tenant_cid both exist.
             // Requires cap.membership:grant (P0.4).
-            "ubl/membership" => {
+            crate::auth::OnboardingChip::Membership(membership) => {
                 crate::capability::require_cap(body, "membership:grant", world).map_err(|e| {
                     PipelineError::InvalidChip(format!("ubl/membership capability: {}", e))
                 })?;
-
-                let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(user_cid, "ubl/user", store)
+                self.require_chip_exists(&membership.user_cid, "ubl/user", store)
                     .await?;
-
-                let tenant_cid = body
-                    .get("tenant_cid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                self.require_chip_exists(tenant_cid, "ubl/tenant", store)
+                self.require_chip_exists(&membership.tenant_cid, "ubl/tenant", store)
                     .await?;
             }
 
             // Token requires: user_cid exists
-            "ubl/token" => {
-                let user_cid = body.get("user_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(user_cid, "ubl/user", store)
+            crate::auth::OnboardingChip::Token(token) => {
+                self.require_chip_exists(&token.user_cid, "ubl/user", store)
                     .await?;
             }
 
             // Revoke requires: target_cid exists (any type) + actor_cid exists.
             // Requires cap.revoke:execute (P0.4).
-            "ubl/revoke" => {
+            crate::auth::OnboardingChip::Revoke(revoke) => {
                 crate::capability::require_cap(body, "revoke:execute", world).map_err(|e| {
                     PipelineError::InvalidChip(format!("ubl/revoke capability: {}", e))
                 })?;
-
-                let target_cid = body
-                    .get("target_cid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
                 if !store
-                    .exists(target_cid)
+                    .exists(&revoke.target_cid)
                     .await
                     .map_err(|e| PipelineError::Internal(format!("ChipStore: {}", e)))?
                 {
                     return Err(PipelineError::DependencyMissing(format!(
                         "Revoke target '{}' not found",
-                        target_cid
+                        revoke.target_cid
                     )));
                 }
-
-                let actor_cid = body.get("actor_cid").and_then(|v| v.as_str()).unwrap_or("");
-                self.require_chip_exists(actor_cid, "ubl/user", store)
+                self.require_chip_exists(&revoke.actor_cid, "ubl/user", store)
                     .await?;
             }
-
-            _ => {} // not an onboarding type
         }
 
         Ok(())
@@ -1615,6 +1712,20 @@ mod tests {
     use crate::transition_registry::TrBytecodeProfile;
     use serde_json::json;
 
+    fn signed_capability(action: &str, audience: &str, sk: &SigningKey) -> serde_json::Value {
+        let did = ubl_kms::did_from_verifying_key(&sk.verifying_key());
+        let mut payload = serde_json::json!({
+            "action": action,
+            "audience": audience,
+            "issued_by": did,
+            "issued_at": chrono::Utc::now().checked_sub_signed(chrono::Duration::minutes(1)).unwrap().to_rfc3339(),
+            "expires_at": chrono::Utc::now().checked_add_signed(chrono::Duration::hours(1)).unwrap().to_rfc3339(),
+        });
+        let sig = ubl_kms::sign_canonical(sk, &payload, ubl_kms::domain::CAPABILITY).unwrap();
+        payload["signature"] = serde_json::json!(sig);
+        payload
+    }
+
     #[tokio::test]
     async fn pipeline_allow_flow_with_real_vm() {
         let storage = InMemoryPolicyStorage::new();
@@ -1736,6 +1847,124 @@ mod tests {
     }
 
     #[test]
+    fn runtime_self_attestation_is_signed_and_verifiable() {
+        let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
+        let att = pipeline.runtime_self_attestation().unwrap();
+        assert_eq!(
+            att.runtime_hash,
+            pipeline.runtime_info().runtime_hash().to_string()
+        );
+        assert!(att.verify().unwrap());
+    }
+
+    #[tokio::test]
+    async fn key_rotate_requires_capability() {
+        use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+        let policy_storage = InMemoryPolicyStorage::new();
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend));
+        let pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store);
+
+        let old_sk = ubl_kms::generate_signing_key();
+        let old_vk = old_sk.verifying_key();
+        let old_did = ubl_kms::did_from_verifying_key(&old_vk);
+        let old_kid = ubl_kms::kid_from_verifying_key(&old_vk);
+
+        let request = ChipRequest {
+            chip_type: "ubl/key.rotate".to_string(),
+            body: json!({
+                "@type":"ubl/key.rotate",
+                "@id":"rot-missing-cap",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "old_did": old_did,
+                "old_kid": old_kid,
+                "reason": "compromise"
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let err = pipeline.process_chip(request).await.unwrap_err();
+        assert!(matches!(err, PipelineError::InvalidChip(_)));
+        assert!(err.to_string().contains("key.rotate capability"));
+    }
+
+    #[tokio::test]
+    async fn key_rotate_persists_mapping_and_replay_is_stable() {
+        use ubl_chipstore::{ChipQuery, ChipStore, InMemoryBackend};
+
+        let policy_storage = InMemoryPolicyStorage::new();
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend));
+        let pipeline = UblPipeline::with_chip_store(Box::new(policy_storage), chip_store.clone());
+
+        let old_sk = ubl_kms::generate_signing_key();
+        let old_vk = old_sk.verifying_key();
+        let old_did = ubl_kms::did_from_verifying_key(&old_vk);
+        let old_kid = ubl_kms::kid_from_verifying_key(&old_vk);
+
+        let cap_sk = ubl_kms::generate_signing_key();
+        let cap = signed_capability("key:rotate", "a/acme", &cap_sk);
+
+        let request = ChipRequest {
+            chip_type: "ubl/key.rotate".to_string(),
+            body: json!({
+                "@type":"ubl/key.rotate",
+                "@id":"rot-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "old_did": old_did,
+                "old_kid": old_kid,
+                "reason": "routine",
+                "@cap": cap
+            }),
+            parents: vec![],
+            operation: Some("create".to_string()),
+        };
+
+        let first = pipeline.process_chip(request.clone()).await.unwrap();
+        assert!(matches!(first.decision, Decision::Allow));
+        assert!(!first.replayed);
+
+        let mappings = chip_store
+            .query(&ChipQuery {
+                chip_type: Some("ubl/key.map".to_string()),
+                tags: vec![format!("old_kid:{}", old_kid)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: None,
+                offset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mappings.total_count, 1);
+        let map = &mappings.chips[0].chip_data;
+        assert_eq!(map["old_kid"].as_str(), Some(old_kid.as_str()));
+        assert!(map["new_kid"].as_str().is_some());
+        assert_ne!(map["new_kid"].as_str(), Some(old_kid.as_str()));
+
+        let second = pipeline.process_chip(request).await.unwrap();
+        assert!(second.replayed);
+
+        let mappings_after = chip_store
+            .query(&ChipQuery {
+                chip_type: Some("ubl/key.map".to_string()),
+                tags: vec![format!("old_kid:{}", old_kid)],
+                created_after: None,
+                created_before: None,
+                executor_did: None,
+                limit: None,
+                offset: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mappings_after.total_count, 1);
+    }
+
+    #[test]
     fn tr_profile_selection_by_chip_type() {
         let registry = TransitionRegistry::default();
         assert_eq!(
@@ -1786,9 +2015,7 @@ mod tests {
                 "abi_version": "1.0"
             }
         });
-        assert!(AdapterRuntimeInfo::parse_optional(&good)
-            .unwrap()
-            .is_some());
+        assert!(AdapterRuntimeInfo::parse_optional(&good).unwrap().is_some());
 
         let bad_hash = json!({
             "adapter": {

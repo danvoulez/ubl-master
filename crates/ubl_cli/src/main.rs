@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use ubl_ai_nrf1::{ChipFile, to_nrf1_bytes, compute_cid};
+use ubl_ai_nrf1::{compute_cid, to_nrf1_bytes, ChipFile};
 
 #[derive(Parser)]
 #[command(name = "ublx")]
@@ -91,7 +91,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Build { input, output } => cmd_build(&input, output)?,
         Commands::Cid { file } => cmd_cid(&file)?,
         Commands::Explain { target } => cmd_explain(&target)?,
-        Commands::Search { chip_type, tag, after, before, limit } => {
+        Commands::Search {
+            chip_type,
+            tag,
+            after,
+            before,
+            limit,
+        } => {
             cmd_search(chip_type, tag, after, before, limit).await?;
         }
         Commands::Fixture { output_dir, count } => cmd_fixture(&output_dir, count)?,
@@ -176,8 +182,14 @@ fn cmd_explain(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(trace) = receipt_json.get("policy_trace").and_then(|v| v.as_array()) {
         println!("\n--- Policy Trace ({} policies) ---", trace.len());
         for (i, entry) in trace.iter().enumerate() {
-            let policy_id = entry.get("policy_id").and_then(|v| v.as_str()).unwrap_or("?");
-            let decision = entry.get("decision").and_then(|v| v.as_str()).unwrap_or("?");
+            let policy_id = entry
+                .get("policy_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let decision = entry
+                .get("decision")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let marker = match decision {
                 "allow" => "PASS",
                 "deny" => "DENY",
@@ -230,7 +242,7 @@ async fn cmd_search(
     before: Option<String>,
     limit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use ubl_chipstore::{ChipStore, InMemoryBackend, ChipQuery};
+    use ubl_chipstore::{ChipQuery, ChipStore, InMemoryBackend};
 
     // In a real deployment, this would connect to the running ChipStore.
     // For now, demonstrate the query API with an in-memory store.
@@ -251,7 +263,11 @@ async fn cmd_search(
     println!("  Query: {}", serde_json::to_string_pretty(&query)?);
 
     let results = store.query(&query).await?;
-    println!("\n  Found: {} chips (total: {})", results.chips.len(), results.total_count);
+    println!(
+        "\n  Found: {} chips (total: {})",
+        results.chips.len(),
+        results.total_count
+    );
 
     for chip in &results.chips {
         println!("  ---");
@@ -272,7 +288,13 @@ async fn cmd_search(
 fn cmd_fixture(output_dir: &str, count: usize) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(output_dir)?;
 
-    let chip_types = ["ubl/user", "ubl/token", "ubl/policy", "ubl/app", "ubl/advisory"];
+    let chip_types = [
+        "ubl/user",
+        "ubl/token",
+        "ubl/policy",
+        "ubl/app",
+        "ubl/advisory",
+    ];
 
     for i in 0..count {
         let chip_type = chip_types[i % chip_types.len()];
@@ -329,10 +351,20 @@ fn cmd_fixture(output_dir: &str, count: usize) -> Result<(), Box<dyn std::error:
         let receipt_path = format!("{}/receipt-{:04}.json", output_dir, i);
         std::fs::write(&receipt_path, serde_json::to_string_pretty(&receipt)?)?;
 
-        println!("  [{}/{}] {} type={} cid={}", i + 1, count, id, chip_type, &cid[..20]);
+        println!(
+            "  [{}/{}] {} type={} cid={}",
+            i + 1,
+            count,
+            id,
+            chip_type,
+            &cid[..20]
+        );
     }
 
-    println!("\nGenerated {} chip + receipt fixture pairs in {}/", count, output_dir);
+    println!(
+        "\nGenerated {} chip + receipt fixture pairs in {}/",
+        count, output_dir
+    );
     Ok(())
 }
 

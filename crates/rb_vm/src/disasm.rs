@@ -44,7 +44,11 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
             if payload.len() <= 32 {
                 format!("({} bytes: {})", payload.len(), hex_preview(payload))
             } else {
-                format!("({} bytes: {}...)", payload.len(), hex_preview(&payload[..32]))
+                format!(
+                    "({} bytes: {}...)",
+                    payload.len(),
+                    hex_preview(&payload[..32])
+                )
             }
         }
         Opcode::PushInput if payload.len() == 2 => {
@@ -63,12 +67,10 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
             };
             format!("({})", cmp)
         }
-        Opcode::JsonGetKey => {
-            match std::str::from_utf8(payload) {
-                Ok(s) => format!("(\"{}\")", s),
-                Err(_) => format!("({} bytes, non-utf8)", payload.len()),
-            }
-        }
+        Opcode::JsonGetKey => match std::str::from_utf8(payload) {
+            Ok(s) => format!("(\"{}\")", s),
+            Err(_) => format!("({} bytes, non-utf8)", payload.len()),
+        },
         _ if !payload.is_empty() => {
             format!("({} bytes)", payload.len())
         }
@@ -77,7 +79,11 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
 }
 
 fn hex_preview(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    bytes
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(test)]
@@ -117,10 +123,22 @@ mod tests {
 
     #[test]
     fn disasm_cmp_operators() {
-        for (byte, name) in [(0, "EQ"), (1, "NE"), (2, "LT"), (3, "LE"), (4, "GT"), (5, "GE")] {
+        for (byte, name) in [
+            (0, "EQ"),
+            (1, "NE"),
+            (2, "LT"),
+            (3, "LE"),
+            (4, "GT"),
+            (5, "GE"),
+        ] {
             let bc = encode_instr(Opcode::CmpI64, &[byte]);
             let out = disassemble(&bc).unwrap();
-            assert!(out.contains(name), "expected {} in output for byte {}", name, byte);
+            assert!(
+                out.contains(name),
+                "expected {} in output for byte {}",
+                name,
+                byte
+            );
         }
     }
 
@@ -156,7 +174,7 @@ mod tests {
     #[test]
     fn disasm_offsets_correct() {
         let mut bc = Vec::new();
-        bc.extend(encode_instr(Opcode::Drop, &[]));        // offset 0, size 3
+        bc.extend(encode_instr(Opcode::Drop, &[])); // offset 0, size 3
         bc.extend(encode_instr(Opcode::ConstI64, &1i64.to_be_bytes())); // offset 3, size 11
 
         let out = disassemble(&bc).unwrap();

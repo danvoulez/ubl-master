@@ -42,7 +42,12 @@ pub enum EnvelopeError {
 
 impl UblEnvelope {
     /// Create a new envelope with all four anchors.
-    pub fn new(r#type: impl Into<String>, id: impl Into<String>, ver: impl Into<String>, world: impl Into<String>) -> Result<Self, EnvelopeError> {
+    pub fn new(
+        r#type: impl Into<String>,
+        id: impl Into<String>,
+        ver: impl Into<String>,
+        world: impl Into<String>,
+    ) -> Result<Self, EnvelopeError> {
         let envelope = Self {
             r#type: r#type.into(),
             id: id.into(),
@@ -78,7 +83,13 @@ impl UblEnvelope {
             // a/{app}
             2 if parts[0] == "a" && !parts[1].is_empty() => Ok(()),
             // a/{app}/t/{tenant}
-            4 if parts[0] == "a" && parts[2] == "t" && !parts[1].is_empty() && !parts[3].is_empty() => Ok(()),
+            4 if parts[0] == "a"
+                && parts[2] == "t"
+                && !parts[1].is_empty()
+                && !parts[3].is_empty() =>
+            {
+                Ok(())
+            }
             _ => Err(EnvelopeError::InvalidWorld(world.to_string())),
         }
     }
@@ -95,7 +106,9 @@ impl UblEnvelope {
 
     /// Extract an envelope from a JSON object, validating anchor presence and key order.
     pub fn from_json(value: &Value) -> Result<Self, EnvelopeError> {
-        let obj = value.as_object().ok_or(EnvelopeError::MissingAnchor("@type"))?;
+        let obj = value
+            .as_object()
+            .ok_or(EnvelopeError::MissingAnchor("@type"))?;
 
         // Validate key ordering: @type must be first, @id must be second
         let keys: Vec<&String> = obj.keys().collect();
@@ -108,24 +121,33 @@ impl UblEnvelope {
             return Err(EnvelopeError::IdNotSecond(found));
         }
 
-        let r#type = obj.get("@type")
+        let r#type = obj
+            .get("@type")
             .and_then(|v| v.as_str())
             .ok_or(EnvelopeError::MissingAnchor("@type"))?
             .to_string();
-        let id = obj.get("@id")
+        let id = obj
+            .get("@id")
             .and_then(|v| v.as_str())
             .ok_or(EnvelopeError::MissingAnchor("@id"))?
             .to_string();
-        let ver = obj.get("@ver")
+        let ver = obj
+            .get("@ver")
             .and_then(|v| v.as_str())
             .ok_or(EnvelopeError::MissingAnchor("@ver"))?
             .to_string();
-        let world = obj.get("@world")
+        let world = obj
+            .get("@world")
             .and_then(|v| v.as_str())
             .ok_or(EnvelopeError::MissingAnchor("@world"))?
             .to_string();
 
-        let envelope = Self { r#type, id, ver, world };
+        let envelope = Self {
+            r#type,
+            id,
+            ver,
+            world,
+        };
         envelope.validate()?;
         Ok(envelope)
     }
@@ -163,7 +185,11 @@ impl UblEnvelope {
 
 impl fmt::Display for UblEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{} (ver={}, world={})", self.r#type, self.id, self.ver, self.world)
+        write!(
+            f,
+            "{}:{} (ver={}, world={})",
+            self.r#type, self.id, self.ver, self.world
+        )
     }
 }
 

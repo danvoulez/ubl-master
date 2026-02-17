@@ -58,9 +58,21 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/app".into(),
             description: "Register a new application".into(),
             required_fields: vec![
-                FieldSpec { name: "slug".into(), field_type: "string".into(), description: "Unique app slug".into() },
-                FieldSpec { name: "display_name".into(), field_type: "string".into(), description: "Display name".into() },
-                FieldSpec { name: "owner_did".into(), field_type: "string".into(), description: "Owner DID".into() },
+                FieldSpec {
+                    name: "slug".into(),
+                    field_type: "string".into(),
+                    description: "Unique app slug".into(),
+                },
+                FieldSpec {
+                    name: "display_name".into(),
+                    field_type: "string".into(),
+                    description: "Display name".into(),
+                },
+                FieldSpec {
+                    name: "owner_did".into(),
+                    field_type: "string".into(),
+                    description: "Owner DID".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: Some("registry:init".into()),
@@ -69,8 +81,16 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/user".into(),
             description: "Register a user (first user requires cap)".into(),
             required_fields: vec![
-                FieldSpec { name: "did".into(), field_type: "string".into(), description: "User DID".into() },
-                FieldSpec { name: "display_name".into(), field_type: "string".into(), description: "Display name".into() },
+                FieldSpec {
+                    name: "did".into(),
+                    field_type: "string".into(),
+                    description: "User DID".into(),
+                },
+                FieldSpec {
+                    name: "display_name".into(),
+                    field_type: "string".into(),
+                    description: "Display name".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: None,
@@ -79,9 +99,21 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/tenant".into(),
             description: "Create a tenant (circle/workspace)".into(),
             required_fields: vec![
-                FieldSpec { name: "slug".into(), field_type: "string".into(), description: "Tenant slug".into() },
-                FieldSpec { name: "display_name".into(), field_type: "string".into(), description: "Display name".into() },
-                FieldSpec { name: "creator_cid".into(), field_type: "string".into(), description: "CID of creating user".into() },
+                FieldSpec {
+                    name: "slug".into(),
+                    field_type: "string".into(),
+                    description: "Tenant slug".into(),
+                },
+                FieldSpec {
+                    name: "display_name".into(),
+                    field_type: "string".into(),
+                    description: "Display name".into(),
+                },
+                FieldSpec {
+                    name: "creator_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of creating user".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: None,
@@ -90,9 +122,21 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/membership".into(),
             description: "Grant membership to a user in a tenant".into(),
             required_fields: vec![
-                FieldSpec { name: "user_cid".into(), field_type: "string".into(), description: "CID of user".into() },
-                FieldSpec { name: "tenant_cid".into(), field_type: "string".into(), description: "CID of tenant".into() },
-                FieldSpec { name: "role".into(), field_type: "string".into(), description: "Role (admin, member, viewer)".into() },
+                FieldSpec {
+                    name: "user_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of user".into(),
+                },
+                FieldSpec {
+                    name: "tenant_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of tenant".into(),
+                },
+                FieldSpec {
+                    name: "role".into(),
+                    field_type: "string".into(),
+                    description: "Role (admin, member, viewer)".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: Some("membership:grant".into()),
@@ -101,10 +145,26 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/token".into(),
             description: "Issue an access token for a user".into(),
             required_fields: vec![
-                FieldSpec { name: "user_cid".into(), field_type: "string".into(), description: "CID of user".into() },
-                FieldSpec { name: "scope".into(), field_type: "array".into(), description: "Token scopes".into() },
-                FieldSpec { name: "expires_at".into(), field_type: "string".into(), description: "RFC-3339 expiration".into() },
-                FieldSpec { name: "kid".into(), field_type: "string".into(), description: "Key ID".into() },
+                FieldSpec {
+                    name: "user_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of user".into(),
+                },
+                FieldSpec {
+                    name: "scope".into(),
+                    field_type: "array".into(),
+                    description: "Token scopes".into(),
+                },
+                FieldSpec {
+                    name: "expires_at".into(),
+                    field_type: "string".into(),
+                    description: "RFC-3339 expiration".into(),
+                },
+                FieldSpec {
+                    name: "kid".into(),
+                    field_type: "string".into(),
+                    description: "Key ID".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: None,
@@ -113,20 +173,62 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             chip_type: "ubl/revoke".into(),
             description: "Revoke any chip by CID".into(),
             required_fields: vec![
-                FieldSpec { name: "target_cid".into(), field_type: "string".into(), description: "CID of chip to revoke".into() },
-                FieldSpec { name: "actor_cid".into(), field_type: "string".into(), description: "CID of revoking user".into() },
-                FieldSpec { name: "reason".into(), field_type: "string".into(), description: "Revocation reason".into() },
+                FieldSpec {
+                    name: "target_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of chip to revoke".into(),
+                },
+                FieldSpec {
+                    name: "actor_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of revoking user".into(),
+                },
+                FieldSpec {
+                    name: "reason".into(),
+                    field_type: "string".into(),
+                    description: "Revocation reason".into(),
+                },
             ],
             optional_fields: vec![],
             required_cap: Some("revoke:execute".into()),
+        },
+        ChipTypeSpec {
+            chip_type: "ubl/key.rotate".into(),
+            description: "Rotate signing key material under admin policy".into(),
+            required_fields: vec![
+                FieldSpec {
+                    name: "old_did".into(),
+                    field_type: "string".into(),
+                    description: "Current DID being rotated".into(),
+                },
+                FieldSpec {
+                    name: "old_kid".into(),
+                    field_type: "string".into(),
+                    description: "Current key id being rotated".into(),
+                },
+            ],
+            optional_fields: vec![FieldSpec {
+                name: "reason".into(),
+                field_type: "string".into(),
+                description: "Rotation reason".into(),
+            }],
+            required_cap: Some("key:rotate".into()),
         },
         ChipTypeSpec {
             chip_type: "ubl/document".into(),
             description: "Submit a document for attestation".into(),
             required_fields: vec![],
             optional_fields: vec![
-                FieldSpec { name: "content".into(), field_type: "string".into(), description: "Document content".into() },
-                FieldSpec { name: "content_cid".into(), field_type: "string".into(), description: "CID of external content".into() },
+                FieldSpec {
+                    name: "content".into(),
+                    field_type: "string".into(),
+                    description: "Document content".into(),
+                },
+                FieldSpec {
+                    name: "content_cid".into(),
+                    field_type: "string".into(),
+                    description: "CID of external content".into(),
+                },
             ],
             required_cap: None,
         },
@@ -141,10 +243,7 @@ impl GateManifest {
         // POST /v1/chips
         let mut chip_schemas = serde_json::Map::new();
         for ct in &self.chip_types {
-            chip_schemas.insert(
-                ct.chip_type.replace('/', "_"),
-                self.chip_type_to_schema(ct),
-            );
+            chip_schemas.insert(ct.chip_type.replace('/', "_"), self.chip_type_to_schema(ct));
         }
 
         paths.insert("/v1/chips".into(), json!({
@@ -176,58 +275,82 @@ impl GateManifest {
         }));
 
         // GET /v1/chips/{cid}
-        paths.insert("/v1/chips/{cid}".into(), json!({
-            "get": {
-                "operationId": "getChip",
-                "summary": "Retrieve a chip by CID (ETag/If-None-Match supported)",
-                "parameters": [{
-                    "name": "cid",
-                    "in": "path",
-                    "required": true,
-                    "schema": { "type": "string", "pattern": "^b3:" }
-                }],
-                "responses": {
-                    "200": { "description": "Chip data", "headers": {
-                        "ETag": { "schema": { "type": "string" } },
-                        "Cache-Control": { "schema": { "type": "string" } }
-                    }},
-                    "304": { "description": "Not Modified (ETag match)" },
-                    "404": { "description": "Chip not found" }
+        paths.insert(
+            "/v1/chips/{cid}".into(),
+            json!({
+                "get": {
+                    "operationId": "getChip",
+                    "summary": "Retrieve a chip by CID (ETag/If-None-Match supported)",
+                    "parameters": [{
+                        "name": "cid",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string", "pattern": "^b3:" }
+                    }],
+                    "responses": {
+                        "200": { "description": "Chip data", "headers": {
+                            "ETag": { "schema": { "type": "string" } },
+                            "Cache-Control": { "schema": { "type": "string" } }
+                        }},
+                        "304": { "description": "Not Modified (ETag match)" },
+                        "404": { "description": "Chip not found" }
+                    }
                 }
-            }
-        }));
+            }),
+        );
 
         // GET /v1/chips/{cid}/verify
-        paths.insert("/v1/chips/{cid}/verify".into(), json!({
-            "get": {
-                "operationId": "verifyChip",
-                "summary": "Verify chip integrity by recomputing CID",
-                "parameters": [{
-                    "name": "cid", "in": "path", "required": true,
-                    "schema": { "type": "string" }
-                }],
-                "responses": {
-                    "200": { "description": "Verification result" },
-                    "404": { "description": "Chip not found" }
+        paths.insert(
+            "/v1/chips/{cid}/verify".into(),
+            json!({
+                "get": {
+                    "operationId": "verifyChip",
+                    "summary": "Verify chip integrity by recomputing CID",
+                    "parameters": [{
+                        "name": "cid", "in": "path", "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": { "description": "Verification result" },
+                        "404": { "description": "Chip not found" }
+                    }
                 }
-            }
-        }));
+            }),
+        );
+
+        // GET /v1/runtime/attestation
+        paths.insert(
+            "/v1/runtime/attestation".into(),
+            json!({
+                "get": {
+                    "operationId": "getRuntimeAttestation",
+                    "summary": "Get signed runtime self-attestation for the running gate instance",
+                    "responses": {
+                        "200": { "description": "Runtime self-attestation" },
+                        "500": { "description": "Attestation generation failed" }
+                    }
+                }
+            }),
+        );
 
         // GET /v1/receipts/{cid}/trace
-        paths.insert("/v1/receipts/{cid}/trace".into(), json!({
-            "get": {
-                "operationId": "getReceiptTrace",
-                "summary": "Retrieve policy trace for a receipt",
-                "parameters": [{
-                    "name": "cid", "in": "path", "required": true,
-                    "schema": { "type": "string" }
-                }],
-                "responses": {
-                    "200": { "description": "Receipt trace" },
-                    "404": { "description": "Receipt not found" }
+        paths.insert(
+            "/v1/receipts/{cid}/trace".into(),
+            json!({
+                "get": {
+                    "operationId": "getReceiptTrace",
+                    "summary": "Retrieve policy trace for a receipt",
+                    "parameters": [{
+                        "name": "cid", "in": "path", "required": true,
+                        "schema": { "type": "string" }
+                    }],
+                    "responses": {
+                        "200": { "description": "Receipt trace" },
+                        "404": { "description": "Receipt not found" }
+                    }
                 }
-            }
-        }));
+            }),
+        );
 
         json!({
             "openapi": "3.1.0",
@@ -376,41 +499,56 @@ impl GateManifest {
             "@world".to_string(),
         ];
 
-        properties.insert("@type".into(), json!({"type": "string", "const": ct.chip_type}));
+        properties.insert(
+            "@type".into(),
+            json!({"type": "string", "const": ct.chip_type}),
+        );
         properties.insert("@id".into(), json!({"type": "string"}));
         properties.insert("@ver".into(), json!({"type": "string"}));
-        properties.insert("@world".into(), json!({"type": "string", "pattern": "^a/[^/]+(/t/[^/]+)?$"}));
+        properties.insert(
+            "@world".into(),
+            json!({"type": "string", "pattern": "^a/[^/]+(/t/[^/]+)?$"}),
+        );
 
         if ct.required_cap.is_some() {
-            properties.insert("@cap".into(), json!({
-                "type": "object",
-                "description": "Required capability",
-                "properties": {
-                    "action": { "type": "string" },
-                    "audience": { "type": "string" },
-                    "issued_by": { "type": "string" },
-                    "issued_at": { "type": "string", "format": "date-time" },
-                    "expires_at": { "type": "string", "format": "date-time" },
-                    "signature": { "type": "string" }
-                },
-                "required": ["action", "audience", "issued_by", "signature"]
-            }));
+            properties.insert(
+                "@cap".into(),
+                json!({
+                    "type": "object",
+                    "description": "Required capability",
+                    "properties": {
+                        "action": { "type": "string" },
+                        "audience": { "type": "string" },
+                        "issued_by": { "type": "string" },
+                        "issued_at": { "type": "string", "format": "date-time" },
+                        "expires_at": { "type": "string", "format": "date-time" },
+                        "signature": { "type": "string" }
+                    },
+                    "required": ["action", "audience", "issued_by", "signature"]
+                }),
+            );
             required.push("@cap".to_string());
         }
 
         for field in &ct.required_fields {
-            properties.insert(field.name.clone(), json!({
-                "type": field.field_type,
-                "description": field.description
-            }));
+            properties.insert(
+                field.name.clone(),
+                json!({
+                    "type": field.field_type,
+                    "description": field.description
+                }),
+            );
             required.push(field.name.clone());
         }
 
         for field in &ct.optional_fields {
-            properties.insert(field.name.clone(), json!({
-                "type": field.field_type,
-                "description": field.description
-            }));
+            properties.insert(
+                field.name.clone(),
+                json!({
+                    "type": field.field_type,
+                    "description": field.description
+                }),
+            );
         }
 
         json!({
@@ -436,6 +574,7 @@ mod tests {
         assert!(names.contains(&"ubl/membership"));
         assert!(names.contains(&"ubl/token"));
         assert!(names.contains(&"ubl/revoke"));
+        assert!(names.contains(&"ubl/key.rotate"));
         assert!(names.contains(&"ubl/document"));
     }
 
@@ -456,6 +595,7 @@ mod tests {
         assert!(paths.contains_key("/v1/chips"));
         assert!(paths.contains_key("/v1/chips/{cid}"));
         assert!(paths.contains_key("/v1/chips/{cid}/verify"));
+        assert!(paths.contains_key("/v1/runtime/attestation"));
         assert!(paths.contains_key("/v1/receipts/{cid}/trace"));
     }
 
@@ -487,7 +627,10 @@ mod tests {
         let user_schema = &spec["components"]["schemas"]["ubl_user"];
         let required = user_schema["required"].as_array().unwrap();
         let required_strs: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(!required_strs.contains(&"@cap"), "ubl/user should not require @cap in schema");
+        assert!(
+            !required_strs.contains(&"@cap"),
+            "ubl/user should not require @cap in schema"
+        );
     }
 
     #[test]
@@ -549,10 +692,11 @@ mod tests {
         let m = GateManifest::default();
         let wm = m.to_webmcp_manifest();
         let types = wm["chip_types"].as_array().unwrap();
-        assert_eq!(types.len(), 7);
+        assert_eq!(types.len(), 8);
         let type_names: Vec<&str> = types.iter().map(|t| t["type"].as_str().unwrap()).collect();
         assert!(type_names.contains(&"ubl/app"));
         assert!(type_names.contains(&"ubl/revoke"));
+        assert!(type_names.contains(&"ubl/key.rotate"));
     }
 
     #[test]

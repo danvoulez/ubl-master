@@ -147,6 +147,10 @@ impl BuildMeta {
 pub struct RuntimeInfo {
     /// BLAKE3 hash of the running binary (hex-encoded, "b3:..." prefix)
     pub binary_hash: String,
+    /// Alias for runtime binary hash used by policy/rollout tooling.
+    /// Kept alongside `binary_hash` for wire compatibility during migration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime_hash: String,
     /// Crate version from Cargo.toml
     pub version: String,
     /// Build provenance (compiler, OS, git commit, etc.)
@@ -154,6 +158,9 @@ pub struct RuntimeInfo {
     /// Arbitrary environment labels (e.g. "cluster": "us-east-1")
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub env: BTreeMap<String, String>,
+    /// Runtime certification references (e.g. sbom CID, slsa statement CID).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub certs: BTreeMap<String, String>,
 }
 
 impl RuntimeInfo {
@@ -172,20 +179,24 @@ impl RuntimeInfo {
         };
 
         Self {
+            runtime_hash: binary_hash.clone(),
             binary_hash,
             version: env!("CARGO_PKG_VERSION").to_string(),
             build: BuildMeta::capture(),
-            env: BTreeMap::new(),
+            env: capture_labeled_map("UBL_RUNTIME_ENV_LABELS", "UBL_RUNTIME_ENV_"),
+            certs: capture_labeled_map("UBL_RUNTIME_CERTS", "UBL_RUNTIME_CERT_"),
         }
     }
 
     /// Create a RuntimeInfo with explicit values (for testing or remote attestation).
     pub fn new(binary_hash: &str, version: &str) -> Self {
         Self {
+            runtime_hash: binary_hash.to_string(),
             binary_hash: binary_hash.to_string(),
             version: version.to_string(),
             build: BuildMeta::capture(),
             env: BTreeMap::new(),
+            certs: BTreeMap::new(),
         }
     }
 
@@ -194,6 +205,51 @@ impl RuntimeInfo {
         self.env.insert(key.to_string(), value.to_string());
         self
     }
+
+    /// Add a runtime certification label.
+    pub fn with_cert(mut self, key: &str, value: &str) -> Self {
+        self.certs.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Canonical runtime hash accessor with backward-compatible fallback.
+    pub fn runtime_hash(&self) -> &str {
+        if self.runtime_hash.is_empty() {
+            &self.binary_hash
+        } else {
+            &self.runtime_hash
+        }
+    }
+}
+
+fn capture_labeled_map(csv_env: &str, prefix_env: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+
+    if let Ok(raw) = std::env::var(csv_env) {
+        for pair in raw.split(',') {
+            let trimmed = pair.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+                if !key.is_empty() && !val.is_empty() {
+                    out.insert(key.to_string(), val.to_string());
+                }
+            }
+        }
+    }
+
+    for (k, v) in std::env::vars() {
+        if let Some(suffix) = k.strip_prefix(prefix_env) {
+            if !suffix.is_empty() && !v.trim().is_empty() {
+                out.insert(suffix.to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+    }
+
+    out
 }
 
 /// The unified receipt — a single evolving document that grows through the pipeline.
@@ -367,7 +423,9 @@ impl UnifiedReceipt {
     /// Verify the receipt signature against `did`.
     pub fn verify_signature(&self, mode: VerifyMode) -> Result<VerifyReport, ReceiptError> {
         if self.sig.is_empty() {
-            return Err(ReceiptError::Signature("receipt signature is empty".to_string()));
+            return Err(ReceiptError::Signature(
+                "receipt signature is empty".to_string(),
+            ));
         }
 
         let vk = ubl_kms::verifying_key_from_did(self.did.as_str())
@@ -886,6 +944,7 @@ mod tests {
             rt.binary_hash.starts_with("b3:"),
             "binary_hash must be b3: prefixed"
         );
+        assert_eq!(rt.runtime_hash(), rt.binary_hash);
         assert!(!rt.version.is_empty());
         assert!(!rt.build.arch.is_empty());
         assert!(!rt.build.os.is_empty());
@@ -896,6 +955,7 @@ mod tests {
     fn runtime_info_new_sets_explicit_hash() {
         let rt = RuntimeInfo::new("b3:deadbeef", "0.1.0");
         assert_eq!(rt.binary_hash, "b3:deadbeef");
+        assert_eq!(rt.runtime_hash, "b3:deadbeef");
         assert_eq!(rt.version, "0.1.0");
     }
 
@@ -903,10 +963,12 @@ mod tests {
     fn runtime_info_with_env_labels() {
         let rt = RuntimeInfo::new("b3:abc", "1.0.0")
             .with_env("cluster", "us-east-1")
-            .with_env("deploy", "canary");
+            .with_env("deploy", "canary")
+            .with_cert("slsa", "b3:slsa-cid");
         assert_eq!(rt.env.len(), 2);
         assert_eq!(rt.env["cluster"], "us-east-1");
         assert_eq!(rt.env["deploy"], "canary");
+        assert_eq!(rt.certs["slsa"], "b3:slsa-cid");
     }
 
     #[test]
@@ -930,6 +992,7 @@ mod tests {
             "receipt JSON must include rt field"
         );
         assert_eq!(json["rt"]["binary_hash"], "b3:test-hash");
+        assert_eq!(json["rt"]["runtime_hash"], "b3:test-hash");
         assert_eq!(json["rt"]["version"], "0.1.0");
         assert!(json["rt"]["build"]["arch"].is_string());
         assert!(json["rt"]["build"]["os"].is_string());

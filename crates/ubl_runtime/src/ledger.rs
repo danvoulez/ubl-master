@@ -90,8 +90,8 @@ impl LedgerWriter for NdjsonLedger {
         let path = self.ledger_path(&entry.app, &entry.tenant);
 
         // Serialize to single JSON line
-        let mut line = serde_json::to_string(entry)
-            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
+        let mut line =
+            serde_json::to_string(entry).map_err(|e| LedgerError::Serialization(e.to_string()))?;
         line.push('\n');
 
         // Atomic append under lock
@@ -215,7 +215,11 @@ mod tests {
         entry.tenant = "new-tenant".to_string();
         ledger.append(&entry).await.unwrap();
 
-        let path = dir.path().join("new-app").join("new-tenant").join("receipts.ndjson");
+        let path = dir
+            .path()
+            .join("new-app")
+            .join("new-tenant")
+            .join("receipts.ndjson");
         assert!(path.exists());
     }
 

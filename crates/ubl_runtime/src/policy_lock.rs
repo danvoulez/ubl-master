@@ -77,7 +77,9 @@ impl PolicyLock {
 
             if trimmed.starts_with("version:") {
                 let v = trimmed.trim_start_matches("version:").trim();
-                lock.version = v.parse::<u32>().map_err(|e| format!("invalid version: {}", e))?;
+                lock.version = v
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid version: {}", e))?;
             } else if trimmed == "policies:" {
                 in_policies = true;
             } else if in_policies && trimmed.contains(':') {
@@ -142,7 +144,12 @@ impl PolicyLock {
         }
 
         let ok = mismatches.is_empty() && missing.is_empty();
-        LockVerification { ok, mismatches, missing, extra }
+        LockVerification {
+            ok,
+            mismatches,
+            missing,
+            extra,
+        }
     }
 }
 
@@ -159,7 +166,11 @@ impl std::fmt::Display for LockVerification {
         } else {
             write!(f, "policy lockfile: DRIFT DETECTED")?;
             for m in &self.mismatches {
-                write!(f, "\n  MISMATCH {}: expected {} got {}", m.level, m.expected_cid, m.actual_cid)?;
+                write!(
+                    f,
+                    "\n  MISMATCH {}: expected {} got {}",
+                    m.level, m.expected_cid, m.actual_cid
+                )?;
             }
             for m in &self.missing {
                 write!(f, "\n  MISSING {}", m)?;

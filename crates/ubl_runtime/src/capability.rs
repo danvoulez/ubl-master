@@ -90,6 +90,7 @@ pub fn required_capability(chip_type: &str) -> Option<&'static str> {
         "ubl/app" => Some("registry:init"),
         "ubl/membership" => Some("membership:grant"),
         "ubl/revoke" => Some("revoke:execute"),
+        "ubl/key.rotate" => Some("key:rotate"),
         _ => None,
     }
 }
@@ -408,6 +409,7 @@ mod tests {
             Some("membership:grant")
         );
         assert_eq!(required_capability("ubl/revoke"), Some("revoke:execute"));
+        assert_eq!(required_capability("ubl/key.rotate"), Some("key:rotate"));
         assert_eq!(required_capability("ubl/user"), None);
         assert_eq!(required_capability("ubl/document"), None);
     }

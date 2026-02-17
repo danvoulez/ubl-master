@@ -45,7 +45,10 @@ impl IdempotencyKey {
 
     /// Canonical string representation for logging/metrics.
     pub fn to_string_key(&self) -> String {
-        format!("{}|{}|{}|{}", self.at_type, self.at_ver, self.at_world, self.at_id)
+        format!(
+            "{}|{}|{}|{}",
+            self.at_type, self.at_ver, self.at_world, self.at_id
+        )
     }
 
     /// Stable durable key used by persistent idempotency backends.
@@ -58,7 +61,11 @@ impl IdempotencyKey {
 
 impl std::fmt::Display for IdempotencyKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}, {}, {}, {})", self.at_type, self.at_ver, self.at_world, self.at_id)
+        write!(
+            f,
+            "({}, {}, {}, {})",
+            self.at_type, self.at_ver, self.at_world, self.at_id
+        )
     }
 }
 
@@ -247,13 +254,18 @@ mod tests {
                 at_world: "a/x/t/y".into(),
                 at_id: format!("user-{}", i),
             };
-            store.put(key, CachedResult {
-                receipt_cid: format!("b3:{}", i),
-                response_json: json!({}),
-                decision: "Allow".into(),
-                chain: vec![],
-                created_at: chrono::Utc::now().to_rfc3339(),
-            }).await;
+            store
+                .put(
+                    key,
+                    CachedResult {
+                        receipt_cid: format!("b3:{}", i),
+                        response_json: json!({}),
+                        decision: "Allow".into(),
+                        chain: vec![],
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )
+                .await;
         }
         assert_eq!(store.len().await, 5);
     }
@@ -268,22 +280,32 @@ mod tests {
             at_id: "alice".into(),
         };
 
-        store.put(key.clone(), CachedResult {
-            receipt_cid: "b3:first".into(),
-            response_json: json!({}),
-            decision: "Allow".into(),
-            chain: vec![],
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }).await;
+        store
+            .put(
+                key.clone(),
+                CachedResult {
+                    receipt_cid: "b3:first".into(),
+                    response_json: json!({}),
+                    decision: "Allow".into(),
+                    chain: vec![],
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await;
 
         // Same key, different result — should overwrite
-        store.put(key.clone(), CachedResult {
-            receipt_cid: "b3:second".into(),
-            response_json: json!({}),
-            decision: "Deny".into(),
-            chain: vec![],
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }).await;
+        store
+            .put(
+                key.clone(),
+                CachedResult {
+                    receipt_cid: "b3:second".into(),
+                    response_json: json!({}),
+                    decision: "Deny".into(),
+                    chain: vec![],
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await;
 
         let got = store.get(&key).await.unwrap();
         assert_eq!(got.receipt_cid, "b3:second");

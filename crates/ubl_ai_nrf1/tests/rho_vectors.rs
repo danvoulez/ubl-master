@@ -5,12 +5,14 @@
 //! Vectors live in `kats/rho_vectors/*.json` at repo root.
 
 use std::path::PathBuf;
-use ubl_ai_nrf1::nrf::{json_to_nrf, encode_to_vec, cid_from_nrf_bytes};
+use ubl_ai_nrf1::nrf::{cid_from_nrf_bytes, encode_to_vec, json_to_nrf};
 
 fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()  // crates/
-        .parent().unwrap()  // repo root
+        .parent()
+        .unwrap() // crates/
+        .parent()
+        .unwrap() // repo root
         .join("kats")
         .join("rho_vectors")
 }
@@ -51,7 +53,10 @@ fn rho_01_scalars_ints_and_bools() {
     // Also contains i64::MIN which is valid
     // serde_json parses 18446744073709551615 as u64, not i64 → json_to_nrf rejects
     let result = json_to_nrf(&v);
-    assert!(result.is_err(), "u64 overflow must be rejected (no floats, i64 only)");
+    assert!(
+        result.is_err(),
+        "u64 overflow must be rejected (no floats, i64 only)"
+    );
 }
 
 #[test]
@@ -77,7 +82,10 @@ fn rho_02_strings_with_control_chars_rejected() {
     let v = load("02_strings_basic.json");
     // Contains \n and \t which are control chars (U+000A, U+0009) → rejected by ρ
     let result = json_to_nrf(&v);
-    assert!(result.is_err(), "strings with control chars (\\n, \\t) must be rejected");
+    assert!(
+        result.is_err(),
+        "strings with control chars (\\n, \\t) must be rejected"
+    );
 }
 
 // ── 03: Unicode NFC (valid) ─────────────────────────────────────
@@ -111,7 +119,10 @@ fn rho_05_06_key_order_produces_same_cid() {
     let b = load("06_key_order_b.json");
     let cid_a = canon_cid(&a);
     let cid_b = canon_cid(&b);
-    assert_eq!(cid_a, cid_b, "same keys in different order must produce identical CID");
+    assert_eq!(
+        cid_a, cid_b,
+        "same keys in different order must produce identical CID"
+    );
 }
 
 #[test]

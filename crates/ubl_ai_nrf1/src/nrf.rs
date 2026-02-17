@@ -405,8 +405,7 @@ mod tests {
         let bytes = encode_to_vec(&nrf_val).unwrap();
         let cid = cid_from_nrf_bytes(&bytes);
         assert_eq!(
-            cid,
-            "b3:fd38c071ca3e1ede2a135645677d5326bbf91fb9cfe56a36f2d54636b75e7cd2",
+            cid, "b3:fd38c071ca3e1ede2a135645677d5326bbf91fb9cfe56a36f2d54636b75e7cd2",
             "CID for {{hello:world,n:42}} must be stable across builds (BLAKE3)"
         );
     }

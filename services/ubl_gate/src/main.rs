@@ -6,7 +6,7 @@
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -83,14 +83,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store_for_metrics = store.clone();
             tokio::spawn(async move {
                 loop {
-                    let processed = dispatcher.run_once(64, |event| match event.event_type.as_str() {
-                        // Placeholder delivery path; real publisher can be wired here.
-                        "emit_receipt" => Ok(()),
-                        _ => {
-                            metrics::inc_outbox_retry();
-                            Err(format!("unknown outbox event type: {}", event.event_type))
-                        }
-                    });
+                    let processed =
+                        dispatcher.run_once(64, |event| match event.event_type.as_str() {
+                            // Placeholder delivery path; real publisher can be wired here.
+                            "emit_receipt" => Ok(()),
+                            _ => {
+                                metrics::inc_outbox_retry();
+                                Err(format!("unknown outbox event type: {}", event.event_type))
+                            }
+                        });
 
                     match processed {
                         Ok(processed_count) => {
@@ -123,10 +124,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/runtime/attestation", get(get_runtime_attestation))
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
-        .route("/v1/passports/:cid/advisories", get(get_passport_advisories))
+        .route(
+            "/v1/passports/:cid/advisories",
+            get(get_passport_advisories),
+        )
         .route("/v1/advisories/:cid/verify", get(verify_advisory))
         .route("/v1/chips/:cid/verify", get(verify_chip))
         .route("/metrics", get(metrics_handler))
@@ -144,9 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,ubl_runtime=debug,ubl_gate=debug")
-    });
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,ubl_runtime=debug,ubl_gate=debug"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
@@ -157,15 +161,37 @@ async fn healthz() -> Json<Value> {
     Json(json!({"status": "ok", "system": "ubl-master", "pipeline": "KNOCK->WA->CHECK->TR->WF"}))
 }
 
+/// GET /v1/runtime/attestation — signed runtime self-attestation (PS3/F1).
+async fn get_runtime_attestation(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    match state.pipeline.runtime_self_attestation() {
+        Ok(attestation) => {
+            let verified = attestation.verify().unwrap_or(false);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "@type": "ubl/runtime.attestation.response",
+                    "verified": verified,
+                    "attestation": attestation,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "INTERNAL_ERROR",
+                "message": e.to_string(),
+            })),
+        ),
+    }
+}
+
 /// POST /v1/chips — process raw bytes through the full KNOCK→WA→CHECK→TR→WF pipeline.
 ///
 /// Idempotent: if the chip was already processed (same @type/@ver/@world/@id),
 /// returns the cached result with `X-UBL-Replay: true` header and `"replayed": true`
 /// in the response body. No re-execution occurs.
-async fn create_chip(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn create_chip(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     metrics::inc_chips_total();
     let t0 = std::time::Instant::now();
 
@@ -235,20 +261,30 @@ async fn verify_chip(
     if !cid.starts_with("b3:") {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"})),
+            Json(
+                json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"}),
+            ),
         );
     }
 
     let chip = match state.chip_store.get_chip(&cid).await {
         Ok(Some(c)) => c,
-        Ok(None) => return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)})),
-        ),
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
-        ),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(
+                    json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)}),
+                ),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()}),
+                ),
+            )
+        }
     };
 
     // Recompute CID from chip_data via NRF-1 canonical encoding → BLAKE3
@@ -267,7 +303,8 @@ async fn verify_chip(
     let receipt_exists = if receipt_cid.as_str().is_empty() {
         false
     } else {
-        state.chip_store
+        state
+            .chip_store
             .get_chip_by_receipt_cid(receipt_cid.as_str())
             .await
             .map(|c| c.is_some())
@@ -304,14 +341,16 @@ async fn get_chip(
         return (
             StatusCode::BAD_REQUEST,
             HeaderMap::new(),
-            Json(json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"})),
+            Json(
+                json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"}),
+            ),
         );
     }
 
     // ETag: If-None-Match → 304 (P1.6)
     if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
         if let Ok(inm_str) = inm.to_str() {
-            let etag = format!("\"{}\"" , cid);
+            let etag = format!("\"{}\"", cid);
             if inm_str == etag || inm_str.trim_matches('"') == cid {
                 let mut h = HeaderMap::new();
                 h.insert(header::ETAG, etag.parse().unwrap());
@@ -323,9 +362,12 @@ async fn get_chip(
     match state.chip_store.get_chip(&cid).await {
         Ok(Some(chip)) => {
             let mut h = HeaderMap::new();
-            let etag = format!("\"{}\"" , chip.cid);
+            let etag = format!("\"{}\"", chip.cid);
             h.insert(header::ETAG, etag.parse().unwrap());
-            h.insert(header::CACHE_CONTROL, "public, max-age=31536000, immutable".parse().unwrap());
+            h.insert(
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".parse().unwrap(),
+            );
             (
                 StatusCode::OK,
                 h,
@@ -339,11 +381,13 @@ async fn get_chip(
                     "tags": chip.tags,
                 })),
             )
-        },
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             HeaderMap::new(),
-            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)})),
+            Json(
+                json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Chip {} not found", cid)}),
+            ),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -374,15 +418,17 @@ async fn get_passport_advisories(
             let advisories: Vec<Value> = result
                 .chips
                 .iter()
-                .map(|c| json!({
-                    "cid": c.cid,
-                    "action": c.chip_data.get("action").unwrap_or(&json!("unknown")),
-                    "hook": c.chip_data.get("hook").unwrap_or(&json!("unknown")),
-                    "confidence": c.chip_data.get("confidence").unwrap_or(&json!(0)),
-                    "model": c.chip_data.get("model").unwrap_or(&json!("unknown")),
-                    "input_cid": c.chip_data.get("input_cid").unwrap_or(&json!("")),
-                    "created_at": c.created_at,
-                }))
+                .map(|c| {
+                    json!({
+                        "cid": c.cid,
+                        "action": c.chip_data.get("action").unwrap_or(&json!("unknown")),
+                        "hook": c.chip_data.get("hook").unwrap_or(&json!("unknown")),
+                        "confidence": c.chip_data.get("confidence").unwrap_or(&json!(0)),
+                        "model": c.chip_data.get("model").unwrap_or(&json!("unknown")),
+                        "input_cid": c.chip_data.get("input_cid").unwrap_or(&json!("")),
+                        "created_at": c.created_at,
+                    })
+                })
                 .collect();
 
             (
@@ -410,57 +456,85 @@ async fn verify_advisory(
     // Fetch the advisory chip
     let chip = match state.chip_store.get_chip(&cid).await {
         Ok(Some(c)) => c,
-        Ok(None) => return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Advisory {} not found", cid)})),
-        ),
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
-        ),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(
+                    json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Advisory {} not found", cid)}),
+                ),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()}),
+                ),
+            )
+        }
     };
 
     if chip.chip_type != "ubl/advisory" {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Chip is not an advisory"})),
+            Json(
+                json!({"@type": "ubl/error", "code": "INVALID_TYPE", "message": "Chip is not an advisory"}),
+            ),
         );
     }
 
     // Parse the advisory
     let advisory = match ubl_runtime::advisory::Advisory::from_chip_body(&chip.chip_data) {
         Ok(a) => a,
-        Err(e) => return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"@type": "ubl/error", "code": "INVALID_ADVISORY", "message": e.to_string()})),
-        ),
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(
+                    json!({"@type": "ubl/error", "code": "INVALID_ADVISORY", "message": e.to_string()}),
+                ),
+            )
+        }
     };
 
     // Recompute CID to verify integrity
     let nrf_bytes = match ubl_ai_nrf1::to_nrf1_bytes(&chip.chip_data) {
         Ok(b) => b,
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"@type": "ubl/error", "code": "ENCODING_ERROR", "message": e.to_string()})),
-        ),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"@type": "ubl/error", "code": "ENCODING_ERROR", "message": e.to_string()}),
+                ),
+            )
+        }
     };
     let computed_cid = match ubl_ai_nrf1::compute_cid(&nrf_bytes) {
         Ok(c) => c,
-        Err(e) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"@type": "ubl/error", "code": "CID_ERROR", "message": e.to_string()})),
-        ),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"@type": "ubl/error", "code": "CID_ERROR", "message": e.to_string()})),
+            )
+        }
     };
 
     let cid_valid = computed_cid == cid;
 
     // Check if the passport exists
-    let passport_exists = state.chip_store.get_chip(&advisory.passport_cid).await
-        .map(|r| r.is_some()).unwrap_or(false);
+    let passport_exists = state
+        .chip_store
+        .get_chip(&advisory.passport_cid)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false);
 
     // Check if the input chip exists
-    let input_exists = state.chip_store.get_chip(&advisory.input_cid).await
-        .map(|r| r.is_some()).unwrap_or(false);
+    let input_exists = state
+        .chip_store
+        .get_chip(&advisory.input_cid)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false);
 
     let verified = cid_valid;
 
@@ -508,7 +582,9 @@ async fn get_receipt_trace(
         ),
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            Json(json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Receipt {} not found", cid)})),
+            Json(
+                json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Receipt {} not found", cid)}),
+            ),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -550,19 +626,25 @@ async fn mcp_rpc(
     let params = rpc.get("params").cloned().unwrap_or(json!({}));
 
     if rpc.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-        return (StatusCode::BAD_REQUEST, Json(json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": { "code": -32600, "message": "Invalid Request: missing jsonrpc 2.0" }
-        })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32600, "message": "Invalid Request: missing jsonrpc 2.0" }
+            })),
+        );
     }
 
     match method {
         "tools/list" => {
             let manifest = state.manifest.to_mcp_manifest();
-            (StatusCode::OK, Json(json!({
-                "jsonrpc": "2.0", "id": id,
-                "result": { "tools": manifest["tools"] }
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": manifest["tools"] }
+                })),
+            )
         }
 
         "tools/call" => {
@@ -571,10 +653,13 @@ async fn mcp_rpc(
             dispatch_tool_call(&state, tool_name, &arguments, id).await
         }
 
-        _ => (StatusCode::OK, Json(json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": { "code": -32601, "message": format!("Method not found: {}", method) }
-        }))),
+        _ => (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {}", method) }
+            })),
+        ),
     }
 }
 
@@ -592,22 +677,28 @@ async fn dispatch_tool_call(
             match state.pipeline.process_raw(&bytes).await {
                 Ok(result) => {
                     let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-                    (StatusCode::OK, Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-                            "decision": format!("{:?}", result.decision),
-                            "receipt_cid": result.receipt.receipt_cid,
-                            "chain": result.chain,
-                            "receipt": receipt_json,
-                        })).unwrap_or_default() }] }
-                    })))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                                "decision": format!("{:?}", result.decision),
+                                "receipt_cid": result.receipt.receipt_cid,
+                                "chain": result.chain,
+                                "receipt": receipt_json,
+                            })).unwrap_or_default() }] }
+                        })),
+                    )
                 }
                 Err(e) => {
                     let ubl_err = UblError::from_pipeline_error(&e);
-                    (StatusCode::OK, Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "error": { "code": ubl_err.code.mcp_code(), "message": ubl_err.message, "data": ubl_err.to_json() }
-                    })))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": { "code": ubl_err.code.mcp_code(), "message": ubl_err.message, "data": ubl_err.to_json() }
+                        })),
+                    )
                 }
             }
         }
@@ -615,21 +706,30 @@ async fn dispatch_tool_call(
         "ubl.query" => {
             let cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
             match state.chip_store.get_chip(cid).await {
-                Ok(Some(chip)) => (StatusCode::OK, Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-                        "cid": chip.cid, "chip_type": chip.chip_type,
-                        "chip_data": chip.chip_data, "receipt_cid": chip.receipt_cid,
-                    })).unwrap_or_default() }] }
-                }))),
-                Ok(None) => (StatusCode::OK, Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
-                }))),
-                Err(e) => (StatusCode::OK, Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": { "code": -32603, "message": e.to_string() }
-                }))),
+                Ok(Some(chip)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                            "cid": chip.cid, "chip_type": chip.chip_type,
+                            "chip_data": chip.chip_data, "receipt_cid": chip.receipt_cid,
+                        })).unwrap_or_default() }] }
+                    })),
+                ),
+                Ok(None) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32603, "message": e.to_string() }
+                    })),
+                ),
             }
         }
 
@@ -638,24 +738,35 @@ async fn dispatch_tool_call(
             match state.chip_store.get_chip(cid).await {
                 Ok(Some(chip)) => {
                     let verified = match ubl_ai_nrf1::to_nrf1_bytes(&chip.chip_data) {
-                        Ok(nrf) => ubl_ai_nrf1::compute_cid(&nrf).map(|c| c == cid).unwrap_or(false),
+                        Ok(nrf) => ubl_ai_nrf1::compute_cid(&nrf)
+                            .map(|c| c == cid)
+                            .unwrap_or(false),
                         Err(_) => false,
                     };
-                    (StatusCode::OK, Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-                            "cid": cid, "verified": verified
-                        })).unwrap_or_default() }] }
-                    })))
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                                "cid": cid, "verified": verified
+                            })).unwrap_or_default() }] }
+                        })),
+                    )
                 }
-                Ok(None) => (StatusCode::OK, Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
-                }))),
-                Err(e) => (StatusCode::OK, Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "error": { "code": -32603, "message": e.to_string() }
-                }))),
+                Ok(None) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32603, "message": e.to_string() }
+                    })),
+                ),
             }
         }
 
@@ -663,15 +774,21 @@ async fn dispatch_tool_call(
             let types: Vec<Value> = state.manifest.chip_types.iter().map(|ct| json!({
                 "type": ct.chip_type, "description": ct.description, "required_cap": ct.required_cap,
             })).collect();
-            (StatusCode::OK, Json(json!({
-                "jsonrpc": "2.0", "id": id,
-                "result": { "content": [{ "type": "text", "text": serde_json::to_string(&types).unwrap_or_default() }] }
-            })))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "content": [{ "type": "text", "text": serde_json::to_string(&types).unwrap_or_default() }] }
+                })),
+            )
         }
 
-        _ => (StatusCode::OK, Json(json!({
-            "jsonrpc": "2.0", "id": id,
-            "error": { "code": -32601, "message": format!("Tool not found: {}", tool_name) }
-        }))),
+        _ => (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": -32601, "message": format!("Tool not found: {}", tool_name) }
+            })),
+        ),
     }
 }

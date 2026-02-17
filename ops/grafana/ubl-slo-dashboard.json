@@ -1,0 +1,155 @@
+{
+  "title": "UBL Gate SLO Dashboard",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Requests/s",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_chips_total[5m]))",
+          "legendFormat": "rps",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error Rate",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_errors_total[5m])) / clamp_min(sum(rate(ubl_chips_total[5m])), 1)",
+          "legendFormat": "error_ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Outbox Pending",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "ubl_outbox_pending",
+          "legendFormat": "pending",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Replay Hit Rate",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_idempotency_hit_total[5m])) / clamp_min(sum(rate(ubl_chips_total[5m])), 1)",
+          "legendFormat": "replay_ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency p50/p95/p99",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ubl_pipeline_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ubl_pipeline_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ubl_pipeline_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Allow / Deny / Knock Reject",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_allow_total[5m]))",
+          "legendFormat": "allow",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ubl_deny_total[5m]))",
+          "legendFormat": "deny",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(ubl_knock_reject_total[5m]))",
+          "legendFormat": "knock_reject",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Crypto / Canon Health",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_crypto_verify_fail_total[5m])) by (component,mode)",
+          "legendFormat": "crypto {{component}}/{{mode}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ubl_canon_divergence_total[5m])) by (component)",
+          "legendFormat": "canon {{component}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox + Replay",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(ubl_outbox_retry_total[5m]))",
+          "legendFormat": "outbox_retry",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ubl_idempotency_hit_total[5m]))",
+          "legendFormat": "idempotency_hit",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(ubl_idempotency_replay_block_total[5m]))",
+          "legendFormat": "replay_block",
+          "refId": "C"
+        }
+      ]
+    }
+  ]
+}

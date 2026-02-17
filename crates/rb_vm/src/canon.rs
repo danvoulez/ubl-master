@@ -49,16 +49,21 @@ impl RhoCanon {
     pub fn validate(v: &Value) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         Self::collect_errors(v, "$", &mut errors);
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn collect_errors(v: &Value, path: &str, errors: &mut Vec<String>) {
         match v {
-            Value::Null | Value::Bool(_) => {},
+            Value::Null | Value::Bool(_) => {}
             Value::Number(n) => {
                 if !n.is_i64() && !n.is_u64() {
                     errors.push(format!(
-                        "{}: raw float {} violates UNC-1 — use @num atoms", path, n
+                        "{}: raw float {} violates UNC-1 — use @num atoms",
+                        path, n
                     ));
                 }
             }
@@ -66,7 +71,9 @@ impl RhoCanon {
                 if s.contains('\u{feff}') {
                     errors.push(format!("{}: BOM present", path));
                 }
-                if s.chars().any(|c| c <= '\u{001f}' && c != '\n' && c != '\r' && c != '\t') {
+                if s.chars()
+                    .any(|c| c <= '\u{001f}' && c != '\n' && c != '\r' && c != '\t')
+                {
                     errors.push(format!("{}: control character present", path));
                 }
                 let nfc: String = s.nfc().collect();
@@ -82,7 +89,10 @@ impl RhoCanon {
             Value::Object(map) => {
                 for (k, val) in map {
                     if val.is_null() {
-                        errors.push(format!("{}.{}: null value in map (should be absent)", path, k));
+                        errors.push(format!(
+                            "{}.{}: null value in map (should be absent)",
+                            path, k
+                        ));
                     }
                     Self::collect_errors(val, &format!("{}.{}", path, k), errors);
                 }
@@ -95,7 +105,9 @@ impl RhoCanon {
         if s.contains('\u{feff}') {
             return Err("BOM present in string".to_string());
         }
-        if s.chars().any(|c| c <= '\u{001f}' && c != '\n' && c != '\r' && c != '\t') {
+        if s.chars()
+            .any(|c| c <= '\u{001f}' && c != '\n' && c != '\r' && c != '\t')
+        {
             return Err("Control character present in string".to_string());
         }
         // NFC normalize
@@ -128,9 +140,7 @@ impl RhoCanon {
                     Err(_) => Value::String(s), // best-effort: keep original
                 }
             }
-            Value::Array(arr) => {
-                Value::Array(arr.into_iter().map(Self::rho).collect())
-            }
+            Value::Array(arr) => Value::Array(arr.into_iter().map(Self::rho).collect()),
             Value::Object(map) => {
                 let mut sorted = Map::new();
                 // Collect, sort by key, apply ρ recursively
@@ -277,7 +287,11 @@ mod tests {
         let input = json!({"amount": 12.34});
         let out = RhoCanon.canon(input);
         let s = out["amount"].as_str().unwrap();
-        assert!(s.starts_with("__FLOAT_REJECTED:"), "float must be poisoned: {}", s);
+        assert!(
+            s.starts_with("__FLOAT_REJECTED:"),
+            "float must be poisoned: {}",
+            s
+        );
     }
 
     #[test]

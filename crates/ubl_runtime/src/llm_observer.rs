@@ -37,7 +37,9 @@ impl LlmObserver {
     /// Start observing events from the bus (spawns a background task)
     pub async fn start(&self, event_bus: &EventBus) {
         let mut running = self.running.write().await;
-        if *running { return; }
+        if *running {
+            return;
+        }
         *running = true;
         drop(running);
 

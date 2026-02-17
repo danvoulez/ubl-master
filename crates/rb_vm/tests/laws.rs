@@ -635,9 +635,15 @@ fn golden_deny_age_allow_cid_stable() {
 // New opcodes: Dup, Swap, VerifySig
 // ═══════════════════════════════════════════════════════════════════
 
-fn tlv_dup() -> Vec<u8> { tlv_instr(0x14, &[]) }
-fn tlv_swap() -> Vec<u8> { tlv_instr(0x15, &[]) }
-fn tlv_verify_sig() -> Vec<u8> { tlv_instr(0x16, &[]) }
+fn tlv_dup() -> Vec<u8> {
+    tlv_instr(0x14, &[])
+}
+fn tlv_swap() -> Vec<u8> {
+    tlv_instr(0x15, &[])
+}
+fn tlv_verify_sig() -> Vec<u8> {
+    tlv_instr(0x16, &[])
+}
 
 #[test]
 fn dup_duplicates_top() {
@@ -654,7 +660,11 @@ fn dup_duplicates_top() {
     code.extend(tlv_instr(0x09, &[])); // AssertTrue
 
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let outcome = vm.run(&instrs).unwrap();
@@ -677,7 +687,11 @@ fn swap_reverses_top_two() {
     code.extend(tlv_instr(0x09, &[])); // AssertTrue
 
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let outcome = vm.run(&instrs).unwrap();
@@ -686,7 +700,7 @@ fn swap_reverses_top_two() {
 
 #[test]
 fn verify_sig_valid_ed25519() {
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{Signer, SigningKey};
 
     let sk = SigningKey::from_bytes(&[7u8; 32]);
     let pk_bytes = sk.verifying_key().to_bytes();
@@ -703,7 +717,11 @@ fn verify_sig_valid_ed25519() {
     code.extend(tlv_instr(0x09, &[])); // AssertTrue — should pass
 
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let outcome = vm.run(&instrs).unwrap();
@@ -729,18 +747,29 @@ fn verify_sig_invalid_rejects() {
     code.extend(tlv_instr(0x09, &[])); // AssertTrue — should FAIL
 
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let result = vm.run(&instrs);
-    assert!(matches!(result, Err(ExecError::Deny(_))), "Bad sig must deny");
+    assert!(
+        matches!(result, Err(ExecError::Deny(_))),
+        "Bad sig must deny"
+    );
 }
 
 #[test]
 fn dup_on_empty_stack_errors() {
     let code = tlv_dup();
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let result = vm.run(&instrs);
@@ -755,7 +784,11 @@ fn swap_needs_two_values() {
     code.extend(tlv_swap());
 
     let signer = FixedSigner::new();
-    let cfg = VmConfig { fuel_limit: 100, ghost: false, trace: false };
+    let cfg = VmConfig {
+        fuel_limit: 100,
+        ghost: false,
+        trace: false,
+    };
     let mut vm = Vm::new(cfg, MemCas::new(), &signer, NaiveCanon, vec![]);
     let instrs = tlv::decode_stream(&code).unwrap();
     let result = vm.run(&instrs);

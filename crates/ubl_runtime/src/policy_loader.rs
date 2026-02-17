@@ -3,8 +3,8 @@
 //! Implements the hierarchical policy loading:
 //! chip → tenant → app → genesis
 
-use crate::policy_bit::PolicyBit;
 use crate::genesis::{create_genesis_policy, is_genesis_chip};
+use crate::policy_bit::PolicyBit;
 use serde_json::Value;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -54,7 +54,10 @@ impl PolicyLoader {
     }
 
     /// Load complete policy chain for a chip request
-    pub async fn load_policy_chain(&self, chip_request: &ChipRequest) -> Result<Vec<PolicyBit>, PolicyError> {
+    pub async fn load_policy_chain(
+        &self,
+        chip_request: &ChipRequest,
+    ) -> Result<Vec<PolicyBit>, PolicyError> {
         let mut policies = Vec::new();
 
         // 1. Always start with genesis policy
@@ -72,7 +75,10 @@ impl PolicyLoader {
     }
 
     /// Resolve ancestry chain: chip → tenant → app → genesis
-    async fn resolve_ancestry(&self, chip_request: &ChipRequest) -> Result<Vec<String>, PolicyError> {
+    async fn resolve_ancestry(
+        &self,
+        chip_request: &ChipRequest,
+    ) -> Result<Vec<String>, PolicyError> {
         let mut ancestry = Vec::new();
         let mut visited = std::collections::HashSet::new();
 
@@ -130,10 +136,14 @@ impl PolicyLoader {
     /// Parse a policy chip into a PolicyBit
     fn parse_policy_chip(&self, chip: &ChipData) -> Result<PolicyBit, PolicyError> {
         // Extract PolicyBit from chip body
-        let circuits = chip.body.get("circuits")
+        let circuits = chip
+            .body
+            .get("circuits")
             .ok_or_else(|| PolicyError::InvalidFormat("Missing circuits field".to_string()))?;
 
-        let scope = chip.body.get("scope")
+        let scope = chip
+            .body
+            .get("scope")
             .ok_or_else(|| PolicyError::InvalidFormat("Missing scope field".to_string()))?;
 
         let circuits: Vec<crate::circuit::Circuit> = serde_json::from_value(circuits.clone())
@@ -142,12 +152,16 @@ impl PolicyLoader {
         let scope: crate::policy_bit::PolicyScope = serde_json::from_value(scope.clone())
             .map_err(|e| PolicyError::InvalidFormat(format!("Invalid scope: {}", e)))?;
 
-        let id = chip.body.get("id")
+        let id = chip
+            .body
+            .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or(&chip.cid)
             .to_string();
 
-        let name = chip.body.get("description")
+        let name = chip
+            .body
+            .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or(&id)
             .to_string();
@@ -190,13 +204,15 @@ impl InMemoryPolicyStorage {
         let cid = chip.cid.clone();
 
         // Index by type
-        self.by_type.entry(chip.chip_type.clone())
+        self.by_type
+            .entry(chip.chip_type.clone())
             .or_insert_with(Vec::new)
             .push(cid.clone());
 
         // Index by parents
         for parent in &chip.parents {
-            self.by_parent.entry(parent.clone())
+            self.by_parent
+                .entry(parent.clone())
                 .or_insert_with(Vec::new)
                 .push(cid.clone());
         }
@@ -213,11 +229,14 @@ impl PolicyStorage for InMemoryPolicyStorage {
     }
 
     async fn query_by_type(&self, chip_type: &str) -> Result<Vec<ChipData>, PolicyError> {
-        let cids = self.by_type.get(chip_type)
+        let cids = self
+            .by_type
+            .get(chip_type)
             .map(|v| v.clone())
             .unwrap_or_default();
 
-        let chips = cids.into_iter()
+        let chips = cids
+            .into_iter()
             .filter_map(|cid| self.chips.get(&cid).cloned())
             .collect();
 
@@ -225,11 +244,14 @@ impl PolicyStorage for InMemoryPolicyStorage {
     }
 
     async fn find_children(&self, parent_cid: &str) -> Result<Vec<ChipData>, PolicyError> {
-        let child_cids = self.by_parent.get(parent_cid)
+        let child_cids = self
+            .by_parent
+            .get(parent_cid)
             .map(|v| v.clone())
             .unwrap_or_default();
 
-        let children = child_cids.into_iter()
+        let children = child_cids
+            .into_iter()
             .filter_map(|cid| self.chips.get(&cid).cloned())
             .collect();
 

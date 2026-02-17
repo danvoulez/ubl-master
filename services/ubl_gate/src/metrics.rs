@@ -51,8 +51,13 @@ static ERROR_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 
 static PIPELINE_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     let h = Histogram::with_opts(
-        HistogramOpts::new("ubl_pipeline_seconds", "Pipeline processing latency in seconds")
-            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]),
+        HistogramOpts::new(
+            "ubl_pipeline_seconds",
+            "Pipeline processing latency in seconds",
+        )
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0,
+        ]),
     )
     .unwrap();
     REGISTRY.register(Box::new(h.clone())).unwrap();

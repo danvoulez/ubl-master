@@ -3,9 +3,9 @@
 //! Supports compilation from YAML .chip files to NRF-1 binary format
 //! as specified in the UBL MASTER BLUEPRINT.
 
+use crate::{to_nrf1_bytes, CompileError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::{to_nrf1_bytes, CompileError};
 
 /// A .chip file in YAML format (Chip-as-Code)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,25 +79,46 @@ impl ChipFile {
         let mut canonical_body = self.body.clone();
 
         // Ensure body is an object
-        let body_obj = canonical_body.as_object_mut()
+        let body_obj = canonical_body
+            .as_object_mut()
             .ok_or_else(|| CompileError::InvalidFormat("Body must be a JSON object".to_string()))?;
 
         // Add required fields
-        body_obj.insert("@type".to_string(), serde_json::Value::String(self.chip_type.clone()));
-        body_obj.insert("id".to_string(), serde_json::Value::String(self.metadata.id.clone()));
+        body_obj.insert(
+            "@type".to_string(),
+            serde_json::Value::String(self.chip_type.clone()),
+        );
+        body_obj.insert(
+            "id".to_string(),
+            serde_json::Value::String(self.metadata.id.clone()),
+        );
 
         // Add parents if present
         if !self.metadata.parents.is_empty() {
-            body_obj.insert("parents".to_string(), serde_json::Value::Array(
-                self.metadata.parents.iter().map(|s| serde_json::Value::String(s.clone())).collect()
-            ));
+            body_obj.insert(
+                "parents".to_string(),
+                serde_json::Value::Array(
+                    self.metadata
+                        .parents
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
         }
 
         // Add tags if present
         if !self.metadata.tags.is_empty() {
-            body_obj.insert("tags".to_string(), serde_json::Value::Array(
-                self.metadata.tags.iter().map(|s| serde_json::Value::String(s.clone())).collect()
-            ));
+            body_obj.insert(
+                "tags".to_string(),
+                serde_json::Value::Array(
+                    self.metadata
+                        .tags
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
         }
 
         Ok(canonical_body)

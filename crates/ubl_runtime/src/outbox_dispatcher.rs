@@ -40,8 +40,8 @@ impl OutboxDispatcher {
                 Err(_) => {
                     let attempts = event.attempts.saturating_add(1) as u32;
                     let factor = 2i64.saturating_pow(attempts.min(16));
-                    let backoff = (self.base_backoff_secs.saturating_mul(factor))
-                        .min(self.max_backoff_secs);
+                    let backoff =
+                        (self.base_backoff_secs.saturating_mul(factor)).min(self.max_backoff_secs);
                     let next = chrono::Utc::now().timestamp().saturating_add(backoff);
                     self.store.nack_outbox(event.id, next)?;
                 }

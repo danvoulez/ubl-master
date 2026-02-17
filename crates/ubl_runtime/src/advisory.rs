@@ -60,7 +60,15 @@ impl Advisory {
         model: String,
         hook: AdvisoryHook,
     ) -> Self {
-        Self { passport_cid, action, input_cid, output, confidence, model, hook }
+        Self {
+            passport_cid,
+            action,
+            input_cid,
+            output,
+            confidence,
+            model,
+            hook,
+        }
     }
 
     /// Produce the canonical chip body for this advisory.
@@ -82,30 +90,30 @@ impl Advisory {
 
     /// Parse an Advisory from a chip body.
     pub fn from_chip_body(body: &Value) -> Result<Self, AdvisoryError> {
-        let passport_cid = body.get("passport_cid")
+        let passport_cid = body
+            .get("passport_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AdvisoryError::MissingField("passport_cid".into()))?
             .to_string();
 
-        let action = body.get("action")
+        let action = body
+            .get("action")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AdvisoryError::MissingField("action".into()))?
             .to_string();
 
-        let input_cid = body.get("input_cid")
+        let input_cid = body
+            .get("input_cid")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AdvisoryError::MissingField("input_cid".into()))?
             .to_string();
 
-        let output = body.get("output")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let output = body.get("output").cloned().unwrap_or(Value::Null);
 
-        let confidence = body.get("confidence")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let confidence = body.get("confidence").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let model = body.get("model")
+        let model = body
+            .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -116,7 +124,15 @@ impl Advisory {
             _ => AdvisoryHook::OnDemand,
         };
 
-        Ok(Self { passport_cid, action, input_cid, output, confidence, model, hook })
+        Ok(Self {
+            passport_cid,
+            action,
+            input_cid,
+            output,
+            confidence,
+            model,
+            hook,
+        })
     }
 }
 
@@ -165,7 +181,9 @@ impl AdvisoryEngine {
 
     /// Generate a unique advisory ID.
     fn next_id(&self) -> String {
-        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("advisory-{}", n)
     }
 

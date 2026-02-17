@@ -83,8 +83,7 @@ pub fn knock(bytes: &[u8]) -> Result<Value, KnockError> {
     knock_raw(bytes)?;
 
     // Parse JSON (also validates UTF-8 at serde level)
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| KnockError::InvalidUtf8)?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| KnockError::InvalidUtf8)?;
 
     knock_parsed(&value)?;
 
@@ -268,7 +267,8 @@ mod tests {
             "@ver": "1.0",
             "@world": "a/app/t/ten",
             "email": "alice@acme.com"
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -297,7 +297,8 @@ mod tests {
         let bytes = serde_json::to_vec(&json!({
             "@id": "x",
             "@world": "a/x/t/y"
-        })).unwrap();
+        }))
+        .unwrap();
         let err = knock(&bytes).unwrap_err();
         assert!(matches!(err, KnockError::MissingAnchor("@type")));
     }
@@ -307,7 +308,8 @@ mod tests {
         let bytes = serde_json::to_vec(&json!({
             "@type": "ubl/user",
             "@id": "x"
-        })).unwrap();
+        }))
+        .unwrap();
         let err = knock(&bytes).unwrap_err();
         assert!(matches!(err, KnockError::MissingAnchor("@world")));
     }
@@ -331,10 +333,7 @@ mod tests {
             s.push('}');
         }
         // This won't have @type/@world, so wrap it
-        let wrapped = format!(
-            r#"{{"@type":"ubl/test","@world":"a/x/t/y","deep":{}}}"#,
-            s
-        );
+        let wrapped = format!(r#"{{"@type":"ubl/test","@world":"a/x/t/y","deep":{}}}"#, s);
         let err = knock(wrapped.as_bytes()).unwrap_err();
         assert!(matches!(err, KnockError::DepthExceeded));
     }
@@ -385,7 +384,8 @@ mod tests {
             "@type": "ubl/test",
             "@world": "a/x/t/y",
             "amount": 12.34
-        })).unwrap();
+        }))
+        .unwrap();
         let err = knock(&bytes).unwrap_err();
         assert!(matches!(err, KnockError::RawFloat(_)));
     }
@@ -396,7 +396,8 @@ mod tests {
             "@type": "ubl/test",
             "@world": "a/x/t/y",
             "data": {"price": 9.99}
-        })).unwrap();
+        }))
+        .unwrap();
         let err = knock(&bytes).unwrap_err();
         assert!(matches!(err, KnockError::RawFloat(_)));
     }
@@ -409,7 +410,8 @@ mod tests {
             "@world": "a/x/t/y",
             "count": 42,
             "price": {"@num": "dec/1", "m": "1234", "s": 2}
-        })).unwrap();
+        }))
+        .unwrap();
         assert!(knock(&bytes).is_ok());
     }
 }

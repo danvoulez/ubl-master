@@ -150,8 +150,8 @@ impl DurableStore {
             .transaction()
             .map_err(|e| DurableError::DurableCommitFailed(e.to_string()))?;
 
-        let body_json =
-            serde_json::to_string(&input.receipt_json).map_err(|e| DurableError::Serde(e.to_string()))?;
+        let body_json = serde_json::to_string(&input.receipt_json)
+            .map_err(|e| DurableError::Serde(e.to_string()))?;
 
         tx.execute(
             "INSERT OR IGNORE INTO receipts (receipt_cid, body_json, created_at, did, kid, rt_hash, decision)
@@ -243,7 +243,8 @@ impl DurableStore {
             .map_err(|e| DurableError::Sqlite(e.to_string()))?;
         }
 
-        tx.commit().map_err(|e| DurableError::Sqlite(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| DurableError::Sqlite(e.to_string()))?;
         Ok(events)
     }
 
@@ -321,8 +322,8 @@ impl DurableStore {
         event: &NewOutboxEvent,
         created_at: i64,
     ) -> Result<(), DurableError> {
-        let payload =
-            serde_json::to_string(&event.payload_json).map_err(|e| DurableError::Serde(e.to_string()))?;
+        let payload = serde_json::to_string(&event.payload_json)
+            .map_err(|e| DurableError::Serde(e.to_string()))?;
         tx.execute(
             "INSERT INTO outbox (event_type, payload_json, status, attempts, next_attempt_at, created_at)
              VALUES (?1, ?2, 'pending', 0, ?3, ?4)",
@@ -422,7 +423,9 @@ mod tests {
     }
 
     fn make_store(file_name: &str) -> DurableStore {
-        let store = DurableStore { dsn: temp_dsn(file_name) };
+        let store = DurableStore {
+            dsn: temp_dsn(file_name),
+        };
         store.ensure_initialized().unwrap();
         store
     }
@@ -436,7 +439,11 @@ mod tests {
             rt_hash: "b3:runtime".to_string(),
             decision: "allow".to_string(),
             idem_key: idem_key.map(|s| s.to_string()),
-            chain: vec!["b3:wa".to_string(), "b3:tr".to_string(), "b3:wf".to_string()],
+            chain: vec![
+                "b3:wa".to_string(),
+                "b3:tr".to_string(),
+                "b3:wf".to_string(),
+            ],
             outbox_events: vec![NewOutboxEvent {
                 event_type: "emit_receipt".to_string(),
                 payload_json: serde_json::json!({"receipt_cid":"b3:receipt-1"}),

@@ -24,7 +24,10 @@ pub struct RateLimitConfig {
 
 impl RateLimitConfig {
     pub fn new(max_requests: u32, window: Duration) -> Self {
-        Self { max_requests, window }
+        Self {
+            max_requests,
+            window,
+        }
     }
 
     pub fn per_minute(max_requests: u32) -> Self {
@@ -54,7 +57,9 @@ struct WindowEntry {
 
 impl WindowEntry {
     fn new() -> Self {
-        Self { timestamps: Vec::new() }
+        Self {
+            timestamps: Vec::new(),
+        }
     }
 
     /// Prune expired timestamps and check if a new request is allowed.
@@ -151,7 +156,9 @@ impl RateLimiter {
     pub async fn check(&self, key: &str) -> RateLimitResult {
         let now = Instant::now();
         let mut entries = self.entries.write().await;
-        let entry = entries.entry(key.to_string()).or_insert_with(WindowEntry::new);
+        let entry = entries
+            .entry(key.to_string())
+            .or_insert_with(WindowEntry::new);
         entry.check_and_record(now, &self.config)
     }
 
@@ -159,7 +166,8 @@ impl RateLimiter {
     pub async fn remaining(&self, key: &str) -> u32 {
         let now = Instant::now();
         let entries = self.entries.read().await;
-        entries.get(key)
+        entries
+            .get(key)
             .map(|e| e.remaining(now, &self.config))
             .unwrap_or(self.config.max_requests)
     }
@@ -311,9 +319,21 @@ impl CanonFingerprint {
         let hash = blake3::hash(&nrf_bytes);
         let hash_hex = hex::encode(hash.as_bytes());
 
-        let at_type = body.get("@type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let at_ver = body.get("@ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let at_world = body.get("@world").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let at_type = body
+            .get("@type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let at_ver = body
+            .get("@ver")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let at_world = body
+            .get("@world")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         Some(Self {
             hash: hash_hex,
@@ -325,13 +345,21 @@ impl CanonFingerprint {
 
     /// The rate limit key: `(@type, @ver, @world, fingerprint_hash)`.
     pub fn rate_key(&self) -> String {
-        format!("{}|{}|{}|{}", self.at_type, self.at_ver, self.at_world, self.hash)
+        format!(
+            "{}|{}|{}|{}",
+            self.at_type, self.at_ver, self.at_world, self.hash
+        )
     }
 }
 
 impl std::fmt::Display for CanonFingerprint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "canon:{}…{}", &self.hash[..8], &self.hash[self.hash.len()-4..])
+        write!(
+            f,
+            "canon:{}…{}",
+            &self.hash[..8],
+            &self.hash[self.hash.len() - 4..]
+        )
     }
 }
 
@@ -359,7 +387,10 @@ impl CanonRateLimiter {
 
     /// Check a chip body against the canon rate limit.
     /// Returns `None` if the body can't be canonicalized (non-JSON, etc.).
-    pub async fn check_body(&self, body: &serde_json::Value) -> Option<(CanonFingerprint, RateLimitResult)> {
+    pub async fn check_body(
+        &self,
+        body: &serde_json::Value,
+    ) -> Option<(CanonFingerprint, RateLimitResult)> {
         let fp = CanonFingerprint::from_chip_body(body)?;
         let result = self.limiter.check(&fp.rate_key()).await;
         Some((fp, result))
@@ -445,11 +476,17 @@ mod tests {
             RateLimitConfig::per_minute(1000),
             RateLimitConfig::per_minute(2), // tight IP limit for testing
         );
-        let r1 = gate.check("1.2.3.4", Some("tenant1"), Some("did:key:z123")).await;
+        let r1 = gate
+            .check("1.2.3.4", Some("tenant1"), Some("did:key:z123"))
+            .await;
         assert!(r1.allowed);
-        let r2 = gate.check("1.2.3.4", Some("tenant1"), Some("did:key:z123")).await;
+        let r2 = gate
+            .check("1.2.3.4", Some("tenant1"), Some("did:key:z123"))
+            .await;
         assert!(r2.allowed);
-        let r3 = gate.check("1.2.3.4", Some("tenant1"), Some("did:key:z123")).await;
+        let r3 = gate
+            .check("1.2.3.4", Some("tenant1"), Some("did:key:z123"))
+            .await;
         assert!(!r3.allowed);
         assert_eq!(r3.limited_by, "ip");
     }
@@ -634,7 +671,10 @@ mod tests {
         let (fp1, r1) = limiter.check_body(&body1).await.unwrap();
         assert!(r1.is_allowed());
         let (fp2, r2) = limiter.check_body(&body2).await.unwrap();
-        assert_eq!(fp1.hash, fp2.hash, "cosmetic variation must have same fingerprint");
+        assert_eq!(
+            fp1.hash, fp2.hash,
+            "cosmetic variation must have same fingerprint"
+        );
         assert!(r2.is_limited(), "cosmetic variation must hit same bucket");
     }
 }
