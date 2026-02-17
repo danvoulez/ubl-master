@@ -816,7 +816,7 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 |---|---|---|---|
 | **S1** — Canon + CID | Lock canonical encoding, Universal Envelope | NRF-1.1 encoding, CID computation, `ublx` CLI, type code table | 64 (ubl_ai_nrf1) |
 | **S2** — RB-VM + Policy | Wire rb_vm into pipeline, lock policy resolution | Real TR stage execution, fuel ceiling, unified `Decision` enum, nonce/anti-replay, policy lockfile | 33 (rb_vm) |
-| **S3** — Receipts + Storage + Gate | Unified receipt, persistent storage, end-to-end flow | `UnifiedReceipt` with HMAC chain, ChipStore in pipeline, `NdjsonLedger`, KNOCK stage, canonical errors, gate rewrite, genesis bootstrap | 11 (receipt) + 52 (runtime) |
+| **S3** — Receipts + Storage + Gate | Unified receipt, persistent storage, end-to-end flow | `UnifiedReceipt` with HMAC chain, ChipStore in pipeline, `NdjsonLedger`, KNOCK stage, canonical errors, gate rewrite, genesis bootstrap | 22 (receipt) + 290 (runtime) |
 | **S4** — WASM + URLs + EventBus | External effects, observability, portable URLs | WASM adapter ABI, adapter registry, Rich URL generation, event bus with idempotency, `ublx explain` | — |
 
 ### Completed — Post-Sprint
@@ -834,6 +834,7 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 | **H1** Signing key from env | `ubl_kms` crate, `signing_key_from_env()`, domain separation | 16 |
 | **H2** Real DID resolution | All placeholder DIDs replaced, `did:key:z...` derived from Ed25519 via `ubl_kms` | — |
 | **H3** `NaiveCanon` → full ρ | `RhoCanon` in `rb_vm/src/canon.rs`, NFC, BOM rejection, null stripping, key sorting, idempotent | 19 |
+| **H4** P0→P1 rollout automation | `scripts/rollout_p0_p1_check.sh` + `make rollout-check` preflight (runtime hash allowlist, activation window, quorum, break-glass) | — |
 | **H7** Signature domain separation | `domain::RECEIPT`, `RB_VM`, `CAPSULE`, `CHIP` in `ubl_kms` | — |
 | **H8** Rate limiting | Sliding-window per-key, `GateRateLimiter` (IP/tenant/DID), `prune()` | 13 |
 | **H9** UNC-1 core ops | `ubl_unc1` crate: add/sub/mul/div with promotion, `to_dec`, `to_rat`, `from_f64_bits`, BND intervals | 36 |
@@ -872,12 +873,11 @@ Verified by: `rb_vm` golden CID tests + pipeline integration tests + `receipt_ci
 | `ubl_types` | 24 |
 | **Total (core crates)** | **544** |
 
-### Open — Hardening (2 remaining)
+### Open — Hardening (1 remaining)
 
 | Item | Priority | Status |
 |---|---|---|
-| **H4** P0→P1 rollout automation (see `ROLLOUT_P0_TO_P1.md`) | Medium | Designed, not automated |
-| **H6** Parse, Don't Validate (progressive adoption beyond `auth.rs`) | Low | Open |
+| **H6** Parse, Don't Validate (progressive adoption beyond critical runtime paths) | Low | Open |
 
 ### Next — Protocol Horizons
 

@@ -17,8 +17,8 @@
 ## 1) Snapshot Scorecard
 
 - ✅ `(x)` Core delivery complete: deterministic pipeline, receipts, storage, gate, onboarding, manifests, MCP proxy
-- ✅ `(x)` Test baseline strong: **485 tests passing**
-- 🟨 `( )` Main gap: Parse-Don’t-Validate expansion + broader indexing + runtime ops maturity
+- ✅ `(x)` Test baseline strong: **544 core-crate tests passing**
+- 🟨 `( )` Main gap: production-slice evidence (30-day window) + remaining feature backlog
 - 🟨 `( )` Main objective: move from “working system” to “achieved system” with production proof
 
 ---
@@ -96,7 +96,7 @@
 - ✅ `(x)` P0 canon unification: `ubl_canon` NRF-only CID/sign/verify in critical paths
 - ✅ `(x)` P0 rich URL real verify (CID + DID signature + `rt_hash`) with shadow/strict modes
 - ✅ `(x)` P0/P1 TR bytecode registry: `transition_registry` (`@tr` override + env maps + profile defaults)
-- ✅ `(x)` H6 Parse-Don’t-Validate expansion in critical runtime paths (typed request world + adapter parse + typed onboarding dependency checks)
+- ✅ `(x)` H6 Parse-Don’t-Validate expansion in critical runtime paths (typed request parse for `@type/@id/@world`, typed onboarding dependency checks, adapter parse)
 - 🟨 `( )` F4 property testing expansion (canon + numeric edge cases) — started with proptests in `ubl_canon` + `ubl_unc1`
 - ✅ `(x)` Cross-platform reproducibility CI matrix (Linux + macOS) — `.github/workflows/repro-matrix.yml`
 
@@ -129,7 +129,7 @@
 ## 4) Open Feature Backlog (After Critical Path or In Parallel If Cheap)
 
 - ✅ `(x)` F3 LLM Observer narration endpoint/productization (`GET /v1/receipts/:cid/narrate` + optional advisory persistence + MCP tool `ubl.narrate`)
-- ⬜ `( )` F5 UNC-1 numeric opcodes in RB-VM
+- ✅ `(x)` F5 UNC-1 numeric opcodes in RB-VM (`0x17..0x21` + coverage in `crates/rb_vm/tests/num_opcodes.rs`)
 - ⬜ `( )` F6 UNC-1 strict KNOCK validation path
 - ⬜ `( )` F7 UNC-1 migration flags rollout
 - ⬜ `( )` F10 CAS backends (`Fs`/`S3`) for ChipStore
