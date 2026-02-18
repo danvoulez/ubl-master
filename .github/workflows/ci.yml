@@ -110,6 +110,13 @@ jobs:
         run: cargo test --workspace --features property-tests
         continue-on-error: true
 
+      - name: UNC-1 Strict Smoke
+        run: |
+          REQUIRE_UNC1_NUMERIC=true F64_IMPORT_MODE=reject \
+            cargo test -p ubl_runtime --lib 'knock::tests::knock_require_unc1_numeric_rejects_raw_float_literals' -- --exact
+          REQUIRE_UNC1_NUMERIC=true F64_IMPORT_MODE=reject \
+            cargo test -p ubl_runtime --lib 'knock::tests::knock_require_unc1_numeric_accepts_num_atoms' -- --exact
+
   execute:
     name: "🔧 EXECUTE"
     needs: tr
