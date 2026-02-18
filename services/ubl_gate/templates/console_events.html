@@ -1,0 +1,30 @@
+{% if available %}
+<h2>Recent Events</h2>
+<table>
+  <thead>
+    <tr>
+      <th>When</th>
+      <th>Stage</th>
+      <th>Decision</th>
+      <th>Type</th>
+      <th>Code</th>
+      <th>Receipt</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>{{ row.when }}</td>
+      <td>{{ row.stage }}</td>
+      <td>{{ row.decision }}</td>
+      <td>{{ row.chip_type }}</td>
+      <td>{{ row.code }}</td>
+      <td><a href="/console/receipt/{{ row.receipt_cid }}">{{ row.receipt_cid }}</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<h2>Events Unavailable</h2>
+<p>{{ message }}</p>
+{% endif %}

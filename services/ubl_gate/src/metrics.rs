@@ -5,8 +5,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -122,6 +122,45 @@ static IDEMPOTENCY_REPLAY_BLOCK_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+static EVENTS_INGESTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ubl_events_ingested_total",
+            "Events ingested into the Event Hub by stage and world",
+        ),
+        &["stage", "world"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+static EVENTS_STREAM_CLIENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "ubl_events_stream_clients",
+            "Active event stream clients by world filter",
+        ),
+        &["world"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+static EVENTS_STREAM_DROPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ubl_events_stream_dropped_total",
+            "Dropped event stream deliveries by reason",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 pub fn inc_chips_total() {
     CHIPS_TOTAL.inc();
 }
@@ -172,6 +211,26 @@ pub fn inc_idempotency_replay_block() {
     IDEMPOTENCY_REPLAY_BLOCK_TOTAL.inc();
 }
 
+pub fn inc_events_ingested(stage: &str, world: &str) {
+    EVENTS_INGESTED_TOTAL
+        .with_label_values(&[stage, world])
+        .inc();
+}
+
+pub fn inc_events_stream_clients(world: &str) {
+    EVENTS_STREAM_CLIENTS.with_label_values(&[world]).inc();
+}
+
+pub fn dec_events_stream_clients(world: &str) {
+    EVENTS_STREAM_CLIENTS.with_label_values(&[world]).dec();
+}
+
+pub fn inc_events_stream_dropped(reason: &str) {
+    EVENTS_STREAM_DROPPED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
 pub fn encode_metrics() -> String {
     // Force lazy init of all metrics so they appear even at zero
     Lazy::force(&CHIPS_TOTAL);
@@ -186,6 +245,9 @@ pub fn encode_metrics() -> String {
     Lazy::force(&OUTBOX_RETRY_TOTAL);
     Lazy::force(&IDEMPOTENCY_HIT_TOTAL);
     Lazy::force(&IDEMPOTENCY_REPLAY_BLOCK_TOTAL);
+    Lazy::force(&EVENTS_INGESTED_TOTAL);
+    Lazy::force(&EVENTS_STREAM_CLIENTS);
+    Lazy::force(&EVENTS_STREAM_DROPPED_TOTAL);
 
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();

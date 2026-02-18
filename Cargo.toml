@@ -2,6 +2,7 @@
 members = [
   "crates/ubl_ai_nrf1",
   "crates/ubl_canon",
+  "crates/ubl_eventstore",
   "crates/rb_vm",
   "crates/ubl_runtime",
   "crates/ubl_receipt",

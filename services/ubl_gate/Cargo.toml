@@ -18,11 +18,14 @@ chrono = { version = "0.4", features = ["serde"] }
 ubl_runtime = { path = "../../crates/ubl_runtime" }
 ubl_ai_nrf1 = { path = "../../crates/ubl_ai_nrf1" }
 ubl_chipstore = { path = "../../crates/ubl_chipstore" }
+ubl_eventstore = { path = "../../crates/ubl_eventstore" }
 ubl_receipt = { path = "../../crates/ubl_receipt" }
 prometheus = "0.14"
 once_cell = "1.19"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+async-stream = "0.3"
+askama = "0.12"
 
 [dev-dependencies]
 tower = "0.5"

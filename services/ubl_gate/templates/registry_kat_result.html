@@ -1,0 +1,11 @@
+<h2>KAT Result</h2>
+<div>Status: <strong>{{ status_code }}</strong></div>
+<div>Label: <strong>{{ kat_label }}</strong></div>
+<div>Expected Decision: <strong>{{ expected_decision }}</strong></div>
+<div>Expected Error: <strong>{{ expected_error }}</strong></div>
+<div>Actual Decision: <strong>{{ actual_decision }}</strong></div>
+<div>Actual Error: <strong>{{ actual_error }}</strong></div>
+<div>Receipt CID: <strong>{{ receipt_cid }}</strong></div>
+<div>Result: <strong>{% if pass %}PASS{% else %}FAIL{% endif %}</strong></div>
+<div>Message: {{ message }}</div>
+<pre>{{ response_json }}</pre>

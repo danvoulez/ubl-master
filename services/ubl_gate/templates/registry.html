@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UBL Registry</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    .box { border: 1px solid #ddd; border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
+    input { padding: 0.35rem 0.5rem; min-width: 18rem; }
+    a { color: #0b57d0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>UBL Registry</h1>
+  <div class="row">
+    <form id="registry-filters" class="row">
+      <label for="world">world</label>
+      <input id="world" name="world" value="{{ world }}">
+      <button
+        type="button"
+        hx-get="/registry/_table"
+        hx-include="#registry-filters"
+        hx-target="#registry-table"
+        hx-swap="innerHTML">Refresh</button>
+    </form>
+    <a href="/console">Console</a>
+  </div>
+
+  <div id="registry-table"
+       class="box"
+       hx-get="/registry/_table"
+       hx-include="#registry-filters"
+       hx-trigger="load, every 10s"
+       hx-swap="innerHTML">Loading registry...</div>
+</body>
+</html>

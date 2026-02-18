@@ -1,0 +1,19 @@
+{% if available %}
+<h2>KPIs (5m window)</h2>
+<p>Generated at {{ generated_at }}</p>
+<div>Total Events: <strong>{{ total_events }}</strong></div>
+<div>ALLOW: <strong>{{ allow_count }}</strong> | DENY: <strong>{{ deny_count }}</strong></div>
+<div>Outbox Pending: <strong>{{ outbox_pending }}</strong></div>
+<h3>P95 Latency by Stage (ms)</h3>
+<table>
+  <thead><tr><th>Stage</th><th>P95 ms</th></tr></thead>
+  <tbody>
+  {% for row in p95_rows %}
+  <tr><td>{{ row.stage }}</td><td>{{ row.p95_ms }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<h2>KPIs Unavailable</h2>
+<p>{{ message }}</p>
+{% endif %}

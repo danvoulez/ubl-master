@@ -3,25 +3,30 @@
 //! Every mutation is a chip. Every chip goes through KNOCK→WA→CHECK→TR→WF.
 //! Every output is a receipt. Nothing bypasses the gate.
 
+use askama::Template;
+use async_stream::stream;
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::sse::{Event as SseEvent, KeepAlive, Sse},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ubl_chipstore::{ChipStore, SledBackend};
+use ubl_eventstore::{EventQuery, EventStore};
 use ubl_runtime::advisory::{Advisory, AdvisoryEngine, AdvisoryHook};
 use ubl_runtime::durable_store::DurableStore;
 use ubl_runtime::error_response::{ErrorCode, UblError};
-use ubl_runtime::event_bus::EventBus;
+use ubl_runtime::event_bus::{EventBus, ReceiptEvent};
 use ubl_runtime::manifest::GateManifest;
 use ubl_runtime::outbox_dispatcher::OutboxDispatcher;
 use ubl_runtime::policy_loader::InMemoryPolicyStorage;
@@ -39,6 +44,7 @@ struct AppState {
     advisory_engine: Arc<AdvisoryEngine>,
     canon_rate_limiter: Option<Arc<CanonRateLimiter>>,
     durable_store: Option<Arc<DurableStore>>,
+    event_store: Option<Arc<EventStore>>,
 }
 
 #[tokio::main]
@@ -128,6 +134,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let event_store = match EventStore::from_env() {
+        Ok(Some(store)) => Some(Arc::new(store)),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "event store init failed for gate");
+            None
+        }
+    };
+
+    if let Some(store) = event_store.clone() {
+        let mut rx = pipeline.event_bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let hub = to_hub_event(&event);
+                        let stage = hub
+                            .get("stage")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("UNKNOWN")
+                            .to_string();
+                        let world = hub
+                            .get("@world")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("a/system")
+                            .to_string();
+                        metrics::inc_events_ingested(&stage, &world);
+                        if let Err(e) = store.append_event_json(&hub) {
+                            warn!(error = %e, "event store append failed");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        metrics::inc_events_stream_dropped("hub_lagged");
+                        warn!(skipped, "event hub ingestion lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        info!("event hub ingestion task started");
+    }
+
     let manifest = Arc::new(GateManifest::default());
 
     let state = AppState {
@@ -137,6 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advisory_engine,
         canon_rate_limiter: load_canon_rate_limiter(),
         durable_store,
+        event_store,
     };
 
     let app = build_router(state);
@@ -302,9 +351,1623 @@ async fn submit_chip_bytes(state: &AppState, body: &[u8]) -> (StatusCode, Header
     }
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+struct EventStreamQuery {
+    world: Option<String>,
+    stage: Option<String>,
+    decision: Option<String>,
+    code: Option<String>,
+    #[serde(rename = "type")]
+    chip_type: Option<String>,
+    actor: Option<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn stream_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventStreamQuery>,
+) -> Response {
+    let Some(store) = state.event_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAVAILABLE",
+                "message": "Event hub unavailable: enable EventStore",
+            })),
+        )
+            .into_response();
+    };
+
+    let world_label = query.world.clone().unwrap_or_else(|| "*".to_string());
+    let db_query = EventQuery {
+        world: query.world.clone(),
+        stage: query.stage.clone(),
+        decision: query.decision.clone(),
+        code: query.code.clone(),
+        chip_type: query.chip_type.clone(),
+        actor: query.actor.clone(),
+        since: query.since.clone(),
+        limit: query.limit,
+    };
+
+    let historical = match store.query(&db_query) {
+        Ok(events) => events,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type": "ubl/error",
+                    "code": "INTERNAL_ERROR",
+                    "message": format!("event query failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    struct StreamClientGuard {
+        world: String,
+    }
+    impl Drop for StreamClientGuard {
+        fn drop(&mut self) {
+            metrics::dec_events_stream_clients(&self.world);
+        }
+    }
+
+    metrics::inc_events_stream_clients(&world_label);
+    let mut rx = state.pipeline.event_bus.subscribe();
+    let stream_world = world_label.clone();
+    let live_filters = query.clone();
+    let sse_stream = stream! {
+        let _guard = StreamClientGuard { world: stream_world };
+
+        for event in historical {
+            let payload = match serde_json::to_string(&event) {
+                Ok(p) => p,
+                Err(_) => {
+                    metrics::inc_events_stream_dropped("serialize_error");
+                    continue;
+                }
+            };
+            let id = event.get("@id").and_then(|v| v.as_str()).unwrap_or("evt");
+            yield Ok::<SseEvent, Infallible>(SseEvent::default().id(id).event("ubl.event").data(payload));
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(receipt_event) => {
+                    let hub = to_hub_event(&receipt_event);
+                    if !hub_matches_query(&hub, &live_filters) {
+                        continue;
+                    }
+                    let payload = match serde_json::to_string(&hub) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            metrics::inc_events_stream_dropped("serialize_error");
+                            continue;
+                        }
+                    };
+                    let id = hub.get("@id").and_then(|v| v.as_str()).unwrap_or("evt");
+                    yield Ok::<SseEvent, Infallible>(SseEvent::default().id(id).event("ubl.event").data(payload));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    metrics::inc_events_stream_dropped("client_lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("heartbeat"),
+        )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct EventSearchQuery {
+    world: Option<String>,
+    stage: Option<String>,
+    decision: Option<String>,
+    code: Option<String>,
+    #[serde(rename = "type")]
+    chip_type: Option<String>,
+    actor: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    page_key: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct AdvisorQuery {
+    world: Option<String>,
+    window: Option<String>,
+    interval_ms: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn search_events(
+    State(state): State<AppState>,
+    Query(query): Query<EventSearchQuery>,
+) -> Response {
+    let Some(store) = state.event_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAVAILABLE",
+                "message": "Event hub unavailable: enable EventStore",
+            })),
+        )
+            .into_response();
+    };
+
+    let since = query
+        .page_key
+        .clone()
+        .or_else(|| query.from.clone())
+        .or_else(|| Some("0".to_string()));
+
+    let db_query = EventQuery {
+        world: query.world.clone(),
+        stage: query.stage.clone(),
+        decision: query.decision.clone(),
+        code: query.code.clone(),
+        chip_type: query.chip_type.clone(),
+        actor: query.actor.clone(),
+        since,
+        limit: query.limit,
+    };
+
+    let mut events = match store.query(&db_query) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type": "ubl/error",
+                    "code": "INTERNAL_ERROR",
+                    "message": format!("event search failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(to) = query.to.as_deref().and_then(parse_when_to_ms) {
+        events.retain(|e| {
+            let when = e
+                .get("when")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("timestamp").and_then(|v| v.as_str()));
+            when.and_then(parse_when_to_ms).is_some_and(|ms| ms <= to)
+        });
+    }
+
+    let next_page_key = events
+        .last()
+        .and_then(|e| {
+            e.get("when")
+                .and_then(|v| v.as_str())
+                .or_else(|| e.get("timestamp").and_then(|v| v.as_str()))
+        })
+        .map(ToString::to_string);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/events.search.response",
+            "count": events.len(),
+            "next_page_key": next_page_key,
+            "events": events,
+        })),
+    )
+        .into_response()
+}
+
+async fn advisor_snapshots(
+    State(state): State<AppState>,
+    Query(query): Query<AdvisorQuery>,
+) -> Response {
+    let Some(store) = state.event_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAVAILABLE",
+                "message": "Advisor snapshot unavailable: enable EventStore",
+            })),
+        )
+            .into_response();
+    };
+
+    let window = parse_window_duration(query.window.as_deref()).unwrap_or(Duration::from_secs(300));
+    let limit = query.limit.unwrap_or(10_000).clamp(100, 50_000);
+    match build_advisor_snapshot(&state, store, query.world.as_deref(), window, limit) {
+        Ok(frame) => (
+            StatusCode::OK,
+            Json(json!({
+                "@type": "ubl/advisor.snapshot",
+                "window_ms": window.as_millis() as u64,
+                "snapshot": frame,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "INTERNAL_ERROR",
+                "message": format!("advisor snapshot failed: {}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn advisor_tap(State(state): State<AppState>, Query(query): Query<AdvisorQuery>) -> Response {
+    let Some(store) = state.event_store.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAVAILABLE",
+                "message": "Advisor tap unavailable: enable EventStore",
+            })),
+        )
+            .into_response();
+    };
+
+    let window = parse_window_duration(query.window.as_deref()).unwrap_or(Duration::from_secs(300));
+    let interval = Duration::from_millis(query.interval_ms.unwrap_or(2_000).clamp(1_000, 5_000));
+    let limit = query.limit.unwrap_or(10_000).clamp(100, 50_000);
+    let world_filter = query.world.clone();
+    let state_for_stream = state.clone();
+
+    let sse_stream = stream! {
+        loop {
+            match build_advisor_snapshot(&state_for_stream, &store, world_filter.as_deref(), window, limit) {
+                Ok(frame) => {
+                    let payload = match serde_json::to_string(&frame) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            metrics::inc_events_stream_dropped("advisor_tap_serialize_error");
+                            tokio::time::sleep(interval).await;
+                            continue;
+                        }
+                    };
+                    let id = frame.get("@id").and_then(|v| v.as_str()).unwrap_or("adv");
+                    yield Ok::<SseEvent, Infallible>(SseEvent::default().id(id).event("ubl.advisor.frame").data(payload));
+                }
+                Err(_) => {
+                    metrics::inc_events_stream_dropped("advisor_tap_query_error");
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("heartbeat"),
+        )
+        .into_response()
+}
+
+fn parse_when_to_ms(input: &str) -> Option<i64> {
+    if let Ok(ms) = input.parse::<i64>() {
+        return Some(ms);
+    }
+    chrono::DateTime::parse_from_rfc3339(input)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+fn parse_window_duration(input: Option<&str>) -> Option<Duration> {
+    let raw = input?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(ms) = raw.parse::<u64>() {
+        return Some(Duration::from_millis(ms));
+    }
+    let (num, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let value = num.parse::<u64>().ok()?;
+    match unit {
+        "s" | "S" => Some(Duration::from_secs(value)),
+        "m" | "M" => Some(Duration::from_secs(value.saturating_mul(60))),
+        "h" | "H" => Some(Duration::from_secs(value.saturating_mul(3600))),
+        _ => None,
+    }
+}
+
+fn build_advisor_snapshot(
+    state: &AppState,
+    store: &EventStore,
+    world: Option<&str>,
+    window: Duration,
+    limit: usize,
+) -> Result<Value, String> {
+    let now = chrono::Utc::now();
+    let since = now
+        .checked_sub_signed(chrono::Duration::from_std(window).map_err(|e| e.to_string())?)
+        .ok_or_else(|| "window underflow".to_string())?;
+
+    let query = EventQuery {
+        world: world.map(ToString::to_string),
+        since: Some(since.timestamp_millis().to_string()),
+        limit: Some(limit),
+        ..Default::default()
+    };
+    let events = store.query(&query).map_err(|e| e.to_string())?;
+
+    let mut by_stage = std::collections::BTreeMap::<String, u64>::new();
+    let mut by_decision = std::collections::BTreeMap::<String, u64>::new();
+    let mut by_code = std::collections::BTreeMap::<String, u64>::new();
+    let mut lat_stage = std::collections::BTreeMap::<String, Vec<f64>>::new();
+    let mut outliers: Vec<(f64, Value)> = Vec::new();
+
+    for event in &events {
+        if let Some(stage) = event.get("stage").and_then(|v| v.as_str()) {
+            *by_stage.entry(stage.to_string()).or_default() += 1;
+        }
+        if let Some(decision) = event
+            .get("receipt")
+            .and_then(|v| v.get("decision"))
+            .and_then(|v| v.as_str())
+        {
+            *by_decision.entry(decision.to_string()).or_default() += 1;
+        }
+        if let Some(code) = event
+            .get("receipt")
+            .and_then(|v| v.get("code"))
+            .and_then(|v| v.as_str())
+        {
+            *by_code.entry(code.to_string()).or_default() += 1;
+        }
+        if let Some(lat) = event
+            .get("perf")
+            .and_then(|v| v.get("latency_ms"))
+            .and_then(|v| v.as_f64())
+        {
+            let stage = event
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            lat_stage.entry(stage).or_default().push(lat);
+            outliers.push((
+                lat,
+                json!({
+                    "receipt_cid": event.get("receipt").and_then(|v| v.get("cid")).cloned().unwrap_or(Value::Null),
+                    "stage": event.get("stage").cloned().unwrap_or(Value::Null),
+                    "chip_type": event.get("chip").and_then(|v| v.get("type")).cloned().unwrap_or(Value::Null),
+                    "latency_ms": lat,
+                }),
+            ));
+        }
+    }
+
+    let mut p95_by_stage = serde_json::Map::new();
+    for (stage, mut vals) in lat_stage {
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((vals.len() - 1) as f64 * 0.95).round() as usize;
+        p95_by_stage.insert(stage, json!(vals[idx]));
+    }
+
+    outliers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let top_outliers: Vec<Value> = outliers.into_iter().take(5).map(|(_, v)| v).collect();
+
+    let samples: Vec<Value> = events
+        .iter()
+        .rev()
+        .take(5)
+        .map(|event| {
+            json!({
+                "event_id": event.get("@id").cloned().unwrap_or(Value::Null),
+                "when": event.get("when").cloned().unwrap_or(Value::Null),
+                "stage": event.get("stage").cloned().unwrap_or(Value::Null),
+                "chip_type": event.get("chip").and_then(|v| v.get("type")).cloned().unwrap_or(Value::Null),
+                "receipt_cid": event.get("receipt").and_then(|v| v.get("cid")).cloned().unwrap_or(Value::Null),
+                "decision": event.get("receipt").and_then(|v| v.get("decision")).cloned().unwrap_or(Value::Null),
+                "code": event.get("receipt").and_then(|v| v.get("code")).cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+
+    let outbox_pending = state
+        .durable_store
+        .as_ref()
+        .and_then(|store| store.outbox_pending().ok());
+
+    Ok(json!({
+        "@type": "ubl/advisor.tap.frame",
+        "@ver": "1.0.0",
+        "@id": format!("adv-{}", now.timestamp_millis()),
+        "@world": world.unwrap_or("*"),
+        "generated_at": now.to_rfc3339(),
+        "window_ms": window.as_millis() as u64,
+        "counts": {
+            "stage": by_stage,
+            "decision": by_decision,
+            "code": by_code,
+        },
+        "latency_ms_p95_by_stage": Value::Object(p95_by_stage),
+        "top_outliers": top_outliers,
+        "samples": samples,
+        "outbox": {
+            "pending": outbox_pending,
+            "retries": Value::Null,
+        },
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RegistryView {
+    types: std::collections::BTreeMap<String, RegistryTypeView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RegistryTypeView {
+    chip_type: String,
+    latest_version: Option<String>,
+    deprecated: bool,
+    has_kats: bool,
+    required_cap: Option<String>,
+    description: Option<String>,
+    docs_url: Option<String>,
+    deprecation: Option<Value>,
+    last_cid: Option<String>,
+    last_updated_at: Option<String>,
+    versions: std::collections::BTreeMap<String, RegistryVersionView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct RegistryVersionView {
+    version: String,
+    schema: Option<Value>,
+    kats: Vec<Value>,
+    required_cap: Option<String>,
+    register_cid: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "console.html")]
+struct ConsoleTemplate {
+    world: String,
+}
+
+#[derive(Template)]
+#[template(path = "console_kpis.html")]
+struct ConsoleKpisTemplate {
+    available: bool,
+    message: String,
+    generated_at: String,
+    total_events: u64,
+    allow_count: u64,
+    deny_count: u64,
+    outbox_pending: String,
+    p95_rows: Vec<StageP95Row>,
+}
+
+#[derive(Clone)]
+struct StageP95Row {
+    stage: String,
+    p95_ms: String,
+}
+
+#[derive(Template)]
+#[template(path = "console_events.html")]
+struct ConsoleEventsTemplate {
+    available: bool,
+    message: String,
+    rows: Vec<ConsoleEventRow>,
+}
+
+#[derive(Clone)]
+struct ConsoleEventRow {
+    when: String,
+    stage: String,
+    decision: String,
+    chip_type: String,
+    code: String,
+    receipt_cid: String,
+}
+
+#[derive(Template)]
+#[template(path = "registry.html")]
+struct RegistryTemplate {
+    world: String,
+}
+
+#[derive(Template)]
+#[template(path = "registry_table.html")]
+struct RegistryTableTemplate {
+    rows: Vec<RegistryRow>,
+}
+
+#[derive(Clone)]
+struct RegistryRow {
+    chip_type: String,
+    latest_version: String,
+    deprecated: bool,
+    has_kats: bool,
+    required_cap: String,
+    last_updated_at: String,
+}
+
+#[derive(Template)]
+#[template(path = "registry_type.html")]
+struct RegistryTypeTemplate {
+    chip_type: String,
+    latest_version: String,
+    deprecated: bool,
+    description: String,
+    docs_url: Option<String>,
+    deprecation_json: String,
+    versions: Vec<RegistryTypeVersionRow>,
+}
+
+#[derive(Clone)]
+struct RegistryTypeVersionRow {
+    version: String,
+    required_cap: String,
+    kats_count: usize,
+    register_cid: String,
+    updated_at: String,
+    kats: Vec<RegistryKatRow>,
+}
+
+#[derive(Clone)]
+struct RegistryKatRow {
+    index: usize,
+    label: String,
+    expected_decision: String,
+    expected_error: String,
+    input_json_preview: String,
+}
+
+#[derive(Template)]
+#[template(path = "registry_kat_result.html")]
+struct RegistryKatResultTemplate {
+    status_code: u16,
+    kat_label: String,
+    expected_decision: String,
+    expected_error: String,
+    actual_decision: String,
+    actual_error: String,
+    receipt_cid: String,
+    pass: bool,
+    response_json: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryKatTestForm {
+    chip_type: String,
+    version: String,
+    kat_index: usize,
+}
+
+#[derive(Template)]
+#[template(path = "console_receipt.html")]
+struct ConsoleReceiptTemplate {
+    cid: String,
+}
+
+fn render_html<T: Template>(template: &T) -> Response {
+    match template.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"INTERNAL_ERROR",
+                "message": format!("template render failed: {}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn console_page(Query(query): Query<std::collections::BTreeMap<String, String>>) -> Response {
+    let world = query
+        .get("world")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
+    render_html(&ConsoleTemplate { world })
+}
+
+async fn console_kpis_partial(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .map(|w| w.as_str())
+        .filter(|w| !w.trim().is_empty() && *w != "*");
+    let Some(store) = state.event_store.as_ref() else {
+        return render_html(&ConsoleKpisTemplate {
+            available: false,
+            message: "EventStore unavailable".to_string(),
+            generated_at: "-".to_string(),
+            total_events: 0,
+            allow_count: 0,
+            deny_count: 0,
+            outbox_pending: "-".to_string(),
+            p95_rows: Vec::new(),
+        });
+    };
+    let snapshot =
+        match build_advisor_snapshot(&state, store, world, Duration::from_secs(300), 5000) {
+            Ok(s) => s,
+            Err(e) => {
+                return render_html(&ConsoleKpisTemplate {
+                    available: false,
+                    message: format!("Snapshot error: {}", e),
+                    generated_at: "-".to_string(),
+                    total_events: 0,
+                    allow_count: 0,
+                    deny_count: 0,
+                    outbox_pending: "-".to_string(),
+                    p95_rows: Vec::new(),
+                });
+            }
+        };
+
+    let mut total_events = 0u64;
+    if let Some(map) = snapshot
+        .get("counts")
+        .and_then(|c| c.get("stage"))
+        .and_then(|v| v.as_object())
+    {
+        for value in map.values() {
+            total_events = total_events.saturating_add(value.as_u64().unwrap_or(0));
+        }
+    }
+
+    let allow_count = snapshot
+        .get("counts")
+        .and_then(|c| c.get("decision"))
+        .and_then(|d| d.get("ALLOW"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let deny_count = snapshot
+        .get("counts")
+        .and_then(|c| c.get("decision"))
+        .and_then(|d| d.get("DENY"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let outbox_pending = snapshot
+        .get("outbox")
+        .and_then(|o| o.get("pending"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let generated_at = snapshot
+        .get("generated_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+
+    let mut p95_rows = Vec::new();
+    if let Some(map) = snapshot
+        .get("latency_ms_p95_by_stage")
+        .and_then(|v| v.as_object())
+    {
+        for (stage, value) in map {
+            let p95_ms = value
+                .as_f64()
+                .map(|v| format!("{:.2}", v))
+                .unwrap_or_else(|| "-".to_string());
+            p95_rows.push(StageP95Row {
+                stage: stage.clone(),
+                p95_ms,
+            });
+        }
+    }
+    p95_rows.sort_by(|a, b| a.stage.cmp(&b.stage));
+
+    render_html(&ConsoleKpisTemplate {
+        available: true,
+        message: String::new(),
+        generated_at,
+        total_events,
+        allow_count,
+        deny_count,
+        outbox_pending,
+        p95_rows,
+    })
+}
+
+async fn console_events_partial(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .map(|w| w.as_str())
+        .filter(|w| !w.trim().is_empty() && *w != "*");
+    let Some(store) = state.event_store.as_ref() else {
+        return render_html(&ConsoleEventsTemplate {
+            available: false,
+            message: "EventStore unavailable".to_string(),
+            rows: Vec::new(),
+        });
+    };
+    let events = match store.query(&EventQuery {
+        world: world.map(ToString::to_string),
+        limit: Some(20),
+        ..Default::default()
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            return render_html(&ConsoleEventsTemplate {
+                available: false,
+                message: format!("Events query error: {}", e),
+                rows: Vec::new(),
+            });
+        }
+    };
+
+    let rows: Vec<ConsoleEventRow> = events
+        .iter()
+        .rev()
+        .map(|event| ConsoleEventRow {
+            when: event
+                .get("when")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            stage: event
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            decision: event
+                .get("receipt")
+                .and_then(|v| v.get("decision"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            chip_type: event
+                .get("chip")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            code: event
+                .get("receipt")
+                .and_then(|v| v.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            receipt_cid: event
+                .get("receipt")
+                .and_then(|v| v.get("cid"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+        })
+        .collect();
+
+    render_html(&ConsoleEventsTemplate {
+        available: true,
+        message: String::new(),
+        rows,
+    })
+}
+
+async fn console_receipt_page(Path(cid): Path<String>) -> Response {
+    render_html(&ConsoleReceiptTemplate { cid })
+}
+
+async fn registry_page(
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
+    render_html(&RegistryTemplate { world })
+}
+
+async fn registry_table_partial(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .map(|w| w.as_str())
+        .filter(|w| !w.trim().is_empty() && *w != "*");
+    let registry = match materialize_registry(&state, world).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let rows: Vec<RegistryRow> = registry
+        .types
+        .values()
+        .map(|view| RegistryRow {
+            chip_type: view.chip_type.clone(),
+            latest_version: view
+                .latest_version
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            deprecated: view.deprecated,
+            has_kats: view.has_kats,
+            required_cap: view.required_cap.clone().unwrap_or_else(|| "-".to_string()),
+            last_updated_at: view
+                .last_updated_at
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        })
+        .collect();
+    render_html(&RegistryTableTemplate { rows })
+}
+
+async fn registry_type_page(
+    State(state): State<AppState>,
+    Path(chip_type): Path<String>,
+) -> Response {
+    let normalized_type = chip_type.trim_start_matches('/').to_string();
+    let registry = match materialize_registry(&state, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(view) = registry.types.get(&normalized_type) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!("Registry type '{}' not found", normalized_type),
+            })),
+        )
+            .into_response();
+    };
+
+    let versions: Vec<RegistryTypeVersionRow> = view
+        .versions
+        .values()
+        .map(|ver| {
+            let kats = ver
+                .kats
+                .iter()
+                .enumerate()
+                .map(|(index, kat)| {
+                    let label = kat
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("kat")
+                        .to_string();
+                    let expected_decision = kat
+                        .get("expected_decision")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let expected_error = kat
+                        .get("expected_error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-")
+                        .to_string();
+                    let input_json_preview = kat
+                        .get("input")
+                        .map(Value::to_string)
+                        .map(|s| {
+                            if s.len() > 240 {
+                                format!("{}...", &s[..240])
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    RegistryKatRow {
+                        index,
+                        label,
+                        expected_decision,
+                        expected_error,
+                        input_json_preview,
+                    }
+                })
+                .collect();
+            RegistryTypeVersionRow {
+                version: ver.version.clone(),
+                required_cap: ver.required_cap.clone().unwrap_or_else(|| "-".to_string()),
+                kats_count: ver.kats.len(),
+                register_cid: ver.register_cid.clone().unwrap_or_else(|| "-".to_string()),
+                updated_at: ver.updated_at.clone().unwrap_or_else(|| "-".to_string()),
+                kats,
+            }
+        })
+        .collect();
+    let deprecation_json = view
+        .deprecation
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| "-".to_string());
+
+    render_html(&RegistryTypeTemplate {
+        chip_type: view.chip_type.clone(),
+        latest_version: view
+            .latest_version
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        deprecated: view.deprecated,
+        description: view.description.clone().unwrap_or_else(|| "-".to_string()),
+        docs_url: view.docs_url.clone(),
+        deprecation_json,
+        versions,
+    })
+}
+
+async fn registry_kat_test(
+    State(state): State<AppState>,
+    Form(form): Form<RegistryKatTestForm>,
+) -> Response {
+    let registry = match materialize_registry(&state, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(type_view) = registry.types.get(&form.chip_type) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!("Registry type '{}' not found", form.chip_type),
+            })),
+        )
+            .into_response();
+    };
+    let Some(version_view) = type_view.versions.get(&form.version) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!(
+                    "Registry version '{}' not found for type '{}'",
+                    form.version, form.chip_type
+                ),
+            })),
+        )
+            .into_response();
+    };
+    let Some(kat) = version_view.kats.get(form.kat_index) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!(
+                    "KAT index '{}' not found for type '{}' version '{}'",
+                    form.kat_index, form.chip_type, form.version
+                ),
+            })),
+        )
+            .into_response();
+    };
+
+    let kat_label = kat
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("kat")
+        .to_string();
+    let expected_decision = kat
+        .get("expected_decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+    let expected_error = kat
+        .get("expected_error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+    let Some(input_chip) = kat.get("input") else {
+        return render_html(&RegistryKatResultTemplate {
+            status_code: 400,
+            kat_label,
+            expected_decision,
+            expected_error,
+            actual_decision: "-".to_string(),
+            actual_error: "missing_kat_input".to_string(),
+            receipt_cid: "-".to_string(),
+            pass: false,
+            response_json: "{}".to_string(),
+            message: "KAT input missing".to_string(),
+        });
+    };
+    let body = match serde_json::to_vec(input_chip) {
+        Ok(v) => v,
+        Err(e) => {
+            return render_html(&RegistryKatResultTemplate {
+                status_code: 500,
+                kat_label,
+                expected_decision,
+                expected_error,
+                actual_decision: "-".to_string(),
+                actual_error: "kat_input_serialize_error".to_string(),
+                receipt_cid: "-".to_string(),
+                pass: false,
+                response_json: "{}".to_string(),
+                message: format!("KAT input serialization failed: {}", e),
+            });
+        }
+    };
+
+    let (status, _headers, payload) = submit_chip_bytes(&state, &body).await;
+    let actual_decision = payload
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-")
+        .to_string();
+    let actual_error = payload
+        .get("code")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            payload
+                .get("receipt")
+                .and_then(|v| v.get("code"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("-")
+        .to_string();
+    let receipt_cid = payload
+        .get("receipt_cid")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            payload
+                .get("receipt")
+                .and_then(|v| v.get("receipt_cid"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("-")
+        .to_string();
+
+    let decision_match = expected_decision == "-"
+        || actual_decision
+            .to_ascii_lowercase()
+            .contains(&expected_decision.to_ascii_lowercase());
+    let error_match = expected_error == "-" || actual_error == expected_error;
+    let pass = status.is_success() && decision_match && error_match;
+    let response_json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+    let message = if pass {
+        "KAT passed".to_string()
+    } else {
+        "KAT failed".to_string()
+    };
+
+    render_html(&RegistryKatResultTemplate {
+        status_code: status.as_u16(),
+        kat_label,
+        expected_decision,
+        expected_error,
+        actual_decision,
+        actual_error,
+        receipt_cid,
+        pass,
+        response_json,
+        message,
+    })
+}
+
+async fn registry_types(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query.get("world").map(|s| s.as_str());
+    let registry = match materialize_registry(&state, world).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut types: Vec<Value> = Vec::with_capacity(registry.types.len());
+    for view in registry.types.values() {
+        types.push(json!({
+            "type": view.chip_type,
+            "latest_version": view.latest_version,
+            "deprecated": view.deprecated,
+            "has_kats": view.has_kats,
+            "required_cap": view.required_cap,
+            "last_cid": view.last_cid,
+            "last_updated_at": view.last_updated_at,
+            "versions_count": view.versions.len(),
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/registry.types",
+            "count": types.len(),
+            "types": types,
+        })),
+    )
+        .into_response()
+}
+
+async fn registry_type_detail(
+    State(state): State<AppState>,
+    Path(chip_type): Path<String>,
+) -> Response {
+    let registry = match materialize_registry(&state, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(view) = registry.types.get(&chip_type) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!("Registry type '{}' not found", chip_type),
+            })),
+        )
+            .into_response();
+    };
+
+    let versions: Vec<Value> = view
+        .versions
+        .values()
+        .map(|ver| {
+            json!({
+                "version": ver.version,
+                "schema": ver.schema,
+                "kats": ver.kats,
+                "required_cap": ver.required_cap,
+                "register_cid": ver.register_cid,
+                "updated_at": ver.updated_at,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/registry.type",
+            "type": view.chip_type,
+            "latest_version": view.latest_version,
+            "deprecated": view.deprecated,
+            "description": view.description,
+            "docs_url": view.docs_url,
+            "deprecation": view.deprecation,
+            "has_kats": view.has_kats,
+            "required_cap": view.required_cap,
+            "last_cid": view.last_cid,
+            "last_updated_at": view.last_updated_at,
+            "versions": versions,
+        })),
+    )
+        .into_response()
+}
+
+async fn registry_type_version(
+    State(state): State<AppState>,
+    Path((chip_type, ver)): Path<(String, String)>,
+) -> Response {
+    let registry = match materialize_registry(&state, None).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("registry materialization failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(view) = registry.types.get(&chip_type) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!("Registry type '{}' not found", chip_type),
+            })),
+        )
+            .into_response();
+    };
+    let Some(version) = view.versions.get(&ver) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"NOT_FOUND",
+                "message": format!("Registry version '{}' not found for type '{}'", ver, chip_type),
+            })),
+        )
+            .into_response();
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/registry.version",
+            "type": chip_type,
+            "version": version.version,
+            "schema": version.schema,
+            "kats": version.kats,
+            "required_cap": version.required_cap,
+            "register_cid": version.register_cid,
+            "updated_at": version.updated_at,
+            "deprecated": view.deprecated,
+            "deprecation": view.deprecation,
+        })),
+    )
+        .into_response()
+}
+
+async fn materialize_registry(
+    state: &AppState,
+    world_filter: Option<&str>,
+) -> Result<RegistryView, String> {
+    fn world_matches(chip: &ubl_chipstore::StoredChip, world_filter: Option<&str>) -> bool {
+        let Some(expected) = world_filter else {
+            return true;
+        };
+        chip.chip_data
+            .get("@world")
+            .and_then(|v| v.as_str())
+            .map(|w| w == expected)
+            .unwrap_or(false)
+    }
+
+    fn type_entry<'a>(
+        map: &'a mut std::collections::BTreeMap<String, RegistryTypeView>,
+        chip_type: &str,
+    ) -> &'a mut RegistryTypeView {
+        map.entry(chip_type.to_string())
+            .or_insert_with(|| RegistryTypeView {
+                chip_type: chip_type.to_string(),
+                latest_version: None,
+                deprecated: false,
+                has_kats: false,
+                required_cap: None,
+                description: None,
+                docs_url: None,
+                deprecation: None,
+                last_cid: None,
+                last_updated_at: None,
+                versions: std::collections::BTreeMap::new(),
+            })
+    }
+
+    let mut types = std::collections::BTreeMap::<String, RegistryTypeView>::new();
+
+    let mut registers = state
+        .chip_store
+        .get_chips_by_type("ubl/meta.register")
+        .await
+        .map_err(|e| e.to_string())?;
+    registers.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    for chip in registers {
+        if !world_matches(&chip, world_filter) {
+            continue;
+        }
+        let Ok(parsed) = ubl_runtime::meta_chip::parse_register(&chip.chip_data) else {
+            continue;
+        };
+        let entry = type_entry(&mut types, &parsed.target_type);
+        entry.latest_version = Some(parsed.type_version.clone());
+        entry.description = Some(parsed.description.clone());
+        entry.has_kats = entry.has_kats || !parsed.kats.is_empty();
+        entry.required_cap = parsed.schema.required_cap.clone();
+        entry.last_cid = Some(chip.cid.to_string());
+        entry.last_updated_at = Some(chip.created_at.clone());
+        entry.versions.insert(
+            parsed.type_version.clone(),
+            RegistryVersionView {
+                version: parsed.type_version,
+                schema: serde_json::to_value(parsed.schema.clone()).ok(),
+                kats: parsed
+                    .kats
+                    .iter()
+                    .filter_map(|k| serde_json::to_value(k).ok())
+                    .collect(),
+                required_cap: parsed.schema.required_cap.clone(),
+                register_cid: Some(chip.cid.to_string()),
+                updated_at: Some(chip.created_at.clone()),
+            },
+        );
+    }
+
+    let mut describes = state
+        .chip_store
+        .get_chips_by_type("ubl/meta.describe")
+        .await
+        .map_err(|e| e.to_string())?;
+    describes.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    for chip in describes {
+        if !world_matches(&chip, world_filter) {
+            continue;
+        }
+        let Ok(parsed) = ubl_runtime::meta_chip::parse_describe(&chip.chip_data) else {
+            continue;
+        };
+        let entry = type_entry(&mut types, &parsed.target_type);
+        entry.description = Some(parsed.description);
+        entry.docs_url = parsed.docs_url;
+        entry.last_cid = Some(chip.cid.to_string());
+        entry.last_updated_at = Some(chip.created_at.clone());
+        if !parsed.kats.is_empty() {
+            entry.has_kats = true;
+            if let Some(ver) = entry.latest_version.clone() {
+                if let Some(version_entry) = entry.versions.get_mut(&ver) {
+                    version_entry.kats = parsed
+                        .kats
+                        .iter()
+                        .filter_map(|k| serde_json::to_value(k).ok())
+                        .collect();
+                    version_entry.updated_at = Some(chip.created_at.clone());
+                }
+            }
+        }
+    }
+
+    let mut deprecates = state
+        .chip_store
+        .get_chips_by_type("ubl/meta.deprecate")
+        .await
+        .map_err(|e| e.to_string())?;
+    deprecates.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    for chip in deprecates {
+        if !world_matches(&chip, world_filter) {
+            continue;
+        }
+        let Ok(parsed) = ubl_runtime::meta_chip::parse_deprecate(&chip.chip_data) else {
+            continue;
+        };
+        let entry = type_entry(&mut types, &parsed.target_type);
+        entry.deprecated = true;
+        entry.deprecation = Some(json!({
+            "reason": parsed.reason,
+            "replacement_type": parsed.replacement_type,
+            "sunset_at": parsed.sunset_at,
+            "cid": chip.cid.to_string(),
+        }));
+        entry.last_cid = Some(chip.cid.to_string());
+        entry.last_updated_at = Some(chip.created_at.clone());
+    }
+
+    Ok(RegistryView { types })
+}
+
+fn to_hub_event(event: &ReceiptEvent) -> Value {
+    let stage = normalize_stage(&event.pipeline_stage);
+    let event_id = deterministic_event_id(event, &stage);
+    let world = event
+        .world
+        .clone()
+        .unwrap_or_else(|| "a/system".to_string());
+    let chip_id = event
+        .metadata
+        .get("@id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let chip_ver = event
+        .metadata
+        .get("@ver")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let code = event
+        .metadata
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let cap = event
+        .metadata
+        .get("cap")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+
+    let decision = event.decision.as_ref().map(|d| d.to_ascii_uppercase());
+    let mut receipt = json!({
+        "cid": event.receipt_cid.clone(),
+        "decision": decision,
+        "code": code,
+    });
+    if receipt.get("code").is_some_and(Value::is_null) {
+        if let Some(obj) = receipt.as_object_mut() {
+            obj.remove("code");
+        }
+    }
+
+    json!({
+        "@type": "ubl/event",
+        "@ver": "1.0.0",
+        "@id": event_id,
+        "@world": world,
+        "source": "pipeline",
+        "stage": stage,
+        "when": event.timestamp.clone(),
+        "chip": {
+            "type": event.receipt_type.clone(),
+            "id": chip_id,
+            "ver": chip_ver,
+        },
+        "receipt": receipt,
+        "perf": {
+            "latency_ms": event.latency_ms.or(event.duration_ms),
+            "fuel": event.fuel_used,
+            "mem_kb": Value::Null,
+        },
+        "actor": {
+            "kid": event.actor.clone(),
+            "cap": cap,
+        },
+        "artifacts": event.artifact_cids.clone(),
+        "runtime": {
+            "binary_hash": event.binary_hash.clone(),
+            "build": event.build_meta.clone(),
+        },
+        "labels": Value::Object(Default::default()),
+    })
+}
+
+fn normalize_stage(stage: &str) -> String {
+    match stage.to_ascii_lowercase().as_str() {
+        "knock" => "KNOCK".to_string(),
+        "wa" | "write_ahead" => "WA".to_string(),
+        "check" => "CHECK".to_string(),
+        "tr" | "transition" => "TR".to_string(),
+        "wf" | "write_finished" => "WF".to_string(),
+        "registry" => "REGISTRY".to_string(),
+        other => other.to_ascii_uppercase(),
+    }
+}
+
+fn deterministic_event_id(event: &ReceiptEvent, stage: &str) -> String {
+    format!(
+        "evt:{}:{}:{}:{}",
+        event.receipt_cid,
+        stage,
+        event.input_cid.as_deref().unwrap_or(""),
+        event.output_cid.as_deref().unwrap_or("")
+    )
+}
+
+fn hub_matches_query(event: &Value, query: &EventStreamQuery) -> bool {
+    if let Some(world) = &query.world {
+        if event.get("@world").and_then(|v| v.as_str()) != Some(world.as_str()) {
+            return false;
+        }
+    }
+    if let Some(stage) = &query.stage {
+        let actual = event.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+        if actual != stage && !actual.eq_ignore_ascii_case(stage) {
+            return false;
+        }
+    }
+    if let Some(decision) = &query.decision {
+        let actual = event
+            .get("receipt")
+            .and_then(|v| v.get("decision"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if actual != decision && !actual.eq_ignore_ascii_case(decision) {
+            return false;
+        }
+    }
+    if let Some(code) = &query.code {
+        if event
+            .get("receipt")
+            .and_then(|v| v.get("code"))
+            .and_then(|v| v.as_str())
+            != Some(code.as_str())
+        {
+            return false;
+        }
+    }
+    if let Some(chip_type) = &query.chip_type {
+        let actual = event
+            .get("chip")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if chip_type != "*" && actual != chip_type {
+            return false;
+        }
+    }
+    if let Some(actor) = &query.actor {
+        if event
+            .get("actor")
+            .and_then(|v| v.get("kid"))
+            .and_then(|v| v.as_str())
+            != Some(actor.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/console", get(console_page))
+        .route("/console/_kpis", get(console_kpis_partial))
+        .route("/console/_events", get(console_events_partial))
+        .route("/console/receipt/:cid", get(console_receipt_page))
+        .route("/registry", get(registry_page))
+        .route("/registry/_table", get(registry_table_partial))
+        .route("/registry/_kat_test", post(registry_kat_test))
+        .route("/registry/*chip_type", get(registry_type_page))
+        .route("/v1/events", get(stream_events))
+        .route("/v1/events/search", get(search_events))
+        .route("/v1/advisor/tap", get(advisor_tap))
+        .route("/v1/advisor/snapshots", get(advisor_snapshots))
+        .route("/v1/registry/types", get(registry_types))
+        .route("/v1/registry/types/:chip_type", get(registry_type_detail))
+        .route(
+            "/v1/registry/types/:chip_type/versions/:ver",
+            get(registry_type_version),
+        )
         .route("/v1/runtime/attestation", get(get_runtime_attestation))
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
@@ -1276,10 +2939,12 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
+    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
     use ubl_chipstore::InMemoryBackend;
     use ubl_runtime::durable_store::{CommitInput, NewOutboxEvent};
+    use ubl_runtime::event_bus::ReceiptEvent;
 
     fn test_state(canon_limiter: Option<Arc<CanonRateLimiter>>) -> AppState {
         let backend = Arc::new(InMemoryBackend::new());
@@ -1301,6 +2966,7 @@ mod tests {
             advisory_engine,
             canon_rate_limiter: canon_limiter,
             durable_store: None,
+            event_store: None,
         }
     }
 
@@ -1336,6 +3002,38 @@ mod tests {
         store.commit_wf_atomically(&input).unwrap();
         state.durable_store = Some(Arc::new(store));
         state
+    }
+
+    fn test_state_with_event_store(events: Vec<Value>) -> AppState {
+        let mut state = test_state(None);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ubl_gate_events_{}", ts));
+        let store = EventStore::open(path).unwrap();
+        for event in events {
+            store.append_event_json(&event).unwrap();
+        }
+        state.event_store = Some(Arc::new(store));
+        state
+    }
+
+    async fn seed_meta_chip(state: &AppState, body: Value, receipt_cid: &str) {
+        let metadata: ubl_chipstore::ExecutionMetadata = serde_json::from_value(json!({
+            "runtime_version": "test-runtime",
+            "execution_time_ms": 1,
+            "fuel_consumed": 0,
+            "policies_applied": [],
+            "executor_did": "did:key:ztest",
+            "reproducible": true
+        }))
+        .unwrap();
+        state
+            .chip_store
+            .store_executed_chip(body, receipt_cid.to_string(), metadata)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1481,5 +3179,452 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn events_search_unavailable_without_event_store() {
+        let app = build_router(test_state(None));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/events/search?world=a/acme")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn events_search_filters_world_and_decision() {
+        let app = build_router(test_state_with_event_store(vec![
+            json!({
+                "@type": "ubl/event",
+                "@ver": "1.0.0",
+                "@id": "evt-allow-1",
+                "@world": "a/acme/t/prod",
+                "source": "pipeline",
+                "stage": "WF",
+                "when": "2026-02-18T12:00:00.000Z",
+                "chip": {"type": "ubl/user", "id": "u1", "ver": "1.0"},
+                "receipt": {"cid": "b3:r1", "decision": "ALLOW", "code": "ok"},
+                "actor": {"kid": "did:key:z1#k1"},
+            }),
+            json!({
+                "@type": "ubl/event",
+                "@ver": "1.0.0",
+                "@id": "evt-deny-1",
+                "@world": "a/acme/t/prod",
+                "source": "pipeline",
+                "stage": "CHECK",
+                "when": "2026-02-18T12:00:01.000Z",
+                "chip": {"type": "ubl/user", "id": "u2", "ver": "1.0"},
+                "receipt": {"cid": "b3:r2", "decision": "DENY", "code": "check.policy.deny"},
+                "actor": {"kid": "did:key:z1#k1"},
+            }),
+            json!({
+                "@type": "ubl/event",
+                "@ver": "1.0.0",
+                "@id": "evt-deny-2",
+                "@world": "a/other/t/dev",
+                "source": "pipeline",
+                "stage": "CHECK",
+                "when": "2026-02-18T12:00:02.000Z",
+                "chip": {"type": "ubl/user", "id": "u3", "ver": "1.0"},
+                "receipt": {"cid": "b3:r3", "decision": "DENY", "code": "check.policy.deny"},
+                "actor": {"kid": "did:key:z1#k1"},
+            }),
+        ]));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/events/search?world=a/acme/t/prod&decision=deny")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/events.search.response");
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["events"][0]["@id"], "evt-deny-1");
+    }
+
+    #[tokio::test]
+    async fn advisor_snapshots_unavailable_without_event_store() {
+        let app = build_router(test_state(None));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/advisor/snapshots?window=5m")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn advisor_snapshots_returns_aggregates() {
+        let now = chrono::Utc::now();
+        let app = build_router(test_state_with_event_store(vec![
+            json!({
+                "@type": "ubl/event",
+                "@ver": "1.0.0",
+                "@id": "evt-adv-1",
+                "@world": "a/acme/t/prod",
+                "source": "pipeline",
+                "stage": "CHECK",
+                "when": now.to_rfc3339(),
+                "chip": {"type": "ubl/user", "id": "u1", "ver": "1.0"},
+                "receipt": {"cid": "b3:ra1", "decision": "DENY", "code": "check.policy.deny"},
+                "perf": {"latency_ms": 10.0},
+                "actor": {"kid": "did:key:z1#k1"},
+            }),
+            json!({
+                "@type": "ubl/event",
+                "@ver": "1.0.0",
+                "@id": "evt-adv-2",
+                "@world": "a/acme/t/prod",
+                "source": "pipeline",
+                "stage": "WF",
+                "when": now.to_rfc3339(),
+                "chip": {"type": "ubl/user", "id": "u2", "ver": "1.0"},
+                "receipt": {"cid": "b3:ra2", "decision": "ALLOW", "code": "ok"},
+                "perf": {"latency_ms": 20.0},
+                "actor": {"kid": "did:key:z1#k1"},
+            }),
+        ]));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/advisor/snapshots?world=a/acme/t/prod&window=5m")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/advisor.snapshot");
+        assert_eq!(v["snapshot"]["counts"]["decision"]["ALLOW"], 1);
+        assert_eq!(v["snapshot"]["counts"]["decision"]["DENY"], 1);
+        assert_eq!(v["snapshot"]["counts"]["stage"]["CHECK"], 1);
+        assert_eq!(v["snapshot"]["counts"]["stage"]["WF"], 1);
+    }
+
+    #[test]
+    fn to_hub_event_maps_core_fields() {
+        let event = ReceiptEvent {
+            at_type: "ubl/event".to_string(),
+            event_type: "ubl.receipt.wf".to_string(),
+            schema_version: "1.0".to_string(),
+            idempotency_key: "b3:receipt-1".to_string(),
+            receipt_cid: "b3:receipt-1".to_string(),
+            receipt_type: "ubl/user".to_string(),
+            decision: Some("allow".to_string()),
+            duration_ms: Some(12),
+            timestamp: "2026-02-18T12:34:56.000Z".to_string(),
+            pipeline_stage: "wf".to_string(),
+            fuel_used: Some(7),
+            rb_count: None,
+            artifact_cids: vec!["b3:artifact-1".to_string()],
+            metadata: json!({"@id":"chip-1","@ver":"1.0.0","code":"ok"}),
+            input_cid: Some("b3:in".to_string()),
+            output_cid: Some("b3:receipt-1".to_string()),
+            binary_hash: Some("sha256:abc".to_string()),
+            build_meta: Some(json!({"git":"abc123"})),
+            world: Some("a/acme/t/prod".to_string()),
+            actor: Some("did:key:z1#k1".to_string()),
+            latency_ms: Some(12),
+        };
+
+        let hub = to_hub_event(&event);
+        assert_eq!(hub["@type"], "ubl/event");
+        assert_eq!(hub["@ver"], "1.0.0");
+        assert_eq!(hub["stage"], "WF");
+        assert_eq!(hub["@world"], "a/acme/t/prod");
+        assert_eq!(hub["chip"]["type"], "ubl/user");
+        assert_eq!(hub["receipt"]["cid"], "b3:receipt-1");
+        assert_eq!(hub["receipt"]["decision"], "ALLOW");
+        assert_eq!(hub["perf"]["fuel"], 7);
+    }
+
+    #[test]
+    fn hub_matches_query_applies_stage_and_world_filters() {
+        let event = json!({
+            "@type": "ubl/event",
+            "@ver": "1.0.0",
+            "@id": "evt-1",
+            "@world": "a/acme/t/prod",
+            "stage": "CHECK",
+            "chip": {"type": "ubl/user"},
+            "receipt": {"decision": "DENY", "code": "check.policy.deny"},
+            "actor": {"kid": "did:key:z1#k1"}
+        });
+
+        let q_ok = EventStreamQuery {
+            world: Some("a/acme/t/prod".to_string()),
+            stage: Some("check".to_string()),
+            decision: Some("deny".to_string()),
+            code: Some("check.policy.deny".to_string()),
+            chip_type: Some("ubl/user".to_string()),
+            actor: Some("did:key:z1#k1".to_string()),
+            since: None,
+            limit: None,
+        };
+        assert!(hub_matches_query(&event, &q_ok));
+
+        let q_bad_world = EventStreamQuery {
+            world: Some("a/other".to_string()),
+            ..q_ok
+        };
+        assert!(!hub_matches_query(&event, &q_bad_world));
+    }
+
+    #[tokio::test]
+    async fn registry_types_materializes_meta_chips() {
+        let state = test_state(None);
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.register",
+                "@id":"reg-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/invoice",
+                "description":"Invoice type",
+                "type_version":"1.0",
+                "schema":{
+                    "required_fields":[{"name":"amount","field_type":"string","description":"Amount"}],
+                    "optional_fields":[],
+                    "required_cap":"invoice:create"
+                },
+                "kats":[{
+                    "label":"allow invoice",
+                    "input":{"@type":"acme/invoice","@id":"i1","@ver":"1.0","@world":"a/acme/t/prod","amount":"10.00"},
+                    "expected_decision":"allow"
+                }]
+            }),
+            "b3:r-meta-1",
+        )
+        .await;
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.describe",
+                "@id":"desc-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/invoice",
+                "description":"Invoice type updated",
+                "docs_url":"https://example.com/acme-invoice"
+            }),
+            "b3:r-meta-2",
+        )
+        .await;
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.deprecate",
+                "@id":"dep-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/invoice",
+                "reason":"use acme/invoice.v2",
+                "replacement_type":"acme/invoice.v2",
+                "sunset_at":"2026-12-01T00:00:00Z"
+            }),
+            "b3:r-meta-3",
+        )
+        .await;
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/registry/types?world=a/acme/t/prod")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/registry.types");
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["types"][0]["type"], "acme/invoice");
+        assert_eq!(v["types"][0]["deprecated"], true);
+        assert_eq!(v["types"][0]["required_cap"], "invoice:create");
+    }
+
+    #[tokio::test]
+    async fn registry_version_endpoint_returns_schema_and_kats() {
+        let state = test_state(None);
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.register",
+                "@id":"reg-v1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/payment",
+                "description":"Payment type",
+                "type_version":"1.0",
+                "schema":{
+                    "required_fields":[{"name":"value","field_type":"string","description":"Value"}],
+                    "optional_fields":[],
+                    "required_cap":"payment:create"
+                },
+                "kats":[{
+                    "label":"allow payment",
+                    "input":{"@type":"acme/payment","@id":"p1","@ver":"1.0","@world":"a/acme/t/prod","value":"1"},
+                    "expected_decision":"allow"
+                }]
+            }),
+            "b3:r-meta-v1",
+        )
+        .await;
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/registry/types/acme%2Fpayment/versions/1.0")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/registry.version");
+        assert_eq!(v["type"], "acme/payment");
+        assert_eq!(v["version"], "1.0");
+        assert_eq!(v["required_cap"], "payment:create");
+        assert_eq!(v["kats"][0]["label"], "allow payment");
+    }
+
+    #[tokio::test]
+    async fn console_and_registry_pages_render_html() {
+        let app = build_router(test_state(None));
+
+        let console_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(console_res.status(), StatusCode::OK);
+        let console_body = to_bytes(console_res.into_body(), usize::MAX).await.unwrap();
+        let console_html = String::from_utf8(console_body.to_vec()).unwrap();
+        assert!(console_html.contains("UBL Console"));
+
+        let registry_res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/registry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry_res.status(), StatusCode::OK);
+        let registry_body = to_bytes(registry_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let registry_html = String::from_utf8(registry_body.to_vec()).unwrap();
+        assert!(registry_html.contains("UBL Registry"));
+    }
+
+    #[tokio::test]
+    async fn registry_type_page_renders_for_wildcard_path() {
+        let state = test_state(None);
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.register",
+                "@id":"reg-html-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/invoice",
+                "description":"Invoice type",
+                "type_version":"1.0",
+                "schema":{
+                    "required_fields":[{"name":"amount","field_type":"string","description":"Amount"}],
+                    "optional_fields":[],
+                    "required_cap":"invoice:create"
+                },
+                "kats":[{
+                    "label":"allow invoice",
+                    "input":{"@type":"acme/invoice","@id":"i1","@ver":"1.0","@world":"a/acme/t/prod","amount":"10.00"},
+                    "expected_decision":"allow"
+                }]
+            }),
+            "b3:r-meta-html-1",
+        )
+        .await;
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/registry/acme/invoice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Registry Type: acme/invoice"));
+    }
+
+    #[tokio::test]
+    async fn registry_kat_test_endpoint_runs_and_renders_result() {
+        let state = test_state(None);
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/meta.register",
+                "@id":"reg-kat-1",
+                "@ver":"1.0",
+                "@world":"a/acme/t/prod",
+                "target_type":"acme/invoice",
+                "description":"Invoice type",
+                "type_version":"1.0",
+                "schema":{
+                    "required_fields":[{"name":"amount","field_type":"string","description":"Amount"}],
+                    "optional_fields":[],
+                    "required_cap":"invoice:create"
+                },
+                "kats":[{
+                    "label":"allow invoice",
+                    "input":{"@type":"acme/invoice","@id":"i-kat-1","@ver":"1.0","@world":"a/acme/t/prod","amount":"10.00"},
+                    "expected_decision":"allow"
+                }]
+            }),
+            "b3:r-meta-kat-1",
+        )
+        .await;
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/registry/_kat_test")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "chip_type=acme%2Finvoice&version=1.0&kat_index=0",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("KAT Result"));
+        assert!(html.contains("allow invoice"));
     }
 }
