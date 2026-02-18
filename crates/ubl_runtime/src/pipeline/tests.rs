@@ -1529,3 +1529,25 @@ async fn idempotent_replay_different_id_is_fresh() {
         "different @id → different execution"
     );
 }
+
+#[tokio::test]
+async fn strict_idempotency_requires_type_ver_world_id() {
+    let storage = InMemoryPolicyStorage::new();
+    let pipeline = UblPipeline::new(Box::new(storage));
+
+    let request = ChipRequest {
+        chip_type: "ubl/document".to_string(),
+        body: json!({
+            "@type": "ubl/document",
+            "@ver": "1.0",
+            "@world": "a/x/t/y",
+            "title": "missing id"
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    let err = pipeline.process_chip(request).await.unwrap_err();
+    assert!(matches!(err, PipelineError::InvalidChip(_)));
+    assert!(err.to_string().contains("strict idempotency anchors"));
+}

@@ -25,6 +25,7 @@ use ubl_runtime::event_bus::EventBus;
 use ubl_runtime::manifest::GateManifest;
 use ubl_runtime::outbox_dispatcher::OutboxDispatcher;
 use ubl_runtime::policy_loader::InMemoryPolicyStorage;
+use ubl_runtime::rate_limit::{CanonRateLimiter, RateLimitConfig, RateLimitResult};
 use ubl_runtime::UblPipeline;
 
 mod metrics;
@@ -36,6 +37,7 @@ struct AppState {
     chip_store: Arc<ChipStore>,
     manifest: Arc<GateManifest>,
     advisory_engine: Arc<AdvisoryEngine>,
+    canon_rate_limiter: Option<Arc<CanonRateLimiter>>,
 }
 
 #[tokio::main]
@@ -123,9 +125,174 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chip_store,
         manifest,
         advisory_engine,
+        canon_rate_limiter: load_canon_rate_limiter(),
     };
 
-    let app = Router::new()
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await?;
+    info!("gate listening on http://0.0.0.0:4000");
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,ubl_runtime=debug,ubl_gate=debug"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .try_init();
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+fn load_canon_rate_limiter() -> Option<Arc<CanonRateLimiter>> {
+    if !env_bool("UBL_CANON_RATE_LIMIT_ENABLED", true) {
+        return None;
+    }
+    let per_min = std::env::var("UBL_CANON_RATE_LIMIT_PER_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(120)
+        .max(1);
+    Some(Arc::new(CanonRateLimiter::new(
+        RateLimitConfig::per_minute(per_min),
+    )))
+}
+
+fn too_many_requests_error(message: String, details: Value) -> UblError {
+    UblError {
+        error_type: "ubl/error".to_string(),
+        id: format!("err-rate-{}", chrono::Utc::now().timestamp_micros()),
+        ver: "1.0".to_string(),
+        world: "a/system/t/errors".to_string(),
+        code: ErrorCode::TooManyRequests,
+        message,
+        link: "https://docs.ubl.agency/errors#TOO_MANY_REQUESTS".to_string(),
+        details: Some(details),
+    }
+}
+
+async fn submit_chip_bytes(state: &AppState, body: &[u8]) -> (StatusCode, HeaderMap, Value) {
+    metrics::inc_chips_total();
+    let t0 = std::time::Instant::now();
+
+    let value = match ubl_runtime::knock::knock(body) {
+        Ok(v) => v,
+        Err(e) => {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
+            let ubl_err = UblError::from_pipeline_error(
+                &ubl_runtime::pipeline::PipelineError::Knock(e.to_string()),
+            );
+            let code_str = format!("{:?}", ubl_err.code);
+            metrics::inc_knock_reject();
+            metrics::inc_error(&code_str);
+            let status =
+                StatusCode::from_u16(ubl_err.code.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+            return (status, HeaderMap::new(), ubl_err.to_json());
+        }
+    };
+
+    if let Some(ref limiter) = state.canon_rate_limiter {
+        if let Some((fp, RateLimitResult::Limited { retry_after, .. })) =
+            limiter.check_body(&value).await
+        {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
+            metrics::inc_error("TooManyRequests");
+            let mut headers = HeaderMap::new();
+            let retry_secs = retry_after.as_secs().saturating_add(1);
+            if let Ok(v) = retry_secs.to_string().parse() {
+                headers.insert(header::RETRY_AFTER, v);
+            }
+            let err = too_many_requests_error(
+                format!(
+                    "Rate limit exceeded for canonical payload {}",
+                    fp.rate_key()
+                ),
+                json!({
+                    "limited_by": "canon_fingerprint",
+                    "fingerprint": fp.hash,
+                    "at_type": fp.at_type,
+                    "at_ver": fp.at_ver,
+                    "at_world": fp.at_world,
+                    "retry_after_seconds": retry_secs,
+                }),
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, headers, err.to_json());
+        }
+    }
+
+    let chip_type = value["@type"].as_str().unwrap_or("").to_string();
+    let request = ubl_runtime::pipeline::ChipRequest {
+        chip_type,
+        body: value,
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    match state.pipeline.process_chip(request).await {
+        Ok(result) => {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
+            let decision_str = format!("{:?}", result.decision);
+            if decision_str.contains("Allow") {
+                metrics::inc_allow();
+            } else {
+                metrics::inc_deny();
+            }
+            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
+            let mut headers = HeaderMap::new();
+            if result.replayed {
+                metrics::inc_idempotency_hit();
+                metrics::inc_idempotency_replay_block();
+                headers.insert("X-UBL-Replay", "true".parse().unwrap());
+            }
+            (
+                StatusCode::OK,
+                headers,
+                json!({
+                    "@type": "ubl/response",
+                    "status": "success",
+                    "decision": decision_str,
+                    "receipt_cid": result.receipt.receipt_cid,
+                    "chain": result.chain,
+                    "receipt": receipt_json,
+                    "replayed": result.replayed,
+                }),
+            )
+        }
+        Err(e) => {
+            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
+            let ubl_err = UblError::from_pipeline_error(&e);
+            match ubl_err.code {
+                ErrorCode::SignError | ErrorCode::InvalidSignature => {
+                    let mode = std::env::var("UBL_CRYPTO_MODE")
+                        .unwrap_or_else(|_| "compat_v1".to_string());
+                    metrics::inc_crypto_verify_fail("pipeline", &mode);
+                }
+                ErrorCode::CanonError => metrics::inc_canon_divergence("pipeline"),
+                _ => {}
+            }
+            let code_str = format!("{:?}", ubl_err.code);
+            if code_str.contains("Knock") {
+                metrics::inc_knock_reject();
+            }
+            metrics::inc_error(&code_str);
+            let status = StatusCode::from_u16(ubl_err.code.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, HeaderMap::new(), ubl_err.to_json())
+        }
+    }
+}
+
+fn build_router(state: AppState) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/runtime/attestation", get(get_runtime_attestation))
         .route("/v1/chips", post(create_chip))
@@ -143,22 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/mcp/manifest", get(mcp_manifest))
         .route("/.well-known/webmcp.json", get(webmcp_manifest))
         .route("/mcp/rpc", post(mcp_rpc))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:4000").await?;
-    info!("gate listening on http://0.0.0.0:4000");
-
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,ubl_runtime=debug,ubl_gate=debug"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .try_init();
+        .with_state(state)
 }
 
 async fn healthz() -> Json<Value> {
@@ -196,61 +348,8 @@ async fn get_runtime_attestation(State(state): State<AppState>) -> (StatusCode, 
 /// returns the cached result with `X-UBL-Replay: true` header and `"replayed": true`
 /// in the response body. No re-execution occurs.
 async fn create_chip(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
-    metrics::inc_chips_total();
-    let t0 = std::time::Instant::now();
-
-    match state.pipeline.process_raw(&body).await {
-        Ok(result) => {
-            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
-            let decision_str = format!("{:?}", result.decision);
-            if decision_str.contains("Allow") {
-                metrics::inc_allow();
-            } else {
-                metrics::inc_deny();
-            }
-            let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-            let mut headers = HeaderMap::new();
-            if result.replayed {
-                metrics::inc_idempotency_hit();
-                metrics::inc_idempotency_replay_block();
-                headers.insert("X-UBL-Replay", "true".parse().unwrap());
-            }
-            (
-                StatusCode::OK,
-                headers,
-                Json(json!({
-                    "@type": "ubl/response",
-                    "status": "success",
-                    "decision": decision_str,
-                    "receipt_cid": result.receipt.receipt_cid,
-                    "chain": result.chain,
-                    "receipt": receipt_json,
-                    "replayed": result.replayed,
-                })),
-            )
-        }
-        Err(e) => {
-            metrics::observe_pipeline_seconds(t0.elapsed().as_secs_f64());
-            let ubl_err = UblError::from_pipeline_error(&e);
-            match ubl_err.code {
-                ErrorCode::SignError | ErrorCode::InvalidSignature => {
-                    let mode = std::env::var("UBL_CRYPTO_MODE")
-                        .unwrap_or_else(|_| "compat_v1".to_string());
-                    metrics::inc_crypto_verify_fail("pipeline", &mode);
-                }
-                ErrorCode::CanonError => metrics::inc_canon_divergence("pipeline"),
-                _ => {}
-            }
-            let code_str = format!("{:?}", ubl_err.code);
-            if code_str.contains("Knock") {
-                metrics::inc_knock_reject();
-            }
-            metrics::inc_error(&code_str);
-            let status = StatusCode::from_u16(ubl_err.code.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, HeaderMap::new(), Json(ubl_err.to_json()))
-        }
-    }
+    let (status, headers, payload) = submit_chip_bytes(&state, &body).await;
+    (status, headers, Json(payload))
 }
 
 async fn metrics_handler() -> String {
@@ -793,32 +892,47 @@ async fn dispatch_tool_call(
         "ubl.deliver" => {
             let chip = arguments.get("chip").cloned().unwrap_or(json!({}));
             let bytes = serde_json::to_vec(&chip).unwrap_or_default();
-            match state.pipeline.process_raw(&bytes).await {
-                Ok(result) => {
-                    let receipt_json = result.receipt.to_json().unwrap_or(json!({}));
-                    (
-                        StatusCode::OK,
-                        Json(json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
-                                "decision": format!("{:?}", result.decision),
-                                "receipt_cid": result.receipt.receipt_cid,
-                                "chain": result.chain,
-                                "receipt": receipt_json,
-                            })).unwrap_or_default() }] }
-                        })),
-                    )
-                }
-                Err(e) => {
-                    let ubl_err = UblError::from_pipeline_error(&e);
-                    (
-                        StatusCode::OK,
-                        Json(json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "error": { "code": ubl_err.code.mcp_code(), "message": ubl_err.message, "data": ubl_err.to_json() }
-                        })),
-                    )
-                }
+            let (status, _headers, payload) = submit_chip_bytes(state, &bytes).await;
+            if status.is_success() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&payload).unwrap_or_default() }] }
+                    })),
+                )
+            } else {
+                let (mcp_code, message) = serde_json::from_value::<UblError>(payload.clone())
+                    .map(|e| (e.code.mcp_code(), e.message))
+                    .unwrap_or_else(|_| {
+                        let code = if status == StatusCode::TOO_MANY_REQUESTS {
+                            -32006
+                        } else if status == StatusCode::BAD_REQUEST
+                            || status == StatusCode::UNPROCESSABLE_ENTITY
+                        {
+                            -32602
+                        } else if status == StatusCode::UNAUTHORIZED {
+                            -32001
+                        } else if status == StatusCode::FORBIDDEN {
+                            -32003
+                        } else if status == StatusCode::NOT_FOUND {
+                            -32004
+                        } else if status == StatusCode::CONFLICT {
+                            -32005
+                        } else if status == StatusCode::SERVICE_UNAVAILABLE {
+                            -32000
+                        } else {
+                            -32603
+                        };
+                        (code, format!("HTTP {}", status.as_u16()))
+                    });
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": mcp_code, "message": message, "data": payload }
+                    })),
+                )
             }
         }
 
@@ -1024,5 +1138,129 @@ async fn dispatch_tool_call(
                 "error": { "code": -32601, "message": format!("Tool not found: {}", tool_name) }
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+    use ubl_chipstore::InMemoryBackend;
+
+    fn test_state(canon_limiter: Option<Arc<CanonRateLimiter>>) -> AppState {
+        let backend = Arc::new(InMemoryBackend::new());
+        let chip_store = Arc::new(ChipStore::new(backend));
+        let mut pipeline = UblPipeline::with_chip_store(
+            Box::new(InMemoryPolicyStorage::new()),
+            chip_store.clone(),
+        );
+        let advisory_engine = Arc::new(AdvisoryEngine::new(
+            "b3:test-passport".to_string(),
+            "ubl-gate/test".to_string(),
+            "a/system/t/test".to_string(),
+        ));
+        pipeline.set_advisory_engine(advisory_engine.clone());
+        AppState {
+            pipeline: Arc::new(pipeline),
+            chip_store,
+            manifest: Arc::new(GateManifest::default()),
+            advisory_engine,
+            canon_rate_limiter: canon_limiter,
+        }
+    }
+
+    #[tokio::test]
+    async fn chips_endpoint_accepts_post_and_rejects_other_write_verbs() {
+        let app = build_router(test_state(None));
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/v1/chips")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn chips_endpoint_idempotent_replay_sets_header_and_same_receipt() {
+        let app = build_router(test_state(None));
+        let chip = json!({
+            "@type": "ubl/document",
+            "@id": "gate-idem-1",
+            "@ver": "1.0",
+            "@world": "a/test/t/main",
+            "title": "hello"
+        });
+
+        let req1 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chips")
+            .header("content-type", "application/json")
+            .body(Body::from(chip.to_string()))
+            .unwrap();
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+        assert!(res1.headers().get("X-UBL-Replay").is_none());
+        let body1 = to_bytes(res1.into_body(), usize::MAX).await.unwrap();
+        let v1: Value = serde_json::from_slice(&body1).unwrap();
+        assert_eq!(v1["replayed"], Value::Bool(false));
+        let cid1 = v1["receipt_cid"].as_str().unwrap().to_string();
+
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chips")
+            .header("content-type", "application/json")
+            .body(Body::from(chip.to_string()))
+            .unwrap();
+        let res2 = app.clone().oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        assert_eq!(
+            res2.headers()
+                .get("X-UBL-Replay")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        let body2 = to_bytes(res2.into_body(), usize::MAX).await.unwrap();
+        let v2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(v2["replayed"], Value::Bool(true));
+        let cid2 = v2["receipt_cid"].as_str().unwrap().to_string();
+        assert_eq!(cid1, cid2);
+    }
+
+    #[tokio::test]
+    async fn chips_endpoint_canon_rate_limit_blocks_identical_payload_spam() {
+        let limiter = Arc::new(CanonRateLimiter::new(RateLimitConfig::per_minute(1)));
+        let app = build_router(test_state(Some(limiter)));
+        let chip = json!({
+            "@type": "ubl/document",
+            "@id": "gate-rate-1",
+            "@ver": "1.0",
+            "@world": "a/test/t/main",
+            "title": "same"
+        });
+
+        let req1 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chips")
+            .header("content-type", "application/json")
+            .body(Body::from(chip.to_string()))
+            .unwrap();
+        let res1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chips")
+            .header("content-type", "application/json")
+            .body(Body::from(chip.to_string()))
+            .unwrap();
+        let res2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body2 = to_bytes(res2.into_body(), usize::MAX).await.unwrap();
+        let v2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(v2["code"], Value::String("TOO_MANY_REQUESTS".to_string()));
     }
 }

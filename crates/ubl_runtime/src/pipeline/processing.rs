@@ -38,47 +38,47 @@ impl UblPipeline {
         );
 
         // ── Idempotency check: replay returns cached result (no re-execution) ──
-        let idem_key = IdempotencyKey::from_chip_body(parsed_request.body());
-        let durable_idem_key = idem_key.as_ref().map(|k| k.to_durable_key());
-        if let Some(ref key) = idem_key {
-            let cached = if let (Some(durable), Some(durable_key)) =
-                (&self.durable_store, durable_idem_key.as_ref())
-            {
-                durable.get_idempotent(durable_key).map_err(|e| {
-                    PipelineError::StorageError(format!("Idempotency lookup: {}", e))
-                })?
-            } else {
-                self.idempotency_store.get(key).await
-            };
+        let idem_key = IdempotencyKey::from_chip_body(parsed_request.body()).ok_or_else(|| {
+            PipelineError::InvalidChip(
+                "missing strict idempotency anchors: @type, @ver, @world, @id".to_string(),
+            )
+        })?;
+        let durable_idem_key = idem_key.to_durable_key();
+        let cached = if let Some(durable) = &self.durable_store {
+            durable
+                .get_idempotent(&durable_idem_key)
+                .map_err(|e| PipelineError::StorageError(format!("Idempotency lookup: {}", e)))?
+        } else {
+            self.idempotency_store.get(&idem_key).await
+        };
 
-            if let Some(cached) = cached {
-                let decision = if cached.decision.eq_ignore_ascii_case("allow")
-                    || cached.decision.contains("Allow")
-                {
-                    Decision::Allow
-                } else {
-                    Decision::Deny
-                };
-                let receipt = UnifiedReceipt::from_json(&cached.response_json)
-                    .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
-                info!(
-                    chip_type = %parsed_request.chip_type,
-                    world = %parsed_request.world,
-                    receipt_cid = %cached.receipt_cid,
-                    "pipeline idempotency replay"
-                );
-                return Ok(PipelineResult {
-                    final_receipt: PipelineReceipt {
-                        body_cid: ubl_types::Cid::new_unchecked(&cached.receipt_cid),
-                        receipt_type: "ubl/wf".to_string(),
-                        body: cached.response_json.clone(),
-                    },
-                    chain: cached.chain.clone(),
-                    decision,
-                    receipt,
-                    replayed: true,
-                });
-            }
+        if let Some(cached) = cached {
+            let decision = if cached.decision.eq_ignore_ascii_case("allow")
+                || cached.decision.contains("Allow")
+            {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            };
+            let receipt = UnifiedReceipt::from_json(&cached.response_json)
+                .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
+            info!(
+                chip_type = %parsed_request.chip_type,
+                world = %parsed_request.world,
+                receipt_cid = %cached.receipt_cid,
+                "pipeline idempotency replay"
+            );
+            return Ok(PipelineResult {
+                final_receipt: PipelineReceipt {
+                    body_cid: ubl_types::Cid::new_unchecked(&cached.receipt_cid),
+                    receipt_type: "ubl/wf".to_string(),
+                    body: cached.response_json.clone(),
+                },
+                chain: cached.chain.clone(),
+                decision,
+                receipt,
+                replayed: true,
+            });
         }
 
         // `@world` and `@type` already parsed/validated above.
@@ -261,7 +261,7 @@ impl UblPipeline {
                 "pipeline completed"
             );
 
-            self.persist_final_result(idem_key.as_ref(), world, &result)
+            self.persist_final_result(Some(&idem_key), world, &result)
                 .await?;
             return Ok(result);
         }
@@ -499,7 +499,7 @@ impl UblPipeline {
             replayed: false,
         };
 
-        self.persist_final_result(idem_key.as_ref(), world, &result)
+        self.persist_final_result(Some(&idem_key), world, &result)
             .await?;
 
         info!(
