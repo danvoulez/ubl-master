@@ -33,7 +33,9 @@ jobs:
         id: detect
         run: |
           chmod +x scripts/detect_affected.sh
-          ./scripts/detect_affected.sh >> "$GITHUB_OUTPUT"
+          tmp_out="$(mktemp)"
+          ./scripts/detect_affected.sh | tee "$tmp_out"
+          grep -E '^(affected|breaking|scope)=' "$tmp_out" >> "$GITHUB_OUTPUT"
 
       - name: Report Scope
         run: |
