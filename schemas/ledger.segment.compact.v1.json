@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ubl.agency/schemas/ledger.segment.compact.v1.json",
+  "title": "ledger/segment.compact.v1",
+  "type": "object",
+  "required": [
+    "@type",
+    "@id",
+    "@ver",
+    "@world",
+    "range",
+    "snapshot_ref",
+    "source_segments",
+    "mode"
+  ],
+  "properties": {
+    "@type": { "const": "ledger/segment.compact.v1" },
+    "@id": { "type": "string", "minLength": 1 },
+    "@ver": { "type": "string", "minLength": 1 },
+    "@world": { "type": "string", "minLength": 1 },
+    "range": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" }
+      }
+    },
+    "snapshot_ref": { "type": "string", "pattern": "^b3:" },
+    "source_segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "lines"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+          "lines": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "mode": { "enum": ["archive_then_delete", "delete_with_rollup"] },
+    "@cap": { "type": "object" }
+  }
+}

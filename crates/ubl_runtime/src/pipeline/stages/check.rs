@@ -77,6 +77,23 @@ impl UblPipeline {
             }
         }
 
+        // ── Audit pre-checks: typed contract + capability + range/link constraints ──
+        if crate::audit_chip::is_audit_request_type(request.chip_type) {
+            crate::audit_chip::validate_request_for_check(
+                request.chip_type,
+                request.body(),
+                request.world,
+                self.chip_store.as_deref(),
+            )
+            .await
+            .map_err(|e| match e {
+                crate::audit_chip::AuditError::ChipStore(_) => {
+                    PipelineError::Internal(format!("Audit validation store: {}", e))
+                }
+                _ => PipelineError::InvalidChip(format!("Audit validation: {}", e)),
+            })?;
+        }
+
         // Convert to policy request
         let policy_request = PolicyChipRequest {
             chip_type: request.chip_type.to_string(),

@@ -17,6 +17,13 @@ impl UblPipeline {
 
         let mut artifacts = HashMap::new();
         artifacts.insert("chip".to_string(), chip_cid.clone());
+        if let Some(tr_artifacts) = tr_receipt.body.get("artifacts").and_then(|v| v.as_object()) {
+            for (key, value) in tr_artifacts {
+                if let Some(cid) = value.as_str() {
+                    artifacts.insert(key.clone(), cid.to_string());
+                }
+            }
+        }
 
         let wf_body = WfReceiptBody {
             decision: check.decision.clone(),

@@ -1,0 +1,26 @@
+{% if rows.len() == 0 %}
+<p>No {{ kind }} artifacts found.</p>
+{% else %}
+<table style="border-collapse: collapse; width: 100%">
+  <thead>
+    <tr>
+      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">CID</th>
+      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Type</th>
+      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">World</th>
+      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Created</th>
+      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Summary</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td style="padding:4px;"><a href="/v1/chips/{{ row.cid }}">{{ row.cid }}</a></td>
+      <td style="padding:4px;">{{ row.chip_type }}</td>
+      <td style="padding:4px;">{{ row.world }}</td>
+      <td style="padding:4px;">{{ row.created_at }}</td>
+      <td style="padding:4px;">{{ row.summary }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}

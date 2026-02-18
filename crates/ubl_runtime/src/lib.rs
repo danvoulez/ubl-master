@@ -5,6 +5,7 @@
 
 pub mod advisory;
 pub mod ai_passport;
+pub mod audit_chip;
 pub mod auth;
 pub mod capability;
 pub mod circuit;

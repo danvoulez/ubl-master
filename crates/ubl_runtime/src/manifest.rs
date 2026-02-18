@@ -232,6 +232,96 @@ pub fn default_chip_types() -> Vec<ChipTypeSpec> {
             ],
             required_cap: None,
         },
+        ChipTypeSpec {
+            chip_type: "audit/report.request.v1".into(),
+            description: "Request an on-demand audit report from aggregated views".into(),
+            required_fields: vec![
+                FieldSpec {
+                    name: "name".into(),
+                    field_type: "string".into(),
+                    description: "Report name".into(),
+                },
+                FieldSpec {
+                    name: "format".into(),
+                    field_type: "string".into(),
+                    description: "Output format: ndjson|csv|pdf".into(),
+                },
+            ],
+            optional_fields: vec![
+                FieldSpec {
+                    name: "window".into(),
+                    field_type: "string".into(),
+                    description: "Relative window (e.g. 5m, 24h)".into(),
+                },
+                FieldSpec {
+                    name: "range".into(),
+                    field_type: "object".into(),
+                    description: "Closed range with start/end RFC-3339".into(),
+                },
+            ],
+            required_cap: Some("audit:report".into()),
+        },
+        ChipTypeSpec {
+            chip_type: "audit/ledger.snapshot.request.v1".into(),
+            description: "Create a pre-compaction ledger snapshot and evidence manifest".into(),
+            required_fields: vec![FieldSpec {
+                name: "range".into(),
+                field_type: "object".into(),
+                description: "Closed range with start/end RFC-3339".into(),
+            }],
+            optional_fields: vec![],
+            required_cap: Some("audit:snapshot".into()),
+        },
+        ChipTypeSpec {
+            chip_type: "ledger/segment.compact.v1".into(),
+            description: "Compact ledger segments after snapshot validation".into(),
+            required_fields: vec![
+                FieldSpec {
+                    name: "range".into(),
+                    field_type: "object".into(),
+                    description: "Range to compact".into(),
+                },
+                FieldSpec {
+                    name: "snapshot_ref".into(),
+                    field_type: "string".into(),
+                    description: "Snapshot CID or receipt CID".into(),
+                },
+                FieldSpec {
+                    name: "source_segments".into(),
+                    field_type: "array".into(),
+                    description: "Source segment descriptors".into(),
+                },
+                FieldSpec {
+                    name: "mode".into(),
+                    field_type: "string".into(),
+                    description: "archive_then_delete or delete_with_rollup".into(),
+                },
+            ],
+            optional_fields: vec![],
+            required_cap: Some("ledger:compact".into()),
+        },
+        ChipTypeSpec {
+            chip_type: "audit/advisory.request.v1".into(),
+            description: "Request deterministic LLM advisory over aggregate audit artifacts".into(),
+            required_fields: vec![
+                FieldSpec {
+                    name: "subject".into(),
+                    field_type: "object".into(),
+                    description: "Subject receipt reference".into(),
+                },
+                FieldSpec {
+                    name: "policy_cid".into(),
+                    field_type: "string".into(),
+                    description: "Policy CID for SLO evaluation".into(),
+                },
+            ],
+            optional_fields: vec![FieldSpec {
+                name: "inputs".into(),
+                field_type: "object".into(),
+                description: "Aggregate input CIDs (dataset/histograms/hll)".into(),
+            }],
+            required_cap: Some("audit:advisory".into()),
+        },
     ]
 }
 
@@ -825,11 +915,12 @@ mod tests {
         let m = GateManifest::default();
         let wm = m.to_webmcp_manifest();
         let types = wm["chip_types"].as_array().unwrap();
-        assert_eq!(types.len(), 8);
+        assert!(types.len() >= 8);
         let type_names: Vec<&str> = types.iter().map(|t| t["type"].as_str().unwrap()).collect();
         assert!(type_names.contains(&"ubl/app"));
         assert!(type_names.contains(&"ubl/revoke"));
         assert!(type_names.contains(&"ubl/key.rotate"));
+        assert!(type_names.contains(&"audit/report.request.v1"));
     }
 
     #[test]

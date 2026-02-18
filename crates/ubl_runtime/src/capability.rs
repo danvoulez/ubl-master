@@ -91,6 +91,10 @@ pub fn required_capability(chip_type: &str) -> Option<&'static str> {
         "ubl/membership" => Some("membership:grant"),
         "ubl/revoke" => Some("revoke:execute"),
         "ubl/key.rotate" => Some("key:rotate"),
+        "audit/report.request.v1" => Some("audit:report"),
+        "audit/ledger.snapshot.request.v1" => Some("audit:snapshot"),
+        "ledger/segment.compact.v1" => Some("ledger:compact"),
+        "audit/advisory.request.v1" => Some("audit:advisory"),
         _ => None,
     }
 }
@@ -410,6 +414,22 @@ mod tests {
         );
         assert_eq!(required_capability("ubl/revoke"), Some("revoke:execute"));
         assert_eq!(required_capability("ubl/key.rotate"), Some("key:rotate"));
+        assert_eq!(
+            required_capability("audit/report.request.v1"),
+            Some("audit:report")
+        );
+        assert_eq!(
+            required_capability("audit/ledger.snapshot.request.v1"),
+            Some("audit:snapshot")
+        );
+        assert_eq!(
+            required_capability("ledger/segment.compact.v1"),
+            Some("ledger:compact")
+        );
+        assert_eq!(
+            required_capability("audit/advisory.request.v1"),
+            Some("audit:advisory")
+        );
         assert_eq!(required_capability("ubl/user"), None);
         assert_eq!(required_capability("ubl/document"), None);
     }

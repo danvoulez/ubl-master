@@ -964,6 +964,29 @@ struct ConsoleReceiptTemplate {
     cid: String,
 }
 
+#[derive(Template)]
+#[template(path = "audit.html")]
+struct AuditTemplate {
+    world: String,
+    kind: String,
+}
+
+#[derive(Template)]
+#[template(path = "audit_table.html")]
+struct AuditTableTemplate {
+    kind: String,
+    rows: Vec<AuditRow>,
+}
+
+#[derive(Clone)]
+struct AuditRow {
+    cid: String,
+    chip_type: String,
+    world: String,
+    created_at: String,
+    summary: String,
+}
+
 fn render_html<T: Template>(template: &T) -> Response {
     match template.render() {
         Ok(html) => Html(html).into_response(),
@@ -1171,6 +1194,211 @@ async fn console_events_partial(
 
 async fn console_receipt_page(Path(cid): Path<String>) -> Response {
     render_html(&ConsoleReceiptTemplate { cid })
+}
+
+async fn audit_page(
+    Path(kind): Path<String>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let kind = normalize_audit_kind(&kind);
+    let world = query
+        .get("world")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
+    render_html(&AuditTemplate { world, kind })
+}
+
+async fn audit_table_partial(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .map(|w| w.as_str())
+        .filter(|w| !w.trim().is_empty() && *w != "*");
+    let kind = normalize_audit_kind(query.get("kind").map(String::as_str).unwrap_or("reports"));
+    let rows = match query_audit_rows(&state, &kind, world, 100).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"INTERNAL_ERROR",
+                    "message": format!("audit table query failed: {}", e),
+                })),
+            )
+                .into_response();
+        }
+    };
+    render_html(&AuditTableTemplate { kind, rows })
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditListQuery {
+    world: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_audit_reports(
+    State(state): State<AppState>,
+    Query(query): Query<AuditListQuery>,
+) -> (StatusCode, Json<Value>) {
+    list_audit_kind_json(state, "reports", query).await
+}
+
+async fn list_audit_snapshots(
+    State(state): State<AppState>,
+    Query(query): Query<AuditListQuery>,
+) -> (StatusCode, Json<Value>) {
+    list_audit_kind_json(state, "snapshots", query).await
+}
+
+async fn list_audit_compactions(
+    State(state): State<AppState>,
+    Query(query): Query<AuditListQuery>,
+) -> (StatusCode, Json<Value>) {
+    list_audit_kind_json(state, "compactions", query).await
+}
+
+async fn list_audit_kind_json(
+    state: AppState,
+    kind: &str,
+    query: AuditListQuery,
+) -> (StatusCode, Json<Value>) {
+    let world = query
+        .world
+        .as_deref()
+        .filter(|w| !w.trim().is_empty() && *w != "*");
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    match query_audit_rows(&state, kind, world, limit).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(json!({
+                "@type": "ubl/audit.list",
+                "kind": normalize_audit_kind(kind),
+                "count": rows.len(),
+                "rows": rows.iter().map(|r| json!({
+                    "cid": r.cid,
+                    "chip_type": r.chip_type,
+                    "world": r.world,
+                    "created_at": r.created_at,
+                    "summary": r.summary,
+                })).collect::<Vec<_>>()
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "INTERNAL_ERROR",
+                "message": format!("audit list failed: {}", e),
+            })),
+        ),
+    }
+}
+
+fn normalize_audit_kind(kind: &str) -> String {
+    match kind {
+        "reports" => "reports".to_string(),
+        "snapshots" => "snapshots".to_string(),
+        "compactions" => "compactions".to_string(),
+        _ => "reports".to_string(),
+    }
+}
+
+fn audit_chip_type_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "reports" => "ubl/audit.dataset.v1",
+        "snapshots" => "ubl/audit.snapshot.manifest.v1",
+        "compactions" => "ubl/ledger.compaction.rollup.v1",
+        _ => "ubl/audit.dataset.v1",
+    }
+}
+
+async fn query_audit_rows(
+    state: &AppState,
+    kind: &str,
+    world: Option<&str>,
+    limit: usize,
+) -> Result<Vec<AuditRow>, String> {
+    let chip_type = audit_chip_type_for_kind(kind);
+    let mut tags = Vec::new();
+    if let Some(world) = world {
+        tags.push(format!("world:{}", world));
+    }
+    let result = state
+        .chip_store
+        .query(&ubl_chipstore::ChipQuery {
+            chip_type: Some(chip_type.to_string()),
+            tags,
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(limit),
+            offset: None,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let rows = result
+        .chips
+        .into_iter()
+        .map(|chip| AuditRow {
+            cid: chip.cid.as_str().to_string(),
+            chip_type: chip.chip_type.clone(),
+            world: chip
+                .chip_data
+                .get("@world")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+                .to_string(),
+            created_at: chip.created_at.clone(),
+            summary: audit_summary(&chip.chip_data, kind),
+        })
+        .collect();
+    Ok(rows)
+}
+
+fn audit_summary(chip_data: &Value, kind: &str) -> String {
+    match kind {
+        "reports" => format!(
+            "lines={} format={}",
+            chip_data
+                .get("line_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            chip_data
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ndjson")
+        ),
+        "snapshots" => format!(
+            "segments={} dataset={}",
+            chip_data
+                .get("coverage")
+                .and_then(|c| c.get("segments"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            chip_data
+                .get("artifacts")
+                .and_then(|a| a.get("dataset"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+        ),
+        "compactions" => format!(
+            "freed_bytes={} mode={}",
+            chip_data
+                .get("freed_bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            chip_data
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+        ),
+        _ => "-".to_string(),
+    }
 }
 
 async fn registry_page(
@@ -1954,10 +2182,15 @@ fn build_router(state: AppState) -> Router {
         .route("/console/_kpis", get(console_kpis_partial))
         .route("/console/_events", get(console_events_partial))
         .route("/console/receipt/:cid", get(console_receipt_page))
+        .route("/audit/_table", get(audit_table_partial))
+        .route("/audit/:kind", get(audit_page))
         .route("/registry", get(registry_page))
         .route("/registry/_table", get(registry_table_partial))
         .route("/registry/_kat_test", post(registry_kat_test))
         .route("/registry/*chip_type", get(registry_type_page))
+        .route("/v1/audit/reports", get(list_audit_reports))
+        .route("/v1/audit/snapshots", get(list_audit_snapshots))
+        .route("/v1/audit/compactions", get(list_audit_compactions))
         .route("/v1/events", get(stream_events))
         .route("/v1/events/search", get(search_events))
         .route("/v1/advisor/tap", get(advisor_tap))
@@ -3532,6 +3765,75 @@ mod tests {
             .unwrap();
         let registry_html = String::from_utf8(registry_body.to_vec()).unwrap();
         assert!(registry_html.contains("UBL Registry"));
+    }
+
+    #[tokio::test]
+    async fn audit_pages_render_html() {
+        let app = build_router(test_state(None));
+        let reports_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/audit/reports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reports_res.status(), StatusCode::OK);
+        let reports_body = to_bytes(reports_res.into_body(), usize::MAX).await.unwrap();
+        let reports_html = String::from_utf8(reports_body.to_vec()).unwrap();
+        assert!(reports_html.contains("UBL Audit / reports"));
+
+        let snapshots_res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/audit/snapshots")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshots_res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn audit_list_reports_returns_artifacts() {
+        let state = test_state(None);
+        seed_meta_chip(
+            &state,
+            json!({
+                "@type":"ubl/audit.dataset.v1",
+                "@id":"rpt-1",
+                "@ver":"1.0.0",
+                "@world":"a/acme/t/prod",
+                "line_count": 3,
+                "format": "ndjson"
+            }),
+            "b3:r-audit-1",
+        )
+        .await;
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/audit/reports?world=a/acme/t/prod")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/audit.list");
+        assert_eq!(v["kind"], "reports");
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["rows"][0]["chip_type"], "ubl/audit.dataset.v1");
     }
 
     #[tokio::test]

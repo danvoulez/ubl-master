@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ubl.agency/schemas/audit.report.request.v1.json",
+  "title": "audit/report.request.v1",
+  "type": "object",
+  "required": ["@type", "@id", "@ver", "@world", "name", "format"],
+  "properties": {
+    "@type": { "const": "audit/report.request.v1" },
+    "@id": { "type": "string", "minLength": 1 },
+    "@ver": { "type": "string", "minLength": 1 },
+    "@world": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "components": { "type": "array", "items": { "type": "string" } },
+    "metrics": { "type": "array", "items": { "type": "string" } },
+    "group_by": { "type": "array", "items": { "type": "string" } },
+    "format": { "enum": ["ndjson", "csv", "pdf"] },
+    "window": { "type": "string", "pattern": "^[0-9]+[smhSMH]$" },
+    "range": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" }
+      }
+    },
+    "redaction_profile": { "type": "string" },
+    "@cap": { "type": "object" }
+  },
+  "oneOf": [
+    { "required": ["window"] },
+    { "required": ["range"] }
+  ]
+}

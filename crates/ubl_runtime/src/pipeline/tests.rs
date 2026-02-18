@@ -255,6 +255,365 @@ async fn key_rotate_persists_mapping_and_replay_is_stable() {
     assert_eq!(mappings_after.total_count, 1);
 }
 
+#[tokio::test]
+async fn audit_report_requires_capability() {
+    let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
+    let request = ChipRequest {
+        chip_type: "audit/report.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/report.request.v1",
+            "@id":"audit-report-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "name":"daily",
+            "window":"5m",
+            "format":"ndjson"
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let err = pipeline.process_chip(request).await.unwrap_err();
+    assert!(matches!(err, PipelineError::InvalidChip(_)));
+    assert!(err.to_string().to_lowercase().contains("capability"));
+}
+
+#[tokio::test]
+async fn audit_report_generates_dataset_artifact_and_links_in_wf() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline =
+        UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store.clone());
+
+    let seed_request = ChipRequest {
+        chip_type: "ubl/document".to_string(),
+        body: json!({
+            "@type":"ubl/document",
+            "@id":"seed-doc-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "title":"seed for audit"
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let seed = pipeline.process_chip(seed_request).await.unwrap();
+    assert!(matches!(seed.decision, Decision::Allow));
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let cap = signed_capability("audit:report", "a/acme", &cap_sk);
+    let report_request = ChipRequest {
+        chip_type: "audit/report.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/report.request.v1",
+            "@id":"audit-report-ok-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "name":"daily",
+            "window":"5m",
+            "format":"ndjson",
+            "@cap": cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    let result = pipeline.process_chip(report_request).await.unwrap();
+    assert!(matches!(result.decision, Decision::Allow));
+
+    let dataset_cid = result.final_receipt.body["artifacts"]["dataset"]
+        .as_str()
+        .expect("WF artifacts.dataset must be present");
+    assert!(dataset_cid.starts_with("b3:"));
+
+    let dataset = chip_store
+        .get_chip(dataset_cid)
+        .await
+        .expect("dataset lookup should succeed")
+        .expect("dataset artifact should exist in ChipStore");
+    assert_eq!(dataset.chip_type, "ubl/audit.dataset.v1");
+    assert_eq!(dataset.chip_data["@world"], json!("a/acme/t/prod"));
+    assert_eq!(dataset.chip_data["line_count"], json!(1));
+}
+
+#[tokio::test]
+async fn audit_snapshot_overlap_is_rejected() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline = UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store);
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let cap = signed_capability("audit:snapshot", "a/acme", &cap_sk);
+
+    let first = ChipRequest {
+        chip_type: "audit/ledger.snapshot.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/ledger.snapshot.request.v1",
+            "@id":"snap-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "range":{"start":"2026-02-18T00:00:00Z","end":"2026-02-18T01:00:00Z"},
+            "@cap": cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let first_result = pipeline.process_chip(first).await.unwrap();
+    assert!(matches!(first_result.decision, Decision::Allow));
+
+    let cap2 = signed_capability("audit:snapshot", "a/acme", &cap_sk);
+    let second = ChipRequest {
+        chip_type: "audit/ledger.snapshot.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/ledger.snapshot.request.v1",
+            "@id":"snap-2",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "range":{"start":"2026-02-18T00:30:00Z","end":"2026-02-18T01:30:00Z"},
+            "@cap": cap2
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let err = pipeline.process_chip(second).await.unwrap_err();
+    assert!(matches!(err, PipelineError::InvalidChip(_)));
+    assert!(err.to_string().to_lowercase().contains("snapshot overlap"));
+}
+
+#[tokio::test]
+async fn audit_snapshot_generates_manifest_artifacts_and_links_in_wf() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline =
+        UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store.clone());
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let cap = signed_capability("audit:snapshot", "a/acme", &cap_sk);
+    let request = ChipRequest {
+        chip_type: "audit/ledger.snapshot.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/ledger.snapshot.request.v1",
+            "@id":"snap-artifacts-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "range":{"start":"1970-01-01T00:00:00Z","end":"2999-01-01T00:00:00Z"},
+            "@cap": cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    let result = pipeline.process_chip(request).await.unwrap();
+    assert!(matches!(result.decision, Decision::Allow));
+
+    let artifacts = result.final_receipt.body["artifacts"]
+        .as_object()
+        .expect("WF artifacts must exist");
+    let manifest_cid = artifacts
+        .get("manifest")
+        .and_then(|v| v.as_str())
+        .expect("manifest CID missing");
+    let histograms_cid = artifacts
+        .get("histograms")
+        .and_then(|v| v.as_str())
+        .expect("histograms CID missing");
+    let sketches_cid = artifacts
+        .get("sketches")
+        .and_then(|v| v.as_str())
+        .expect("sketches CID missing");
+    assert!(manifest_cid.starts_with("b3:"));
+    assert!(histograms_cid.starts_with("b3:"));
+    assert!(sketches_cid.starts_with("b3:"));
+
+    let manifest_chip = chip_store
+        .get_chip(manifest_cid)
+        .await
+        .unwrap()
+        .expect("manifest chip must exist");
+    assert_eq!(manifest_chip.chip_type, "ubl/audit.snapshot.manifest.v1");
+}
+
+#[tokio::test]
+async fn ledger_compact_generates_rollup_artifact() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline =
+        UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store.clone());
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let snap_cap = signed_capability("audit:snapshot", "a/acme", &cap_sk);
+    let snapshot_req = ChipRequest {
+        chip_type: "audit/ledger.snapshot.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/ledger.snapshot.request.v1",
+            "@id":"snap-for-compact-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "range":{"start":"1970-01-01T00:00:00Z","end":"2999-01-01T00:00:00Z"},
+            "@cap": snap_cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let snapshot = pipeline.process_chip(snapshot_req).await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("UBL_LEDGER_BASE_DIR", tmp.path());
+    let seg_rel_path = "segments/seg-1.ndjson";
+    let seg_abs_path = tmp.path().join(seg_rel_path);
+    std::fs::create_dir_all(seg_abs_path.parent().unwrap()).unwrap();
+    let seg_content = b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}";
+    std::fs::write(&seg_abs_path, seg_content).unwrap();
+    let seg_sha = {
+        use ring::digest;
+        let hash = digest::digest(&digest::SHA256, seg_content);
+        hex::encode(hash.as_ref())
+    };
+
+    let compact_cap = signed_capability("ledger:compact", "a/acme", &cap_sk);
+    let compact_req = ChipRequest {
+        chip_type: "ledger/segment.compact.v1".to_string(),
+        body: json!({
+            "@type":"ledger/segment.compact.v1",
+            "@id":"compact-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "range":{"start":"2026-02-18T00:00:00Z","end":"2026-02-18T00:10:00Z"},
+            "snapshot_ref": snapshot.receipt.receipt_cid.as_str(),
+            "source_segments":[{"path":seg_rel_path,"sha256":seg_sha,"lines":3}],
+            "mode":"delete_with_rollup",
+            "@cap": compact_cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    let compact = pipeline.process_chip(compact_req).await.unwrap();
+    assert!(matches!(compact.decision, Decision::Allow));
+
+    let rollup_cid = compact.final_receipt.body["artifacts"]["rollup_index"]
+        .as_str()
+        .expect("WF artifacts.rollup_index must exist");
+    let rollup_chip = chip_store
+        .get_chip(rollup_cid)
+        .await
+        .unwrap()
+        .expect("rollup chip must exist");
+    assert_eq!(rollup_chip.chip_type, "ubl/ledger.compaction.rollup.v1");
+    assert!(
+        !seg_abs_path.exists(),
+        "segment file must be removed by delete_with_rollup"
+    );
+    std::env::remove_var("UBL_LEDGER_BASE_DIR");
+}
+
+#[tokio::test]
+async fn audit_advisory_requires_subject_receipt() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline = UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store);
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let cap = signed_capability("audit:advisory", "a/acme", &cap_sk);
+
+    let request = ChipRequest {
+        chip_type: "audit/advisory.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/advisory.request.v1",
+            "@id":"adv-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "subject":{"kind":"report","receipt_cid":"b3:missing"},
+            "inputs":{"dataset_cid":"b3:data"},
+            "policy_cid":"b3:policy",
+            "@cap": cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let err = pipeline.process_chip(request).await.unwrap_err();
+    assert!(matches!(err, PipelineError::InvalidChip(_)));
+    assert!(err.to_string().contains("subject receipt not found"));
+}
+
+#[tokio::test]
+async fn audit_advisory_generates_json_and_markdown_artifacts() {
+    use ubl_chipstore::{ChipStore, InMemoryBackend};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let chip_store = Arc::new(ChipStore::new(backend));
+    let pipeline =
+        UblPipeline::with_chip_store(Box::new(InMemoryPolicyStorage::new()), chip_store.clone());
+
+    let cap_sk = ubl_kms::generate_signing_key();
+    let report_cap = signed_capability("audit:report", "a/acme", &cap_sk);
+    let report_req = ChipRequest {
+        chip_type: "audit/report.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/report.request.v1",
+            "@id":"audit-report-for-advisory-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "window":"5m",
+            "format":"ndjson",
+            "@cap": report_cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+    let report = pipeline.process_chip(report_req).await.unwrap();
+
+    let advisory_cap = signed_capability("audit:advisory", "a/acme", &cap_sk);
+    let advisory_req = ChipRequest {
+        chip_type: "audit/advisory.request.v1".to_string(),
+        body: json!({
+            "@type":"audit/advisory.request.v1",
+            "@id":"adv-ok-1",
+            "@ver":"1.0",
+            "@world":"a/acme/t/prod",
+            "subject":{"kind":"report","receipt_cid": report.receipt.receipt_cid.as_str()},
+            "inputs":{"dataset_cid":"b3:example"},
+            "policy_cid":"b3:policy",
+            "style":"concise",
+            "lang":"en",
+            "@cap": advisory_cap
+        }),
+        parents: vec![],
+        operation: Some("create".to_string()),
+    };
+
+    let advisory = pipeline.process_chip(advisory_req).await.unwrap();
+    assert!(matches!(advisory.decision, Decision::Allow));
+
+    let advisory_json_cid = advisory.final_receipt.body["artifacts"]["advisory_json"]
+        .as_str()
+        .expect("advisory_json CID missing");
+    let advisory_md_cid = advisory.final_receipt.body["artifacts"]["advisory_markdown"]
+        .as_str()
+        .expect("advisory_markdown CID missing");
+    let advisory_json_chip = chip_store
+        .get_chip(advisory_json_cid)
+        .await
+        .unwrap()
+        .expect("advisory json artifact must exist");
+    let advisory_md_chip = chip_store
+        .get_chip(advisory_md_cid)
+        .await
+        .unwrap()
+        .expect("advisory markdown artifact must exist");
+    assert_eq!(advisory_json_chip.chip_type, "ubl/audit.advisory.result.v1");
+    assert_eq!(advisory_md_chip.chip_type, "ubl/audit.advisory.markdown.v1");
+}
+
 #[test]
 fn tr_profile_selection_by_chip_type() {
     let registry = TransitionRegistry::default();

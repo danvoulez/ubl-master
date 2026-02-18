@@ -1,0 +1,34 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ubl.agency/schemas/audit.advisory.request.v1.json",
+  "title": "audit/advisory.request.v1",
+  "type": "object",
+  "required": ["@type", "@id", "@ver", "@world", "subject", "policy_cid"],
+  "properties": {
+    "@type": { "const": "audit/advisory.request.v1" },
+    "@id": { "type": "string", "minLength": 1 },
+    "@ver": { "type": "string", "minLength": 1 },
+    "@world": { "type": "string", "minLength": 1 },
+    "subject": {
+      "type": "object",
+      "required": ["kind", "receipt_cid"],
+      "properties": {
+        "kind": { "enum": ["report", "snapshot"] },
+        "receipt_cid": { "type": "string", "pattern": "^b3:" }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "properties": {
+        "dataset_cid": { "type": "string", "pattern": "^b3:" },
+        "histograms_cid": { "type": "string", "pattern": "^b3:" },
+        "hll_cid": { "type": "string", "pattern": "^b3:" }
+      },
+      "additionalProperties": false
+    },
+    "policy_cid": { "type": "string", "pattern": "^b3:" },
+    "style": { "type": "string" },
+    "lang": { "type": "string" },
+    "@cap": { "type": "object" }
+  }
+}

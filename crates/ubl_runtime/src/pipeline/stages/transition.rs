@@ -1,6 +1,8 @@
 use super::super::*;
 use crate::wasm_adapter::{SandboxConfig, WasmError, WasmExecutor, WasmInput, WasmtimeExecutor};
 use base64::Engine as _;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone)]
 struct AdapterExecutionOutcome {
@@ -10,12 +12,57 @@ struct AdapterExecutionOutcome {
     module_source: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuditReportOutcome {
+    dataset_cid: String,
+    line_count: usize,
+    format: String,
+    artifact_payload_cid: String,
+    type_counts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct AuditSnapshotOutcome {
+    dataset_cid: String,
+    histograms_cid: String,
+    sketches_cid: String,
+    manifest_cid: String,
+    line_count: usize,
+    covered_segments: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LedgerCompactOutcome {
+    parent_snapshot_ref: String,
+    rollup_index_cid: String,
+    tombstones: bool,
+    freed_bytes: u64,
+    archived_files: usize,
+    deleted_files: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AuditAdvisoryOutcome {
+    parent_receipt_cid: String,
+    advisory_markdown_cid: String,
+    advisory_json_cid: String,
+    input_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum AuditTransitionOutcome {
+    Report(AuditReportOutcome),
+    Snapshot(AuditSnapshotOutcome),
+    Compact(LedgerCompactOutcome),
+    Advisory(AuditAdvisoryOutcome),
+}
+
 impl UblPipeline {
     /// Stage 3: TR - Transition (RB-VM execution)
     pub(in crate::pipeline) async fn stage_transition(
         &self,
         request: &ParsedChipRequest<'_>,
-        _check: &CheckResult,
+        check: &CheckResult,
     ) -> Result<PipelineReceipt, PipelineError> {
         // Encode chip body to NRF bytes and store as CAS input
         let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(request.body())
@@ -82,6 +129,54 @@ impl UblPipeline {
                 "TR EmitRc did not return a persisted signature".to_string(),
             ));
         }
+
+        let audit_transition = match request.chip_type {
+            crate::audit_chip::TYPE_AUDIT_REPORT_REQUEST_V1 => {
+                Some(AuditTransitionOutcome::Report(
+                    self.execute_audit_report_transition(
+                        request,
+                        &input_cid_str,
+                        outcome.fuel_used,
+                        &check.trace,
+                    )
+                    .await?,
+                ))
+            }
+            crate::audit_chip::TYPE_AUDIT_LEDGER_SNAPSHOT_REQUEST_V1 => {
+                Some(AuditTransitionOutcome::Snapshot(
+                    self.execute_audit_snapshot_transition(
+                        request,
+                        &input_cid_str,
+                        outcome.fuel_used,
+                        &check.trace,
+                    )
+                    .await?,
+                ))
+            }
+            crate::audit_chip::TYPE_LEDGER_SEGMENT_COMPACT_V1 => {
+                Some(AuditTransitionOutcome::Compact(
+                    self.execute_ledger_compact_transition(
+                        request,
+                        &input_cid_str,
+                        outcome.fuel_used,
+                        &check.trace,
+                    )
+                    .await?,
+                ))
+            }
+            crate::audit_chip::TYPE_AUDIT_ADVISORY_REQUEST_V1 => {
+                Some(AuditTransitionOutcome::Advisory(
+                    self.execute_audit_advisory_transition(
+                        request,
+                        &input_cid_str,
+                        outcome.fuel_used,
+                        &check.trace,
+                    )
+                    .await?,
+                ))
+            }
+            _ => None,
+        };
 
         let key_rotation = if request.chip_type == "ubl/key.rotate" {
             let rotate_req = KeyRotateRequest::parse(request.body())
@@ -161,6 +256,74 @@ impl UblPipeline {
                 serde_json::json!(adapter.effects),
             );
         }
+        if let Some(audit) = audit_transition.as_ref() {
+            match audit {
+                AuditTransitionOutcome::Report(report) => {
+                    vm_state.insert(
+                        "audit_report_generated".to_string(),
+                        serde_json::json!(true),
+                    );
+                    vm_state.insert(
+                        "audit_report_dataset_cid".to_string(),
+                        serde_json::json!(report.dataset_cid),
+                    );
+                    vm_state.insert(
+                        "audit_report_line_count".to_string(),
+                        serde_json::json!(report.line_count),
+                    );
+                }
+                AuditTransitionOutcome::Snapshot(snapshot) => {
+                    vm_state.insert(
+                        "audit_snapshot_generated".to_string(),
+                        serde_json::json!(true),
+                    );
+                    vm_state.insert(
+                        "audit_snapshot_manifest_cid".to_string(),
+                        serde_json::json!(snapshot.manifest_cid),
+                    );
+                    vm_state.insert(
+                        "audit_snapshot_line_count".to_string(),
+                        serde_json::json!(snapshot.line_count),
+                    );
+                }
+                AuditTransitionOutcome::Compact(compact) => {
+                    vm_state.insert(
+                        "ledger_compact_generated".to_string(),
+                        serde_json::json!(true),
+                    );
+                    vm_state.insert(
+                        "ledger_compact_rollup_cid".to_string(),
+                        serde_json::json!(compact.rollup_index_cid),
+                    );
+                    vm_state.insert(
+                        "ledger_compact_freed_bytes".to_string(),
+                        serde_json::json!(compact.freed_bytes),
+                    );
+                    vm_state.insert(
+                        "ledger_compact_archived_files".to_string(),
+                        serde_json::json!(compact.archived_files),
+                    );
+                    vm_state.insert(
+                        "ledger_compact_deleted_files".to_string(),
+                        serde_json::json!(compact.deleted_files),
+                    );
+                }
+                AuditTransitionOutcome::Advisory(advisory) => {
+                    vm_state.insert(
+                        "audit_advisory_generated".to_string(),
+                        serde_json::json!(true),
+                    );
+                    vm_state.insert(
+                        "audit_advisory_json_cid".to_string(),
+                        serde_json::json!(advisory.advisory_json_cid),
+                    );
+                    vm_state.insert(
+                        "audit_advisory_input_count".to_string(),
+                        serde_json::json!(advisory.input_count),
+                    );
+                }
+            }
+        }
 
         let tr_body = serde_json::json!({
             "@type": "ubl/transition",
@@ -171,6 +334,63 @@ impl UblPipeline {
             "vm_state": vm_state
         });
         let mut tr_body = tr_body;
+        if let Some(audit) = audit_transition {
+            match audit {
+                AuditTransitionOutcome::Report(report) => {
+                    tr_body["artifacts"] = serde_json::json!({
+                        "dataset": report.dataset_cid,
+                    });
+                    tr_body["audit_report"] = serde_json::json!({
+                        "dataset_cid": report.dataset_cid,
+                        "line_count": report.line_count,
+                        "format": report.format,
+                        "type_counts": report.type_counts,
+                        "artifact_payload_cid": report.artifact_payload_cid,
+                    });
+                }
+                AuditTransitionOutcome::Snapshot(snapshot) => {
+                    tr_body["artifacts"] = serde_json::json!({
+                        "dataset": snapshot.dataset_cid,
+                        "histograms": snapshot.histograms_cid,
+                        "sketches": snapshot.sketches_cid,
+                        "manifest": snapshot.manifest_cid,
+                    });
+                    tr_body["audit_snapshot"] = serde_json::json!({
+                        "dataset_cid": snapshot.dataset_cid,
+                        "histograms_cid": snapshot.histograms_cid,
+                        "sketches_cid": snapshot.sketches_cid,
+                        "manifest_cid": snapshot.manifest_cid,
+                        "line_count": snapshot.line_count,
+                        "covered_segments": snapshot.covered_segments,
+                    });
+                }
+                AuditTransitionOutcome::Compact(compact) => {
+                    tr_body["artifacts"] = serde_json::json!({
+                        "rollup_index": compact.rollup_index_cid,
+                    });
+                    tr_body["ledger_compact"] = serde_json::json!({
+                        "parent_snapshot_ref": compact.parent_snapshot_ref,
+                        "rollup_index_cid": compact.rollup_index_cid,
+                        "tombstones": compact.tombstones,
+                        "freed_bytes": compact.freed_bytes,
+                        "archived_files": compact.archived_files,
+                        "deleted_files": compact.deleted_files,
+                    });
+                }
+                AuditTransitionOutcome::Advisory(advisory) => {
+                    tr_body["artifacts"] = serde_json::json!({
+                        "advisory_markdown": advisory.advisory_markdown_cid,
+                        "advisory_json": advisory.advisory_json_cid,
+                    });
+                    tr_body["audit_advisory"] = serde_json::json!({
+                        "parent_receipt_cid": advisory.parent_receipt_cid,
+                        "advisory_markdown_cid": advisory.advisory_markdown_cid,
+                        "advisory_json_cid": advisory.advisory_json_cid,
+                        "input_count": advisory.input_count,
+                    });
+                }
+            }
+        }
         if let Some(rotation) = key_rotation {
             tr_body["key_rotation"] = serde_json::json!({
                 "old_did": rotation.old_did,
@@ -349,4 +569,771 @@ impl UblPipeline {
             }
         }
     }
+
+    async fn execute_audit_report_transition(
+        &self,
+        request: &ParsedChipRequest<'_>,
+        input_cid: &str,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+    ) -> Result<AuditReportOutcome, PipelineError> {
+        let parsed = crate::audit_chip::parse_request(request.chip_type, request.body())
+            .map_err(|e| PipelineError::InvalidChip(format!("audit/report parse: {}", e)))?;
+        let report = match parsed {
+            crate::audit_chip::AuditRequest::Report(report) => report,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "audit/report transition received non-report request".to_string(),
+                ));
+            }
+        };
+
+        let store = self.chip_store.as_ref().ok_or_else(|| {
+            PipelineError::StorageError("audit/report.request.v1 requires ChipStore".to_string())
+        })?;
+
+        let limit = request
+            .body()
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1_000)
+            .clamp(1, 10_000) as usize;
+
+        let query = ubl_chipstore::ChipQuery {
+            chip_type: None,
+            tags: vec![format!("world:{}", request.world)],
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(limit),
+            offset: None,
+        };
+        let result = store
+            .query(&query)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("audit/report query: {}", e)))?;
+
+        let report_range = report.range.as_ref().map(|r| (r.start, r.end));
+        let mut rows: Vec<serde_json::Value> = result
+            .chips
+            .iter()
+            .filter(|chip| {
+                if let Some((start, end)) = report_range {
+                    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&chip.created_at) else {
+                        return false;
+                    };
+                    let ts = ts.with_timezone(&chrono::Utc);
+                    ts >= start && ts <= end
+                } else {
+                    true
+                }
+            })
+            .map(|chip| {
+                serde_json::json!({
+                    "cid": chip.cid.as_str(),
+                    "receipt_cid": chip.receipt_cid.as_str(),
+                    "chip_type": chip.chip_type,
+                    "created_at": chip.created_at,
+                })
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            let a_cid = a.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            let b_cid = b.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            a_cid.cmp(b_cid)
+        });
+
+        let mut type_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &rows {
+            if let Some(chip_type) = row.get("chip_type").and_then(|v| v.as_str()) {
+                *type_counts.entry(chip_type.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        let output_format = report.format.unwrap_or_else(|| "ndjson".to_string());
+        let mut ndjson_lines = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let line = serde_json::to_string(row)
+                .map_err(|e| PipelineError::Internal(format!("audit/report ndjson: {}", e)))?;
+            ndjson_lines.push(line);
+        }
+        let ndjson = ndjson_lines.join("\n");
+        let ndjson_hash = format!(
+            "b3:{}",
+            hex::encode(blake3::hash(ndjson.as_bytes()).as_bytes())
+        );
+
+        let artifact_payload = serde_json::json!({
+            "@type": "ubl/audit.dataset.v1",
+            "@id": format!(
+                "{}:dataset",
+                request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))
+            ),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "request_type": request.chip_type,
+            "request_id": request.chip_id,
+            "input_cid": input_cid,
+            "format": output_format,
+            "window": report.window,
+            "range": report_range.map(|(start, end)| serde_json::json!({
+                "start": start.to_rfc3339(),
+                "end": end.to_rfc3339()
+            })),
+            "line_count": rows.len(),
+            "type_counts": type_counts,
+            "dataset_ndjson_b3": ndjson_hash,
+            "rows": rows,
+            "fuel_used_at_tr": fuel_used,
+            "policy_trace_len": policy_trace.len(),
+        });
+        let artifact_cid = ubl_ai_nrf1::compute_cid(
+            &ubl_ai_nrf1::to_nrf1_bytes(&artifact_payload)
+                .map_err(|e| PipelineError::Internal(format!("audit/report NRF: {}", e)))?,
+        )
+        .map_err(|e| PipelineError::Internal(format!("audit/report CID: {}", e)))?;
+
+        let metadata = ubl_chipstore::ExecutionMetadata {
+            runtime_version: "audit/report-tr/0.1".to_string(),
+            execution_time_ms: 0,
+            fuel_consumed: fuel_used,
+            policies_applied: policy_trace.iter().map(|p| p.policy_id.clone()).collect(),
+            executor_did: ubl_types::Did::new_unchecked(&self.did),
+            reproducible: true,
+        };
+        let stored_artifact_cid = store
+            .store_executed_chip(artifact_payload.clone(), "self".to_string(), metadata)
+            .await
+            .map_err(|e| {
+                PipelineError::StorageError(format!("audit/report artifact store: {}", e))
+            })?;
+        if stored_artifact_cid != artifact_cid {
+            return Err(PipelineError::Internal(format!(
+                "audit/report artifact CID mismatch: expected {}, got {}",
+                artifact_cid, stored_artifact_cid
+            )));
+        }
+
+        Ok(AuditReportOutcome {
+            dataset_cid: artifact_cid,
+            line_count: ndjson_lines.len(),
+            format: output_format,
+            artifact_payload_cid: stored_artifact_cid,
+            type_counts,
+        })
+    }
+
+    async fn execute_audit_snapshot_transition(
+        &self,
+        request: &ParsedChipRequest<'_>,
+        input_cid: &str,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+    ) -> Result<AuditSnapshotOutcome, PipelineError> {
+        let parsed = crate::audit_chip::parse_request(request.chip_type, request.body())
+            .map_err(|e| PipelineError::InvalidChip(format!("audit/snapshot parse: {}", e)))?;
+        let snapshot = match parsed {
+            crate::audit_chip::AuditRequest::Snapshot(snapshot) => snapshot,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "audit/snapshot transition received non-snapshot request".to_string(),
+                ));
+            }
+        };
+        let store = self.chip_store.as_ref().ok_or_else(|| {
+            PipelineError::StorageError(
+                "audit/ledger.snapshot.request.v1 requires ChipStore".into(),
+            )
+        })?;
+
+        let limit = request
+            .body()
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5_000)
+            .clamp(1, 20_000) as usize;
+
+        let query = ubl_chipstore::ChipQuery {
+            chip_type: None,
+            tags: vec![format!("world:{}", request.world)],
+            created_after: None,
+            created_before: None,
+            executor_did: None,
+            limit: Some(limit),
+            offset: None,
+        };
+        let result = store
+            .query(&query)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("audit/snapshot query: {}", e)))?;
+
+        let mut chips_in_range: Vec<&ubl_chipstore::StoredChip> = result
+            .chips
+            .iter()
+            .filter(|chip| {
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&chip.created_at) else {
+                    return false;
+                };
+                let ts = ts.with_timezone(&chrono::Utc);
+                ts >= snapshot.range.start && ts <= snapshot.range.end
+            })
+            .collect();
+        chips_in_range.sort_by(|a, b| a.cid.as_str().cmp(b.cid.as_str()));
+
+        let rows: Vec<serde_json::Value> = chips_in_range
+            .iter()
+            .map(|chip| {
+                serde_json::json!({
+                    "cid": chip.cid.as_str(),
+                    "receipt_cid": chip.receipt_cid.as_str(),
+                    "chip_type": chip.chip_type,
+                    "created_at": chip.created_at,
+                })
+            })
+            .collect();
+
+        let mut latencies: Vec<i64> = chips_in_range
+            .iter()
+            .map(|chip| chip.execution_metadata.execution_time_ms)
+            .collect();
+        latencies.sort_unstable();
+        let p50 = Self::percentile_i64(&latencies, 0.50);
+        let p95 = Self::percentile_i64(&latencies, 0.95);
+        let p99 = Self::percentile_i64(&latencies, 0.99);
+
+        let mut distinct_types = BTreeMap::<String, usize>::new();
+        for chip in &chips_in_range {
+            *distinct_types.entry(chip.chip_type.clone()).or_insert(0) += 1;
+        }
+
+        let dataset_payload = serde_json::json!({
+            "@type": "ubl/audit.snapshot.dataset.v1",
+            "@id": format!("{}:snapshot-dataset", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "range": {
+                "start": snapshot.range.start.to_rfc3339(),
+                "end": snapshot.range.end.to_rfc3339()
+            },
+            "line_count": rows.len(),
+            "rows": rows,
+        });
+        let dataset_cid = self
+            .store_audit_artifact(
+                store,
+                dataset_payload,
+                fuel_used,
+                policy_trace,
+                "audit/snapshot-dataset-tr/0.1",
+            )
+            .await?;
+
+        let histograms_payload = serde_json::json!({
+            "@type": "ubl/audit.snapshot.histograms.v1",
+            "@id": format!("{}:snapshot-histograms", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "count": latencies.len(),
+            "latency_ms": {
+                "p50": p50,
+                "p95": p95,
+                "p99": p99,
+                "min": latencies.first().copied().unwrap_or(0),
+                "max": latencies.last().copied().unwrap_or(0)
+            }
+        });
+        let histograms_cid = self
+            .store_audit_artifact(
+                store,
+                histograms_payload,
+                fuel_used,
+                policy_trace,
+                "audit/snapshot-histograms-tr/0.1",
+            )
+            .await?;
+
+        let sketches_payload = serde_json::json!({
+            "@type": "ubl/audit.snapshot.sketches.v1",
+            "@id": format!("{}:snapshot-sketches", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "cardinality_exact": {
+                "chips": chips_in_range.len(),
+                "types": distinct_types.len(),
+            },
+            "type_counts": distinct_types,
+        });
+        let sketches_cid = self
+            .store_audit_artifact(
+                store,
+                sketches_payload,
+                fuel_used,
+                policy_trace,
+                "audit/snapshot-sketches-tr/0.1",
+            )
+            .await?;
+
+        let manifest_payload = serde_json::json!({
+            "@type": "ubl/audit.snapshot.manifest.v1",
+            "@id": format!("{}:snapshot-manifest", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "range": {
+                "start": snapshot.range.start.to_rfc3339(),
+                "end": snapshot.range.end.to_rfc3339()
+            },
+            "artifacts": {
+                "dataset": dataset_cid,
+                "histograms": histograms_cid,
+                "sketches": sketches_cid,
+            },
+            "coverage": {
+                "segments": chips_in_range.len(),
+                "lines": chips_in_range.len(),
+                "bytes_estimate": chips_in_range.len() as u64 * 128,
+            }
+        });
+        let manifest_cid = self
+            .store_audit_artifact(
+                store,
+                manifest_payload,
+                fuel_used,
+                policy_trace,
+                "audit/snapshot-manifest-tr/0.1",
+            )
+            .await?;
+
+        Ok(AuditSnapshotOutcome {
+            dataset_cid,
+            histograms_cid,
+            sketches_cid,
+            manifest_cid,
+            line_count: chips_in_range.len(),
+            covered_segments: chips_in_range.len(),
+        })
+    }
+
+    async fn execute_ledger_compact_transition(
+        &self,
+        request: &ParsedChipRequest<'_>,
+        input_cid: &str,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+    ) -> Result<LedgerCompactOutcome, PipelineError> {
+        let parsed = crate::audit_chip::parse_request(request.chip_type, request.body())
+            .map_err(|e| PipelineError::InvalidChip(format!("ledger/compact parse: {}", e)))?;
+        let compact = match parsed {
+            crate::audit_chip::AuditRequest::Compact(compact) => compact,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "ledger/compact transition received non-compact request".to_string(),
+                ));
+            }
+        };
+        let store = self.chip_store.as_ref().ok_or_else(|| {
+            PipelineError::StorageError("ledger/segment.compact.v1 requires ChipStore".to_string())
+        })?;
+
+        let snapshot_chip = if let Some(chip) = store
+            .get_chip(&compact.snapshot_ref)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("compact snapshot lookup: {}", e)))?
+        {
+            chip
+        } else {
+            store
+                .get_chip_by_receipt_cid(&compact.snapshot_ref)
+                .await
+                .map_err(|e| {
+                    PipelineError::StorageError(format!("compact snapshot receipt lookup: {}", e))
+                })?
+                .ok_or_else(|| {
+                    PipelineError::InvalidChip(format!(
+                        "compact snapshot_ref not found: {}",
+                        compact.snapshot_ref
+                    ))
+                })?
+        };
+
+        let compact_result =
+            Self::execute_filesystem_compaction(&compact.mode, &compact.source_segments)?;
+        let rollup_payload = serde_json::json!({
+            "@type": "ubl/ledger.compaction.rollup.v1",
+            "@id": format!("{}:compact-rollup", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "parent_snapshot_ref": compact.snapshot_ref,
+            "parent_snapshot_cid": snapshot_chip.cid.as_str(),
+            "mode": compact.mode,
+            "range": {
+                "start": compact.range.start.to_rfc3339(),
+                "end": compact.range.end.to_rfc3339(),
+            },
+            "source_segments": compact.source_segments,
+            "tombstones": true,
+            "freed_bytes": compact_result.freed_bytes,
+            "archived_files": compact_result.archived_files,
+            "deleted_files": compact_result.deleted_files,
+        });
+        let rollup_index_cid = self
+            .store_audit_artifact(
+                store,
+                rollup_payload,
+                fuel_used,
+                policy_trace,
+                "ledger/compact-tr/0.1",
+            )
+            .await?;
+
+        Ok(LedgerCompactOutcome {
+            parent_snapshot_ref: compact.snapshot_ref,
+            rollup_index_cid,
+            tombstones: true,
+            freed_bytes: compact_result.freed_bytes,
+            archived_files: compact_result.archived_files,
+            deleted_files: compact_result.deleted_files,
+        })
+    }
+
+    async fn execute_audit_advisory_transition(
+        &self,
+        request: &ParsedChipRequest<'_>,
+        input_cid: &str,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+    ) -> Result<AuditAdvisoryOutcome, PipelineError> {
+        let parsed = crate::audit_chip::parse_request(request.chip_type, request.body())
+            .map_err(|e| PipelineError::InvalidChip(format!("audit/advisory parse: {}", e)))?;
+        let advisory = match parsed {
+            crate::audit_chip::AuditRequest::Advisory(advisory) => advisory,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "audit/advisory transition received non-advisory request".to_string(),
+                ));
+            }
+        };
+        let store = self.chip_store.as_ref().ok_or_else(|| {
+            PipelineError::StorageError("audit/advisory.request.v1 requires ChipStore".to_string())
+        })?;
+
+        let subject = store
+            .get_chip_by_receipt_cid(&advisory.subject_receipt_cid)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("audit/advisory subject: {}", e)))?
+            .ok_or_else(|| {
+                PipelineError::InvalidChip(format!(
+                    "subject receipt not found: {}",
+                    advisory.subject_receipt_cid
+                ))
+            })?;
+
+        let inputs = request
+            .body()
+            .get("inputs")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let input_count = inputs.len();
+
+        let mut findings = Vec::new();
+        findings.push(serde_json::json!({
+            "severity": if input_count == 0 { "warn" } else { "info" },
+            "code": "advisory.inputs.count",
+            "message": format!("{} aggregate input(s) provided", input_count),
+        }));
+        findings.push(serde_json::json!({
+            "severity": "info",
+            "code": "advisory.subject.type",
+            "message": format!("subject type {}", subject.chip_type),
+        }));
+
+        let policy_cid = request
+            .body()
+            .get("policy_cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("b3:policy-missing");
+        let style = request
+            .body()
+            .get("style")
+            .and_then(|v| v.as_str())
+            .unwrap_or("concise");
+        let lang = request
+            .body()
+            .get("lang")
+            .and_then(|v| v.as_str())
+            .unwrap_or("en");
+
+        let advisory_json_payload = serde_json::json!({
+            "@type": "ubl/audit.advisory.result.v1",
+            "@id": format!("{}:advisory-json", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "subject": {
+                "kind": advisory.subject_kind,
+                "receipt_cid": advisory.subject_receipt_cid,
+                "chip_type": subject.chip_type,
+            },
+            "policy_cid": policy_cid,
+            "style": style,
+            "lang": lang,
+            "inputs": inputs,
+            "findings": findings,
+        });
+        let advisory_json_cid = self
+            .store_audit_artifact(
+                store,
+                advisory_json_payload.clone(),
+                fuel_used,
+                policy_trace,
+                "audit/advisory-json-tr/0.1",
+            )
+            .await?;
+
+        let markdown_lines = vec![
+            "# Advisory".to_string(),
+            format!(
+                "- Subject: `{}` (`{}`)",
+                advisory.subject_receipt_cid, subject.chip_type
+            ),
+            format!("- Inputs: `{}`", input_count),
+            format!("- Policy: `{}`", policy_cid),
+            format!("- Style: `{}`", style),
+            format!("- Lang: `{}`", lang),
+        ];
+        let advisory_markdown_payload = serde_json::json!({
+            "@type": "ubl/audit.advisory.markdown.v1",
+            "@id": format!("{}:advisory-md", request.chip_id.unwrap_or(input_cid.trim_start_matches("b3:"))),
+            "@ver": "1.0.0",
+            "@world": request.world,
+            "input_cid": input_cid,
+            "markdown_text": markdown_lines.join(" | "),
+            "markdown_lines": markdown_lines,
+            "advisory_json_cid": advisory_json_cid,
+        });
+        let advisory_markdown_cid = self
+            .store_audit_artifact(
+                store,
+                advisory_markdown_payload,
+                fuel_used,
+                policy_trace,
+                "audit/advisory-markdown-tr/0.1",
+            )
+            .await?;
+
+        Ok(AuditAdvisoryOutcome {
+            parent_receipt_cid: advisory.subject_receipt_cid,
+            advisory_markdown_cid,
+            advisory_json_cid,
+            input_count,
+        })
+    }
+
+    async fn store_audit_artifact(
+        &self,
+        store: &ubl_chipstore::ChipStore,
+        payload: serde_json::Value,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+        runtime_version: &str,
+    ) -> Result<String, PipelineError> {
+        let expected_cid = ubl_ai_nrf1::compute_cid(
+            &ubl_ai_nrf1::to_nrf1_bytes(&payload)
+                .map_err(|e| PipelineError::Internal(format!("artifact NRF: {}", e)))?,
+        )
+        .map_err(|e| PipelineError::Internal(format!("artifact CID: {}", e)))?;
+
+        let metadata = ubl_chipstore::ExecutionMetadata {
+            runtime_version: runtime_version.to_string(),
+            execution_time_ms: 0,
+            fuel_consumed: fuel_used,
+            policies_applied: policy_trace.iter().map(|p| p.policy_id.clone()).collect(),
+            executor_did: ubl_types::Did::new_unchecked(&self.did),
+            reproducible: true,
+        };
+        let stored_cid = store
+            .store_executed_chip(payload, "self".to_string(), metadata)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("artifact store: {}", e)))?;
+
+        if stored_cid != expected_cid {
+            return Err(PipelineError::Internal(format!(
+                "artifact CID mismatch: expected {}, got {}",
+                expected_cid, stored_cid
+            )));
+        }
+        Ok(stored_cid)
+    }
+
+    fn execute_filesystem_compaction(
+        mode: &str,
+        segments: &[crate::audit_chip::SegmentSource],
+    ) -> Result<CompactFsResult, PipelineError> {
+        let base_dir =
+            std::env::var("UBL_LEDGER_BASE_DIR").unwrap_or_else(|_| "./data/ledger".to_string());
+        let base_dir = PathBuf::from(base_dir);
+        std::fs::create_dir_all(&base_dir).map_err(|e| {
+            PipelineError::StorageError(format!("compact base dir create failed: {}", e))
+        })?;
+
+        let archive_root = if mode == "archive_then_delete" {
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let root = base_dir.join("archive").join(ts);
+            std::fs::create_dir_all(&root).map_err(|e| {
+                PipelineError::StorageError(format!("compact archive dir create failed: {}", e))
+            })?;
+            Some(root)
+        } else {
+            None
+        };
+
+        let mut freed_bytes = 0u64;
+        let mut archived_files = 0usize;
+        let mut deleted_files = 0usize;
+
+        for segment in segments {
+            let resolved = Self::resolve_compact_segment_path(&base_dir, &segment.path)?;
+            let metadata = std::fs::metadata(&resolved).map_err(|e| {
+                PipelineError::StorageError(format!(
+                    "compact segment metadata failed '{}': {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(PipelineError::InvalidChip(format!(
+                    "compact segment is not a file: {}",
+                    resolved.display()
+                )));
+            }
+
+            let content = std::fs::read(&resolved).map_err(|e| {
+                PipelineError::StorageError(format!(
+                    "compact segment read failed '{}': {}",
+                    resolved.display(),
+                    e
+                ))
+            })?;
+            let actual_sha = Self::sha256_hex(&content);
+            if !actual_sha.eq_ignore_ascii_case(&segment.sha256) {
+                return Err(PipelineError::InvalidChip(format!(
+                    "compact segment sha256 mismatch for '{}': expected {}, got {}",
+                    segment.path, segment.sha256, actual_sha
+                )));
+            }
+            let actual_lines = Self::count_non_empty_lines(&content) as u64;
+            if actual_lines != segment.lines {
+                return Err(PipelineError::InvalidChip(format!(
+                    "compact segment lines mismatch for '{}': expected {}, got {}",
+                    segment.path, segment.lines, actual_lines
+                )));
+            }
+
+            freed_bytes = freed_bytes.saturating_add(metadata.len());
+
+            if let Some(root) = archive_root.as_ref() {
+                let rel = Self::segment_rel_path(&segment.path)?;
+                let target = root.join(rel);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        PipelineError::StorageError(format!(
+                            "compact archive parent create failed '{}': {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                }
+                std::fs::rename(&resolved, &target)
+                    .or_else(|_| {
+                        std::fs::copy(&resolved, &target)?;
+                        std::fs::remove_file(&resolved)
+                    })
+                    .map_err(|e| {
+                        PipelineError::StorageError(format!(
+                            "compact archive move failed '{}' -> '{}': {}",
+                            resolved.display(),
+                            target.display(),
+                            e
+                        ))
+                    })?;
+                archived_files += 1;
+            } else {
+                std::fs::remove_file(&resolved).map_err(|e| {
+                    PipelineError::StorageError(format!(
+                        "compact delete failed '{}': {}",
+                        resolved.display(),
+                        e
+                    ))
+                })?;
+                deleted_files += 1;
+            }
+        }
+
+        Ok(CompactFsResult {
+            freed_bytes,
+            archived_files,
+            deleted_files,
+        })
+    }
+
+    fn count_non_empty_lines(content: &[u8]) -> usize {
+        content
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .count()
+    }
+
+    fn segment_rel_path(raw: &str) -> Result<PathBuf, PipelineError> {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            return Err(PipelineError::InvalidChip(format!(
+                "segment path must be relative: {}",
+                raw
+            )));
+        }
+        let mut clean = PathBuf::new();
+        for comp in path.components() {
+            match comp {
+                Component::Normal(s) => clean.push(s),
+                Component::CurDir => {}
+                _ => {
+                    return Err(PipelineError::InvalidChip(format!(
+                        "segment path contains invalid component: {}",
+                        raw
+                    )));
+                }
+            }
+        }
+        if clean.as_os_str().is_empty() {
+            return Err(PipelineError::InvalidChip(
+                "segment path cannot be empty".to_string(),
+            ));
+        }
+        Ok(clean)
+    }
+
+    fn resolve_compact_segment_path(base_dir: &Path, raw: &str) -> Result<PathBuf, PipelineError> {
+        let rel = Self::segment_rel_path(raw)?;
+        Ok(base_dir.join(rel))
+    }
+
+    fn percentile_i64(values: &[i64], q: f64) -> i64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let idx = ((values.len() as f64 - 1.0) * q.clamp(0.0, 1.0)).round() as usize;
+        values[idx]
+    }
+}
+
+struct CompactFsResult {
+    freed_bytes: u64,
+    archived_files: usize,
+    deleted_files: usize,
 }
