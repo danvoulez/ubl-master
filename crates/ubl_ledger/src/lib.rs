@@ -21,8 +21,8 @@ mod imp {
     use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::OnceLock;
-    use tokio::sync::Mutex;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Mutex;
 
     const DEFAULT_LEDGER_PATH: &str = "./data/ubl_ledger.ndjson";
 
