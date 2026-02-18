@@ -830,7 +830,7 @@ async fn webmcp_manifest(State(state): State<AppState>) -> Json<Value> {
 /// POST /mcp/rpc — MCP JSON-RPC 2.0 proxy (P2.9).
 ///
 /// Dispatches MCP tool calls to the same pipeline:
-/// - ubl.deliver → process_raw
+/// - ubl.deliver → same submission path as POST /v1/chips
 /// - ubl.query → ChipStore get
 /// - ubl.verify → CID recomputation
 /// - ubl.narrate → receipt narration
