@@ -10,3 +10,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 cid = "0.11"
+hex = "0.4"
+
+[features]
+default = ["ledger_mem"]
+ledger_mem = []
+ledger_ndjson = []

@@ -3248,6 +3248,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cid",
+ "hex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

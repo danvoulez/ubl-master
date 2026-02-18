@@ -138,9 +138,80 @@ jobs:
           cargo semver-checks check-release --baseline-rev origin/main
         continue-on-error: true
 
+  simkit_stx:
+    name: "🧪 SIMKIT-STX"
+    needs: tr
+    if: ${{ needs.tr.result == 'success' && hashFiles('simrunner/main.py') != '' }}
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_UNC1_NUMERIC: "true"
+      F64_IMPORT_MODE: "reject"
+      STX_ENABLED: "1"
+      STX_DIFF_PROB: "0.03"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install SimRunner deps
+        run: |
+          if [[ -f simrunner/requirements.txt ]]; then
+            python -m pip install --upgrade pip
+            python -m pip install -r simrunner/requirements.txt
+          fi
+
+      - name: Start Gate
+        run: |
+          cargo run -p ubl_gate > /tmp/ubl_gate.log 2>&1 &
+          echo "GATE_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for Gate Health
+        run: |
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:4000/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Gate did not become healthy" >&2
+          exit 1
+
+      - name: Run SimRunner STX
+        run: |
+          export UBL_GATE_URL="${UBL_GATE_URL:-http://127.0.0.1:4000/v1/chips}"
+          export RUN_ID="stx-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python simrunner/main.py | tee /tmp/simrunner.log
+
+      - name: Assert STX verify has no failures
+        run: |
+          if grep -R -nE 'stx/receipt\\.verify[^[:alnum:]]*(false|0)|\"verify\"[[:space:]]*:[[:space:]]*false' /tmp/simrunner.log simrunner 2>/dev/null; then
+            echo "Detected failed receipt verification in STX run" >&2
+            exit 1
+          fi
+
+      - name: Upload STX logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simkit-stx-logs
+          path: |
+            /tmp/ubl_gate.log
+            /tmp/simrunner.log
+
+      - name: Stop Gate
+        if: always()
+        run: |
+          if [[ -n "${GATE_PID:-}" ]]; then
+            kill "${GATE_PID}" || true
+          fi
+
   wf:
     name: "✅ WF"
-    needs: [knock, wa, tr, execute]
+    needs: [knock, wa, tr, execute, simkit_stx]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -161,11 +232,13 @@ jobs:
           echo "  WA:      ${{ needs.wa.result }}"
           echo "  TR:      ${{ needs.tr.result }}"
           echo "  EXECUTE: ${{ needs.execute.result }}"
+          echo "  SIMKIT:  ${{ needs.simkit_stx.result }}"
           echo ""
 
           if [[ "${{ needs.wa.result }}" == "success" && \
                 "${{ needs.tr.result }}" == "success" && \
-                "${{ needs.execute.result }}" == "success" ]]; then
+                "${{ needs.execute.result }}" == "success" && \
+                ("${{ needs.simkit_stx.result }}" == "success" || "${{ needs.simkit_stx.result }}" == "skipped") ]]; then
             echo "decision=ALLOW" >> "$GITHUB_ENV"
             echo "🟢 DECISION: ALLOW"
           else
@@ -189,7 +262,8 @@ jobs:
             "stages": {
               "wa": "${{ needs.wa.result }}",
               "tr": "${{ needs.tr.result }}",
-              "execute": "${{ needs.execute.result }}"
+              "execute": "${{ needs.execute.result }}",
+              "simkit_stx": "${{ needs.simkit_stx.result }}"
             },
             "pipeline": "WA→TR→WF",
             "runtime": "github-actions",
