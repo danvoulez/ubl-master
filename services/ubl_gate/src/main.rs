@@ -38,6 +38,7 @@ struct AppState {
     manifest: Arc<GateManifest>,
     advisory_engine: Arc<AdvisoryEngine>,
     canon_rate_limiter: Option<Arc<CanonRateLimiter>>,
+    durable_store: Option<Arc<DurableStore>>,
 }
 
 #[tokio::main]
@@ -74,49 +75,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start outbox dispatcher workers when SQLite durability is enabled.
-    if let Ok(Some(store)) = DurableStore::from_env() {
-        let workers: usize = std::env::var("UBL_OUTBOX_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
-        metrics::set_outbox_pending(store.outbox_pending().unwrap_or(0));
+    let durable_store = match DurableStore::from_env() {
+        Ok(Some(store)) => {
+            let store = Arc::new(store);
+            let workers: usize = std::env::var("UBL_OUTBOX_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            metrics::set_outbox_pending(store.outbox_pending().unwrap_or(0));
 
-        for worker_id in 0..workers {
-            let dispatcher = OutboxDispatcher::new(store.clone()).with_backoff(2, 300);
-            let store_for_metrics = store.clone();
-            tokio::spawn(async move {
-                loop {
-                    let processed =
-                        dispatcher.run_once(64, |event| match event.event_type.as_str() {
-                            // Placeholder delivery path; real publisher can be wired here.
-                            "emit_receipt" => Ok(()),
-                            _ => {
+            for worker_id in 0..workers {
+                let dispatcher = OutboxDispatcher::new((*store).clone()).with_backoff(2, 300);
+                let store_for_metrics = store.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let processed =
+                            dispatcher.run_once(64, |event| match event.event_type.as_str() {
+                                // Placeholder delivery path; real publisher can be wired here.
+                                "emit_receipt" => Ok(()),
+                                _ => {
+                                    metrics::inc_outbox_retry();
+                                    Err(format!("unknown outbox event type: {}", event.event_type))
+                                }
+                            });
+
+                        match processed {
+                            Ok(processed_count) => {
+                                metrics::set_outbox_pending(
+                                    store_for_metrics.outbox_pending().unwrap_or_default(),
+                                );
+                                if processed_count == 0 {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                }
+                            }
+                            Err(e) => {
                                 metrics::inc_outbox_retry();
-                                Err(format!("unknown outbox event type: {}", event.event_type))
+                                warn!(worker_id, error = %e, "outbox worker error");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
                             }
-                        });
-
-                    match processed {
-                        Ok(processed_count) => {
-                            metrics::set_outbox_pending(
-                                store_for_metrics.outbox_pending().unwrap_or_default(),
-                            );
-                            if processed_count == 0 {
-                                tokio::time::sleep(Duration::from_millis(500)).await;
-                            }
-                        }
-                        Err(e) => {
-                            metrics::inc_outbox_retry();
-                            warn!(worker_id, error = %e, "outbox worker error");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
-                }
-            });
+                });
+            }
+            info!(workers, "outbox dispatcher started");
+            Some(store)
         }
-        info!(workers, "outbox dispatcher started");
-    }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "durable store init failed for gate");
+            None
+        }
+    };
 
     let manifest = Arc::new(GateManifest::default());
 
@@ -126,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manifest,
         advisory_engine,
         canon_rate_limiter: load_canon_rate_limiter(),
+        durable_store,
     };
 
     let app = build_router(state);
@@ -297,6 +308,8 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/runtime/attestation", get(get_runtime_attestation))
         .route("/v1/chips", post(create_chip))
         .route("/v1/chips/:cid", get(get_chip))
+        .route("/v1/cas/:cid", get(get_chip))
+        .route("/v1/receipts/:cid", get(get_receipt))
         .route("/v1/receipts/:cid/trace", get(get_receipt_trace))
         .route("/v1/receipts/:cid/narrate", get(narrate_receipt))
         .route(
@@ -496,6 +509,77 @@ async fn get_chip(
             StatusCode::INTERNAL_SERVER_ERROR,
             HeaderMap::new(),
             Json(json!({"@type": "ubl/error", "code": "INTERNAL_ERROR", "message": e.to_string()})),
+        ),
+    }
+}
+
+/// GET /v1/receipts/:cid — retrieve persisted WF receipt JSON by receipt CID.
+///
+/// ETag support: receipt CID is immutable content address.
+async fn get_receipt(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !cid.starts_with("b3:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(
+                json!({"@type": "ubl/error", "code": "INVALID_CID", "message": "CID must start with b3:"}),
+            ),
+        );
+    }
+
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(inm_str) = inm.to_str() {
+            let etag = format!("\"{}\"", cid);
+            if inm_str == etag || inm_str.trim_matches('"') == cid {
+                let mut h = HeaderMap::new();
+                h.insert(header::ETAG, etag.parse().unwrap());
+                return (StatusCode::NOT_MODIFIED, h, Json(json!(null)));
+            }
+        }
+    }
+
+    let Some(store) = state.durable_store.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAVAILABLE",
+                "message": "Receipt store unavailable: enable SQLite durable store",
+            })),
+        );
+    };
+
+    match store.get_receipt(&cid) {
+        Ok(Some(receipt)) => {
+            let mut h = HeaderMap::new();
+            let etag = format!("\"{}\"", cid);
+            h.insert(header::ETAG, etag.parse().unwrap());
+            h.insert(
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".parse().unwrap(),
+            );
+            (StatusCode::OK, h, Json(receipt))
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            HeaderMap::new(),
+            Json(
+                json!({"@type": "ubl/error", "code": "NOT_FOUND", "message": format!("Receipt {} not found", cid)}),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "INTERNAL_ERROR",
+                "message": format!("Receipt fetch failed: {}", e),
+            })),
         ),
     }
 }
@@ -832,6 +916,7 @@ async fn webmcp_manifest(State(state): State<AppState>) -> Json<Value> {
 /// Dispatches MCP tool calls to the same pipeline:
 /// - ubl.deliver → same submission path as POST /v1/chips
 /// - ubl.query → ChipStore get
+/// - ubl.receipt → durable receipt get
 /// - ubl.verify → CID recomputation
 /// - ubl.narrate → receipt narration
 /// - registry.listTypes → manifest chip types
@@ -954,6 +1039,51 @@ async fn dispatch_tool_call(
                     Json(json!({
                         "jsonrpc": "2.0", "id": id,
                         "error": { "code": -32004, "message": format!("Chip {} not found", cid) }
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32603, "message": e.to_string() }
+                    })),
+                ),
+            }
+        }
+
+        "ubl.receipt" => {
+            let cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32602, "message": "missing required argument: cid" }
+                    })),
+                );
+            }
+            let Some(store) = state.durable_store.as_ref() else {
+                return (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32000, "message": "receipt store unavailable" }
+                    })),
+                );
+            };
+            match store.get_receipt(cid) {
+                Ok(Some(receipt)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&receipt).unwrap_or_default() }] }
+                    })),
+                ),
+                Ok(None) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32004, "message": format!("Receipt {} not found", cid) }
                     })),
                 ),
                 Err(e) => (
@@ -1146,8 +1276,10 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
     use ubl_chipstore::InMemoryBackend;
+    use ubl_runtime::durable_store::{CommitInput, NewOutboxEvent};
 
     fn test_state(canon_limiter: Option<Arc<CanonRateLimiter>>) -> AppState {
         let backend = Arc::new(InMemoryBackend::new());
@@ -1168,7 +1300,42 @@ mod tests {
             manifest: Arc::new(GateManifest::default()),
             advisory_engine,
             canon_rate_limiter: canon_limiter,
+            durable_store: None,
         }
+    }
+
+    fn test_state_with_receipt_store(receipt_cid: &str, receipt_json: Value) -> AppState {
+        let mut state = test_state(None);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ubl_gate_receipts_{}.db", ts));
+        let dsn = format!("file:{}?mode=rwc&_journal_mode=WAL", path.display());
+        let store = DurableStore::new(dsn).unwrap();
+        let input = CommitInput {
+            receipt_cid: receipt_cid.to_string(),
+            receipt_json,
+            did: "did:key:ztest".to_string(),
+            kid: "did:key:ztest#ed25519".to_string(),
+            rt_hash: "b3:runtime-test".to_string(),
+            decision: "allow".to_string(),
+            idem_key: None,
+            chain: vec![
+                "b3:wa".to_string(),
+                "b3:tr".to_string(),
+                "b3:wf".to_string(),
+            ],
+            outbox_events: vec![NewOutboxEvent {
+                event_type: "emit_receipt".to_string(),
+                payload_json: json!({"receipt_cid": receipt_cid}),
+            }],
+            created_at: chrono::Utc::now().timestamp(),
+            fail_after_receipt_write: false,
+        };
+        store.commit_wf_atomically(&input).unwrap();
+        state.durable_store = Some(Arc::new(store));
+        state
     }
 
     #[tokio::test]
@@ -1182,6 +1349,18 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn cas_alias_route_is_read_only_and_reachable() {
+        let app = build_router(test_state(None));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/cas/b3:missing")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1262,5 +1441,45 @@ mod tests {
         let body2 = to_bytes(res2.into_body(), usize::MAX).await.unwrap();
         let v2: Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(v2["code"], Value::String("TOO_MANY_REQUESTS".to_string()));
+    }
+
+    #[tokio::test]
+    async fn receipts_endpoint_returns_raw_persisted_receipt() {
+        let receipt_cid = "b3:receipt-gate-test";
+        let app = build_router(test_state_with_receipt_store(
+            receipt_cid,
+            json!({
+                "@type": "ubl/receipt",
+                "@id": receipt_cid,
+                "@ver": "1.0",
+                "@world": "a/test/t/main",
+                "decision": "Allow"
+            }),
+        ));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/receipts/{}", receipt_cid))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["@type"], "ubl/receipt");
+        assert_eq!(v["@id"], receipt_cid);
+        assert_eq!(v["decision"], "Allow");
+    }
+
+    #[tokio::test]
+    async fn receipts_endpoint_unavailable_without_durable_store() {
+        let app = build_router(test_state(None));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/receipts/b3:any")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

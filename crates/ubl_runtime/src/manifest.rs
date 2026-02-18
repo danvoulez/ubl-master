@@ -299,6 +299,31 @@ impl GateManifest {
             }),
         );
 
+        // GET /v1/cas/{cid}
+        paths.insert(
+            "/v1/cas/{cid}".into(),
+            json!({
+                "get": {
+                    "operationId": "getCasObject",
+                    "summary": "Retrieve a CAS object by CID (alias of /v1/chips/{cid})",
+                    "parameters": [{
+                        "name": "cid",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "string", "pattern": "^b3:" }
+                    }],
+                    "responses": {
+                        "200": { "description": "CAS object", "headers": {
+                            "ETag": { "schema": { "type": "string" } },
+                            "Cache-Control": { "schema": { "type": "string" } }
+                        }},
+                        "304": { "description": "Not Modified (ETag match)" },
+                        "404": { "description": "Object not found" }
+                    }
+                }
+            }),
+        );
+
         // GET /v1/chips/{cid}/verify
         paths.insert(
             "/v1/chips/{cid}/verify".into(),
@@ -328,6 +353,30 @@ impl GateManifest {
                     "responses": {
                         "200": { "description": "Runtime self-attestation" },
                         "500": { "description": "Attestation generation failed" }
+                    }
+                }
+            }),
+        );
+
+        // GET /v1/receipts/{cid}
+        paths.insert(
+            "/v1/receipts/{cid}".into(),
+            json!({
+                "get": {
+                    "operationId": "getReceipt",
+                    "summary": "Retrieve persisted raw receipt JSON by receipt CID",
+                    "parameters": [{
+                        "name": "cid", "in": "path", "required": true,
+                        "schema": { "type": "string", "pattern": "^b3:" }
+                    }],
+                    "responses": {
+                        "200": { "description": "Receipt JSON", "headers": {
+                            "ETag": { "schema": { "type": "string" } },
+                            "Cache-Control": { "schema": { "type": "string" } }
+                        }},
+                        "304": { "description": "Not Modified (ETag match)" },
+                        "404": { "description": "Receipt not found" },
+                        "503": { "description": "Receipt store unavailable" }
                     }
                 }
             }),
@@ -425,6 +474,19 @@ impl GateManifest {
             }
         }));
 
+        // ubl.receipt — get persisted receipt by CID
+        tools.push(json!({
+            "name": "ubl.receipt",
+            "description": "Retrieve a persisted receipt by its receipt CID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cid": { "type": "string", "description": "Receipt CID to fetch" }
+                },
+                "required": ["cid"]
+            }
+        }));
+
         // ubl.verify — verify chip integrity
         tools.push(json!({
             "name": "ubl.verify",
@@ -498,6 +560,12 @@ impl GateManifest {
                     "description": "Retrieve a chip by CID (supports ETag)"
                 },
                 {
+                    "name": "ubl.receipt",
+                    "method": "GET",
+                    "path": "/v1/receipts/{cid}",
+                    "description": "Retrieve raw persisted receipt by CID (supports ETag)"
+                },
+                {
                     "name": "ubl.verify",
                     "method": "GET",
                     "path": "/v1/chips/{cid}/verify",
@@ -521,6 +589,18 @@ impl GateManifest {
                     "name": "chip",
                     "uri_template": "/v1/chips/{cid}",
                     "description": "A content-addressed chip",
+                    "mime_type": "application/json"
+                },
+                {
+                    "name": "cas",
+                    "uri_template": "/v1/cas/{cid}",
+                    "description": "A content-addressed object from CAS",
+                    "mime_type": "application/json"
+                },
+                {
+                    "name": "receipt",
+                    "uri_template": "/v1/receipts/{cid}",
+                    "description": "A persisted pipeline receipt",
                     "mime_type": "application/json"
                 }
             ],
@@ -639,8 +719,10 @@ mod tests {
         let paths = spec["paths"].as_object().unwrap();
         assert!(paths.contains_key("/v1/chips"));
         assert!(paths.contains_key("/v1/chips/{cid}"));
+        assert!(paths.contains_key("/v1/cas/{cid}"));
         assert!(paths.contains_key("/v1/chips/{cid}/verify"));
         assert!(paths.contains_key("/v1/runtime/attestation"));
+        assert!(paths.contains_key("/v1/receipts/{cid}"));
         assert!(paths.contains_key("/v1/receipts/{cid}/trace"));
         assert!(paths.contains_key("/v1/receipts/{cid}/narrate"));
     }
@@ -698,6 +780,7 @@ mod tests {
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"ubl.deliver"));
         assert!(tool_names.contains(&"ubl.query"));
+        assert!(tool_names.contains(&"ubl.receipt"));
         assert!(tool_names.contains(&"ubl.verify"));
         assert!(tool_names.contains(&"registry.listTypes"));
         assert!(tool_names.contains(&"ubl.narrate"));
@@ -732,6 +815,9 @@ mod tests {
         assert!(tools.len() >= 4);
         let resources = wm["resources"].as_array().unwrap();
         assert!(!resources.is_empty());
+        assert!(tools.iter().any(|t| t["name"] == "ubl.receipt"));
+        assert!(resources.iter().any(|r| r["name"] == "receipt"));
+        assert!(resources.iter().any(|r| r["name"] == "cas"));
     }
 
     #[test]

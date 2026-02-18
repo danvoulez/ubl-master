@@ -142,6 +142,29 @@ impl DurableStore {
         }))
     }
 
+    /// Fetch a persisted WF receipt JSON by receipt CID.
+    pub fn get_receipt(&self, receipt_cid: &str) -> Result<Option<Value>, DurableError> {
+        let conn = self.open_conn()?;
+        self.apply_pragmas(&conn)?;
+
+        let body_json: Option<String> = conn
+            .query_row(
+                "SELECT body_json FROM receipts WHERE receipt_cid = ?1",
+                params![receipt_cid],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+
+        let Some(body_json) = body_json else {
+            return Ok(None);
+        };
+
+        let receipt_json =
+            serde_json::from_str(&body_json).map_err(|e| DurableError::Serde(e.to_string()))?;
+        Ok(Some(receipt_json))
+    }
+
     pub fn commit_wf_atomically(&self, input: &CommitInput) -> Result<CommitResult, DurableError> {
         let mut conn = self.open_conn()?;
         self.apply_pragmas(&conn)?;
@@ -513,5 +536,19 @@ mod tests {
         store.ack_outbox(claimed2[0].id).unwrap();
 
         assert_eq!(store.outbox_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn get_receipt_returns_persisted_json() {
+        let store = make_store("receipt_get.db");
+        let commit = sample_commit(Some("idem-receipt"));
+        store.commit_wf_atomically(&commit).unwrap();
+
+        let receipt = store.get_receipt("b3:receipt-1").unwrap().unwrap();
+        assert_eq!(receipt["@type"], "ubl/receipt");
+        assert_eq!(receipt["ok"], true);
+
+        let missing = store.get_receipt("b3:missing").unwrap();
+        assert!(missing.is_none());
     }
 }
