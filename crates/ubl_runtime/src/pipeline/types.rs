@@ -4,6 +4,9 @@ use super::*;
 pub(super) struct AdapterRuntimeInfo {
     pub(super) wasm_sha256: String,
     pub(super) abi_version: String,
+    pub(super) wasm_cid: Option<String>,
+    pub(super) wasm_b64: Option<String>,
+    pub(super) fuel_budget: Option<u64>,
 }
 
 impl AdapterRuntimeInfo {
@@ -23,6 +26,15 @@ impl AdapterRuntimeInfo {
             .get("abi_version")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PipelineError::InvalidChip("adapter.abi_version missing".to_string()))?;
+        let wasm_cid = adapter
+            .get("wasm_cid")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        let wasm_b64 = adapter
+            .get("wasm_b64")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string());
+        let fuel_budget = adapter.get("fuel_budget").and_then(|v| v.as_u64());
 
         let is_hex = wasm_sha256.len() == 64 && wasm_sha256.chars().all(|c| c.is_ascii_hexdigit());
         if !is_hex {
@@ -40,6 +52,9 @@ impl AdapterRuntimeInfo {
         Ok(Some(Self {
             wasm_sha256: wasm_sha256.to_string(),
             abi_version: abi_version.to_string(),
+            wasm_cid,
+            wasm_b64,
+            fuel_budget,
         }))
     }
 }
