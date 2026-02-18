@@ -103,6 +103,9 @@ jobs:
       - name: Integration Tests
         run: cargo test --workspace --test '*'
 
+      - name: Gate Contract Tests
+        run: cargo test -p ubl_gate
+
       - name: Doc Tests
         run: cargo test --workspace --doc
 
