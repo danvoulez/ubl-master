@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+pub use ubl_canon::CanonFingerprint;
 
 /// Configuration for a single rate limit bucket.
 #[derive(Clone, Debug)]
@@ -291,77 +292,6 @@ pub struct GateRateLimitResult {
 // ---------------------------------------------------------------------------
 // Canon-aware rate limiting (P0.2)
 // ---------------------------------------------------------------------------
-
-/// A canonical fingerprint of a chip payload.
-///
-/// Computed as: `BLAKE3(NRF-1(ρ(body)))` — cosmetic JSON variations
-/// (whitespace, key order, Unicode normalization) all map to the same
-/// fingerprint, preventing semantic spam.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CanonFingerprint {
-    /// Hex-encoded BLAKE3 hash of the NRF-1 canonical bytes.
-    pub hash: String,
-    /// Extracted `@type` for metrics bucketing.
-    pub at_type: String,
-    /// Extracted `@ver` for metrics bucketing.
-    pub at_ver: String,
-    /// Extracted `@world` for metrics bucketing.
-    pub at_world: String,
-}
-
-impl CanonFingerprint {
-    /// Compute the canonical fingerprint of a chip body.
-    ///
-    /// Uses NRF-1 canonical encoding (which applies ρ normalization)
-    /// then BLAKE3 hashes the result. Returns `None` if encoding fails.
-    pub fn from_chip_body(body: &serde_json::Value) -> Option<Self> {
-        let nrf_bytes = ubl_ai_nrf1::to_nrf1_bytes(body).ok()?;
-        let hash = blake3::hash(&nrf_bytes);
-        let hash_hex = hex::encode(hash.as_bytes());
-
-        let at_type = body
-            .get("@type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let at_ver = body
-            .get("@ver")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let at_world = body
-            .get("@world")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Some(Self {
-            hash: hash_hex,
-            at_type,
-            at_ver,
-            at_world,
-        })
-    }
-
-    /// The rate limit key: `(@type, @ver, @world, fingerprint_hash)`.
-    pub fn rate_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.at_type, self.at_ver, self.at_world, self.hash
-        )
-    }
-}
-
-impl std::fmt::Display for CanonFingerprint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "canon:{}…{}",
-            &self.hash[..8],
-            &self.hash[self.hash.len() - 4..]
-        )
-    }
-}
 
 /// Canon-aware rate limiter.
 ///

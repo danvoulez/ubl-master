@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use std::fmt;
 use thiserror::Error;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
@@ -40,6 +41,73 @@ pub fn to_nrf_bytes(value: &serde_json::Value) -> Result<Vec<u8>, CanonError> {
 pub fn cid_of(value: &serde_json::Value) -> Result<String, CanonError> {
     let nrf = to_nrf_bytes(value)?;
     Ok(format!("b3:{}", hex::encode(blake3::hash(&nrf).as_bytes())))
+}
+
+/// Canonical fingerprint for payload bucketing and canon-aware controls.
+///
+/// Computed as `BLAKE3(NRF-1(payload))`. Cosmetic JSON differences
+/// (key order, whitespace) produce the same fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonFingerprint {
+    /// Hex-encoded BLAKE3 hash of canonical NRF-1 bytes.
+    pub hash: String,
+    /// `@type` anchor, if present.
+    pub at_type: String,
+    /// `@ver` anchor, if present.
+    pub at_ver: String,
+    /// `@world` anchor, if present.
+    pub at_world: String,
+}
+
+impl CanonFingerprint {
+    /// Compute canonical fingerprint from a chip body.
+    ///
+    /// Returns `None` if canonical encoding fails.
+    pub fn from_chip_body(body: &serde_json::Value) -> Option<Self> {
+        let nrf_bytes = to_nrf_bytes(body).ok()?;
+        let hash = blake3::hash(&nrf_bytes);
+
+        Some(Self {
+            hash: hex::encode(hash.as_bytes()),
+            at_type: body
+                .get("@type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            at_ver: body
+                .get("@ver")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            at_world: body
+                .get("@world")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
+
+    /// Stable key format: `@type|@ver|@world|hash`.
+    pub fn rate_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.at_type, self.at_ver, self.at_world, self.hash
+        )
+    }
+}
+
+impl fmt::Display for CanonFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.hash.len() < 12 {
+            return write!(f, "canon:{}", self.hash);
+        }
+        write!(
+            f,
+            "canon:{}…{}",
+            &self.hash[..8],
+            &self.hash[self.hash.len() - 4..]
+        )
+    }
 }
 
 /// Sign canonical NRF payload with v1 compatibility mode.
@@ -174,6 +242,57 @@ mod tests {
         let v = json!({"@type":"ubl/test","ok":true});
         let sig = sign_domain_v2_hash_first(&v, domains::RECEIPT, &sk).unwrap();
         assert!(verify_domain_v2_hash_first(&v, domains::RECEIPT, &vk, &sig).unwrap());
+    }
+
+    #[test]
+    fn canon_fingerprint_deterministic() {
+        let body = json!({
+            "@type": "ubl/user",
+            "@ver": "1.0",
+            "@world": "a/acme/t/prod",
+            "@id": "alice",
+            "name": "Alice"
+        });
+        let fp1 = CanonFingerprint::from_chip_body(&body).unwrap();
+        let fp2 = CanonFingerprint::from_chip_body(&body).unwrap();
+        assert_eq!(fp1.hash, fp2.hash);
+        assert_eq!(fp1.at_type, "ubl/user");
+        assert_eq!(fp1.at_world, "a/acme/t/prod");
+    }
+
+    #[test]
+    fn canon_fingerprint_ignores_key_order() {
+        let body1 = json!({
+            "@type": "ubl/user",
+            "@ver": "1.0",
+            "@world": "a/x/t/y",
+            "@id": "a",
+            "name": "Alice"
+        });
+        let body2 = json!({
+            "name": "Alice",
+            "@id": "a",
+            "@world": "a/x/t/y",
+            "@ver": "1.0",
+            "@type": "ubl/user"
+        });
+        let fp1 = CanonFingerprint::from_chip_body(&body1).unwrap();
+        let fp2 = CanonFingerprint::from_chip_body(&body2).unwrap();
+        assert_eq!(fp1.hash, fp2.hash);
+    }
+
+    #[test]
+    fn canon_fingerprint_rate_key_format() {
+        let body = json!({
+            "@type": "ubl/token",
+            "@ver": "2.0",
+            "@world": "a/acme/t/prod",
+            "@id": "tok1"
+        });
+        let fp = CanonFingerprint::from_chip_body(&body).unwrap();
+        let key = fp.rate_key();
+        assert!(key.starts_with("ubl/token|2.0|a/acme/t/prod|"));
+        assert_eq!(key.matches('|').count(), 3);
     }
 
     proptest! {
