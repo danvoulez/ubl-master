@@ -63,7 +63,22 @@ pub enum Role {
 }
 
 impl Role {
-    pub fn from_str(s: &str) -> Result<Self, AuthError> {
+    pub fn parse(s: &str) -> Result<Self, AuthError> {
+        s.parse()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Member => "member",
+        }
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = AuthError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "admin" => Ok(Role::Admin),
             "member" => Ok(Role::Member),
@@ -71,13 +86,6 @@ impl Role {
                 "Role must be 'admin' or 'member', got '{}'",
                 other
             ))),
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Role::Admin => "admin",
-            Role::Member => "member",
         }
     }
 }
@@ -335,7 +343,7 @@ impl Membership {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AuthError::MissingField("role".into()))?;
 
-        let role = Role::from_str(role_str)?;
+        let role = Role::parse(role_str)?;
 
         Ok(Self {
             user_cid,
@@ -432,7 +440,7 @@ impl SessionToken {
     }
 
     pub fn is_expired(&self, now: &str) -> bool {
-        self.expires_at < now.to_string()
+        self.expires_at.as_str() < now
     }
 
     pub fn has_scope(&self, scope: &str) -> bool {
@@ -558,15 +566,17 @@ impl WorldScope {
         Ok(Self { app, tenant })
     }
 
-    pub fn to_string(&self) -> String {
-        match &self.tenant {
-            Some(t) => format!("a/{}/t/{}", self.app, t),
-            None => format!("a/{}", self.app),
-        }
-    }
-
     pub fn app_world(&self) -> String {
         format!("a/{}", self.app)
+    }
+}
+
+impl std::fmt::Display for WorldScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.tenant {
+            Some(t) => write!(f, "a/{}/t/{}", self.app, t),
+            None => write!(f, "a/{}", self.app),
+        }
     }
 }
 
@@ -847,10 +857,10 @@ impl AuthEngine {
             .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?;
 
         for chip in &apps.chips {
-            if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug) {
-                if !self.is_revoked(chip.cid.as_str(), store).await? {
-                    return Ok(());
-                }
+            if chip.chip_data.get("slug").and_then(|v| v.as_str()) == Some(app_slug)
+                && !self.is_revoked(chip.cid.as_str(), store).await?
+            {
+                return Ok(());
             }
         }
 
@@ -913,6 +923,12 @@ impl AuthEngine {
             .map_err(|e| AuthValidationError::Internal(format!("ChipStore: {}", e)))?;
 
         Ok(!revocations.chips.is_empty())
+    }
+}
+
+impl Default for AuthEngine {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1311,10 +1327,10 @@ mod tests {
 
     #[test]
     fn role_only_two() {
-        assert!(Role::from_str("admin").is_ok());
-        assert!(Role::from_str("member").is_ok());
-        assert!(Role::from_str("superadmin").is_err());
-        assert!(Role::from_str("user").is_err());
-        assert!(Role::from_str("").is_err());
+        assert!(Role::parse("admin").is_ok());
+        assert!(Role::parse("member").is_ok());
+        assert!(Role::parse("superadmin").is_err());
+        assert!(Role::parse("user").is_err());
+        assert!(Role::parse("").is_err());
     }
 }

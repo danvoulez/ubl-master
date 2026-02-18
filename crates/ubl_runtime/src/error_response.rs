@@ -257,7 +257,7 @@ impl UblError {
             message,
             link: format!(
                 "https://docs.ubl.agency/errors#{}",
-                serde_json::to_value(&code)
+                serde_json::to_value(code)
                     .unwrap_or(Value::Null)
                     .as_str()
                     .unwrap_or("UNKNOWN")

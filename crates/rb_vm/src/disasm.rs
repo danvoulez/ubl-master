@@ -101,7 +101,6 @@ fn hex_preview(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tlv;
 
     fn encode_instr(op: Opcode, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -119,7 +118,7 @@ mod tests {
 
     #[test]
     fn disasm_const_i64() {
-        let mut bc = encode_instr(Opcode::ConstI64, &42i64.to_be_bytes());
+        let bc = encode_instr(Opcode::ConstI64, &42i64.to_be_bytes());
         let out = disassemble(&bc).unwrap();
         assert!(out.contains("ConstI64"));
         assert!(out.contains("(42)"));

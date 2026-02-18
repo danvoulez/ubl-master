@@ -328,7 +328,7 @@ mod tests {
         for _ in 0..MAX_DEPTH + 2 {
             s.push_str(r#"{"a":"#);
         }
-        s.push_str("1");
+        s.push('1');
         for _ in 0..MAX_DEPTH + 2 {
             s.push('}');
         }

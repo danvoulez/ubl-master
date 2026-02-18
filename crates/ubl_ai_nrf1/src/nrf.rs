@@ -197,7 +197,7 @@ pub fn json_to_nrf(value: &Value) -> Result<NrfValue> {
             if s.chars().any(|c| c == '\u{feff}') {
                 bail!("BOMPresent");
             }
-            if s.chars().any(|c| c >= '\u{0000}' && c <= '\u{001f}') {
+            if s.chars().any(|c| ('\u{0000}'..='\u{001f}').contains(&c)) {
                 bail!("ControlCharPresent");
             }
             if s.nfc().collect::<String>() != *s {
@@ -218,7 +218,7 @@ pub fn json_to_nrf(value: &Value) -> Result<NrfValue> {
                 if k.chars().any(|c| c == '\u{feff}') {
                     bail!("BOMPresent in key");
                 }
-                if k.chars().any(|c| c >= '\u{0000}' && c <= '\u{001f}') {
+                if k.chars().any(|c| ('\u{0000}'..='\u{001f}').contains(&c)) {
                     bail!("ControlCharPresent in key");
                 }
                 if k.nfc().collect::<String>() != *k {

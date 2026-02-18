@@ -19,7 +19,10 @@ impl CasProvider for SharedCas {
     fn put(&mut self, bytes: &[u8]) -> Cid {
         let hash = blake3::hash(bytes);
         let cid = format!("b3:{}", hex::encode(hash.as_bytes()));
-        self.store.lock().unwrap().insert(cid.clone(), bytes.to_vec());
+        self.store
+            .lock()
+            .unwrap()
+            .insert(cid.clone(), bytes.to_vec());
         Cid(cid)
     }
 

@@ -53,7 +53,7 @@ pub enum TransitionRegistryError {
     InvalidConfig(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransitionRegistry {
     bytecode_overrides: HashMap<String, Vec<u8>>,
     profile_overrides: HashMap<String, TrBytecodeProfile>,
@@ -63,15 +63,6 @@ pub struct TransitionRegistry {
 enum ChipTrDirective {
     BytecodeHex(String),
     Profile(TrBytecodeProfile),
-}
-
-impl Default for TransitionRegistry {
-    fn default() -> Self {
-        Self {
-            bytecode_overrides: HashMap::new(),
-            profile_overrides: HashMap::new(),
-        }
-    }
 }
 
 impl TransitionRegistry {

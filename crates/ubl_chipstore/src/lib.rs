@@ -13,6 +13,11 @@ pub mod backends;
 pub mod indexing;
 pub mod query;
 
+/// Re-export for convenience
+pub use backends::*;
+pub use indexing::*;
+pub use query::*;
+
 /// A stored chip with its metadata and receipt
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredChip {
@@ -502,8 +507,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 }
-
-/// Re-export for convenience
-pub use backends::*;
-pub use indexing::*;
-pub use query::*;

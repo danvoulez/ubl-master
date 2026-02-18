@@ -5,7 +5,6 @@
 
 use crate::{to_nrf1_bytes, CompileError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// A .chip file in YAML format (Chip-as-Code)
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -31,16 +31,11 @@ pub enum SortField {
     ChipType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum SortOrder {
     Ascending,
+    #[default]
     Descending,
-}
-
-impl Default for SortOrder {
-    fn default() -> Self {
-        SortOrder::Descending
-    }
 }
 
 impl ChipQueryBuilder {
@@ -230,7 +225,7 @@ impl ChipQueryBuilder {
         true
     }
 
-    pub fn sort_chips(&self, chips: &mut Vec<StoredChip>) {
+    pub fn sort_chips(&self, chips: &mut [StoredChip]) {
         if let Some(ref sort_field) = self.sort_by {
             match sort_field {
                 SortField::CreatedAt => {

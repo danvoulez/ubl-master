@@ -113,7 +113,7 @@ impl Did {
 
     /// The DID method (e.g. `"key"` for `did:key:z...`).
     pub fn method(&self) -> &str {
-        self.0.splitn(3, ':').nth(1).unwrap_or("")
+        self.0.split(':').nth(1).unwrap_or("")
     }
 
     /// Borrow the inner string.
@@ -288,7 +288,7 @@ impl ChipType {
 
     /// The name part (after first `/`).
     pub fn name(&self) -> &str {
-        self.0.splitn(2, '/').nth(1).unwrap_or("")
+        self.0.split_once('/').map(|x| x.1).unwrap_or("")
     }
 
     /// Borrow the inner string.

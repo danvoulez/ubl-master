@@ -43,6 +43,7 @@ pub struct HostedUrl {
 
 impl HostedUrl {
     /// Build a new hosted URL.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: &str,
         app: &str,

@@ -180,7 +180,7 @@ mod tests {
             Expression::ContextHas("body.email".to_string()),
         ]);
 
-        assert_eq!(expr.evaluate(&test_context()), true);
+        assert!(expr.evaluate(&test_context()));
 
         let inputs = expr.inputs_used();
         assert!(inputs.contains(&"@type".to_string()));
@@ -190,9 +190,9 @@ mod tests {
     #[test]
     fn expression_size_limit() {
         let expr = Expression::BodySizeLte(2048);
-        assert_eq!(expr.evaluate(&test_context()), true);
+        assert!(expr.evaluate(&test_context()));
 
         let expr = Expression::BodySizeLte(512);
-        assert_eq!(expr.evaluate(&test_context()), false);
+        assert!(!expr.evaluate(&test_context()));
     }
 }

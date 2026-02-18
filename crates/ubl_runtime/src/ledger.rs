@@ -6,7 +6,7 @@
 //! Ledger failures are warn-logged, never block the pipeline.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -142,6 +142,12 @@ impl InMemoryLedger {
 
     pub async fn count(&self) -> usize {
         self.entries.lock().await.len()
+    }
+}
+
+impl Default for InMemoryLedger {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

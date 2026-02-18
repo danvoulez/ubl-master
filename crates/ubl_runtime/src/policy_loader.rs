@@ -206,14 +206,14 @@ impl InMemoryPolicyStorage {
         // Index by type
         self.by_type
             .entry(chip.chip_type.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(cid.clone());
 
         // Index by parents
         for parent in &chip.parents {
             self.by_parent
                 .entry(parent.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(cid.clone());
         }
 
@@ -229,11 +229,7 @@ impl PolicyStorage for InMemoryPolicyStorage {
     }
 
     async fn query_by_type(&self, chip_type: &str) -> Result<Vec<ChipData>, PolicyError> {
-        let cids = self
-            .by_type
-            .get(chip_type)
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        let cids = self.by_type.get(chip_type).cloned().unwrap_or_default();
 
         let chips = cids
             .into_iter()
@@ -244,11 +240,7 @@ impl PolicyStorage for InMemoryPolicyStorage {
     }
 
     async fn find_children(&self, parent_cid: &str) -> Result<Vec<ChipData>, PolicyError> {
-        let child_cids = self
-            .by_parent
-            .get(parent_cid)
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        let child_cids = self.by_parent.get(parent_cid).cloned().unwrap_or_default();
 
         let children = child_cids
             .into_iter()
@@ -256,6 +248,12 @@ impl PolicyStorage for InMemoryPolicyStorage {
             .collect();
 
         Ok(children)
+    }
+}
+
+impl Default for InMemoryPolicyStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

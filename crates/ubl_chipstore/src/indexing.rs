@@ -8,7 +8,7 @@ use ubl_types::Cid as TypedCid;
 
 /// Index for efficient chip lookups
 pub struct ChipIndexer {
-    backend: Arc<dyn ChipStoreBackend>,
+    _backend: Arc<dyn ChipStoreBackend>,
     // In-memory indexes for fast lookups
     type_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // chip_type -> CIDs
     tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>,  // tag -> CIDs
@@ -18,7 +18,7 @@ pub struct ChipIndexer {
 impl ChipIndexer {
     pub fn new(backend: Arc<dyn ChipStoreBackend>) -> Self {
         Self {
-            backend,
+            _backend: backend,
             type_index: Arc::new(RwLock::new(HashMap::new())),
             tag_index: Arc::new(RwLock::new(HashMap::new())),
             executor_index: Arc::new(RwLock::new(HashMap::new())),

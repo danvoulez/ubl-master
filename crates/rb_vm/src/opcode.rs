@@ -18,22 +18,22 @@ pub enum Opcode {
     SignDefault = 0x0F,
     EmitRc = 0x10,
     Drop = 0x11,
-    PushInput = 0x12,  // payload: u16 index
-    JsonGetKey = 0x13, // payload: utf-8 key
-    Dup = 0x14,        // duplicate top of stack
-    Swap = 0x15,       // swap top two stack values
-    VerifySig = 0x16,  // pop (pubkey_bytes, sig_bytes, msg_bytes) → push Bool
+    PushInput = 0x12,         // payload: u16 index
+    JsonGetKey = 0x13,        // payload: utf-8 key
+    Dup = 0x14,               // duplicate top of stack
+    Swap = 0x15,              // swap top two stack values
+    VerifySig = 0x16,         // pop (pubkey_bytes, sig_bytes, msg_bytes) → push Bool
     NumFromDecimalStr = 0x17, // pop string bytes -> push unc1 num
-    NumFromF64Bits = 0x18, // pop i64 bits -> push unc1 bnd
-    NumAdd = 0x19,     // pop b,a (num) -> push num
-    NumSub = 0x1A,     // pop b,a (num) -> push num
-    NumMul = 0x1B,     // pop b,a (num) -> push num
-    NumDiv = 0x1C,     // pop b,a (num) -> push num
-    NumToDec = 0x1D,   // payload: u32 scale + u8 rounding mode; pop num -> push dec
-    NumToRat = 0x1E,   // payload: u64 limit_den; pop num -> push rat
-    NumWithUnit = 0x1F, // payload: utf8 unit; pop num -> push num
-    NumAssertUnit = 0x20, // payload: utf8 unit; pop num -> push same num
-    NumCompare = 0x21, // pop b,a (num) -> push int/1 as num
+    NumFromF64Bits = 0x18,    // pop i64 bits -> push unc1 bnd
+    NumAdd = 0x19,            // pop b,a (num) -> push num
+    NumSub = 0x1A,            // pop b,a (num) -> push num
+    NumMul = 0x1B,            // pop b,a (num) -> push num
+    NumDiv = 0x1C,            // pop b,a (num) -> push num
+    NumToDec = 0x1D,          // payload: u32 scale + u8 rounding mode; pop num -> push dec
+    NumToRat = 0x1E,          // payload: u64 limit_den; pop num -> push rat
+    NumWithUnit = 0x1F,       // payload: utf8 unit; pop num -> push num
+    NumAssertUnit = 0x20,     // payload: utf8 unit; pop num -> push same num
+    NumCompare = 0x21,        // pop b,a (num) -> push int/1 as num
 }
 
 impl TryFrom<u8> for Opcode {

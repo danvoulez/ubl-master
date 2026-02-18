@@ -204,7 +204,7 @@ mod tests {
         use std::collections::HashMap;
 
         let rb = create_type_validation_rb();
-        let mut variables = HashMap::new();
+        let variables = HashMap::new();
 
         let context = EvalContext {
             chip: json!({"@type": "ubl/user", "id": "test"}),

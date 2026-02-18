@@ -617,7 +617,7 @@ pub fn to_rat(a: &Num, limit_den: u64) -> Result<Num, String> {
     let unit = a.unit().clone();
     let r = to_rational(a)?;
     // Check denominator limit
-    if r.denom().to_u64().map_or(true, |d| d > limit_den) {
+    if r.denom().to_u64().is_none_or(|d| d > limit_den) {
         // Approximate using continued fraction
         let approx = approximate_rational(&r, limit_den);
         Ok(Num::Rat {

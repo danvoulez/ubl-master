@@ -121,6 +121,11 @@ impl IdempotencyStore {
         entries.len()
     }
 
+    /// Whether there are no cached entries.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
     /// Prune entries older than the given duration.
     pub async fn prune_older_than(&self, max_age: std::time::Duration) {
         let cutoff = chrono::Utc::now() - chrono::Duration::from_std(max_age).unwrap_or_default();

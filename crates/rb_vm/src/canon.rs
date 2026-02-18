@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn rho_nfc_normalizes_keys() {
-        let nfd_key = format!("caf\u{0065}\u{0301}");
+        let nfd_key = "caf\u{0065}\u{0301}".to_string();
         let mut map = Map::new();
         map.insert(nfd_key, json!(1));
         let input = Value::Object(map);
