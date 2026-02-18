@@ -4,11 +4,8 @@ impl UblPipeline {
     /// Stage 1: Write-Ahead - create ghost record, freeze @world
     pub(in crate::pipeline) async fn stage_write_ahead(
         &self,
-        request: &ChipRequest,
+        request: &ParsedChipRequest<'_>,
     ) -> Result<PipelineReceipt, PipelineError> {
-        // Parse and validate envelope anchors used by WA.
-        let _parsed = ParsedChipRequest::parse(request)?;
-
         // Generate nonce and check for replay
         let nonce = Self::generate_nonce();
         {
@@ -24,11 +21,8 @@ impl UblPipeline {
             policy_cid: genesis_chip_cid(),  // For now, just genesis
             frozen_time: chrono::Utc::now().to_rfc3339(),
             caller: self.did.clone(),
-            context: request.body.clone(),
-            operation: request
-                .operation
-                .clone()
-                .unwrap_or_else(|| "create".to_string()),
+            context: request.body().clone(),
+            operation: request.operation().to_string(),
             nonce,
             kid: self.kid.clone(),
         };

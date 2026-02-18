@@ -4,6 +4,10 @@ use base64::Engine as _;
 use ring::digest;
 use serde_json::json;
 
+fn parsed_request(request: &ChipRequest) -> ParsedChipRequest<'_> {
+    ParsedChipRequest::parse(request).expect("request should parse")
+}
+
 fn allow_request() -> ChipRequest {
     ChipRequest {
         chip_type: "ubl/document".to_string(),
@@ -37,8 +41,9 @@ fn deny_request() -> ChipRequest {
 async fn stage_write_ahead_emits_valid_receipt() {
     let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
     let req = allow_request();
+    let parsed = parsed_request(&req);
 
-    let wa = pipeline.stage_write_ahead(&req).await.unwrap();
+    let wa = pipeline.stage_write_ahead(&parsed).await.unwrap();
     assert_eq!(wa.receipt_type, "ubl/wa");
     assert!(wa.body_cid.as_str().starts_with("b3:"));
     assert_eq!(wa.body["ghost"], json!(true));
@@ -49,12 +54,20 @@ async fn stage_write_ahead_emits_valid_receipt() {
 async fn stage_check_allow_and_deny_paths() {
     let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
 
-    let allow = pipeline.stage_check(&allow_request()).await.unwrap();
+    let allow_req = allow_request();
+    let allow = pipeline
+        .stage_check(&parsed_request(&allow_req))
+        .await
+        .unwrap();
     assert!(matches!(allow.decision, Decision::Allow));
     assert!(!allow.short_circuited);
     assert!(!allow.trace.is_empty());
 
-    let deny = pipeline.stage_check(&deny_request()).await.unwrap();
+    let deny_req = deny_request();
+    let deny = pipeline
+        .stage_check(&parsed_request(&deny_req))
+        .await
+        .unwrap();
     assert!(matches!(deny.decision, Decision::Deny));
     assert!(deny.short_circuited);
     assert!(!deny.trace.is_empty());
@@ -64,9 +77,10 @@ async fn stage_check_allow_and_deny_paths() {
 async fn stage_transition_emits_vm_signature_and_payload_cid() {
     let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
     let req = allow_request();
-    let check = pipeline.stage_check(&req).await.unwrap();
+    let parsed = parsed_request(&req);
+    let check = pipeline.stage_check(&parsed).await.unwrap();
 
-    let tr = pipeline.stage_transition(&req, &check).await.unwrap();
+    let tr = pipeline.stage_transition(&parsed, &check).await.unwrap();
     assert_eq!(tr.receipt_type, "ubl/transition");
     assert!(tr.body_cid.as_str().starts_with("b3:"));
     assert!(!tr.body["vm_sig"].as_str().unwrap_or("").is_empty());
@@ -98,8 +112,9 @@ async fn stage_transition_executes_inline_wasm_adapter() {
         "fuel_budget": 50_000
     });
 
-    let check = pipeline.stage_check(&req).await.unwrap();
-    let tr = pipeline.stage_transition(&req, &check).await.unwrap();
+    let parsed = parsed_request(&req);
+    let check = pipeline.stage_check(&parsed).await.unwrap();
+    let tr = pipeline.stage_transition(&parsed, &check).await.unwrap();
 
     assert_eq!(tr.body["vm_state"]["adapter_executed"], json!(true));
     assert_eq!(
@@ -137,8 +152,12 @@ async fn stage_transition_rejects_wasm_hash_mismatch() {
         "wasm_b64": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&module)
     });
 
-    let check = pipeline.stage_check(&req).await.unwrap();
-    let err = pipeline.stage_transition(&req, &check).await.unwrap_err();
+    let parsed = parsed_request(&req);
+    let check = pipeline.stage_check(&parsed).await.unwrap();
+    let err = pipeline
+        .stage_transition(&parsed, &check)
+        .await
+        .unwrap_err();
     assert!(matches!(err, PipelineError::InvalidChip(_)));
 }
 
@@ -146,12 +165,13 @@ async fn stage_transition_rejects_wasm_hash_mismatch() {
 async fn stage_write_finished_links_wa_and_tr_receipts() {
     let pipeline = UblPipeline::new(Box::new(InMemoryPolicyStorage::new()));
     let req = allow_request();
-    let wa = pipeline.stage_write_ahead(&req).await.unwrap();
-    let check = pipeline.stage_check(&req).await.unwrap();
-    let tr = pipeline.stage_transition(&req, &check).await.unwrap();
+    let parsed = parsed_request(&req);
+    let wa = pipeline.stage_write_ahead(&parsed).await.unwrap();
+    let check = pipeline.stage_check(&parsed).await.unwrap();
+    let tr = pipeline.stage_transition(&parsed, &check).await.unwrap();
 
     let wf = pipeline
-        .stage_write_finished(&req, &wa, &tr, &check)
+        .stage_write_finished(&parsed, &wa, &tr, &check)
         .await
         .unwrap();
     assert_eq!(wf.receipt_type, "ubl/wf");

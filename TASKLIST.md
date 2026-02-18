@@ -126,7 +126,7 @@ This section is additive and does not remove any existing items above. It is the
 | Existing ID | Phase | Notes |
 |---|---|---|
 | H4 (P0→P1 rollout automation) | M5 | Required for controlled production transition. |
-| H6 (Parse, Don't Validate) | M2 | Move critical chip flow to typed parsing first. |
+| H6 (Parse, Don't Validate) | M2 | ✅ Completed: pipeline now parses/anchors once and stages consume typed request context. |
 | F1 (Runtime certification) | M4 | Core deliverable for "Certified Runtime." |
 | F2 (Structured tracing) | M4 | ✅ Completed; supports operability gate G4. |
 | F4 (Property testing) | M2 | Supports determinism/confidence proof. |
@@ -137,13 +137,13 @@ This section is additive and does not remove any existing items above. It is the
 
 ---
 
-## Open — Hardening the Base (1 remaining)
+## Open — Hardening the Base (0 remaining)
 
 | # | Task | Location | Notes |
 |---|---|---|---|
 | H4 | **P0→P1 rollout automation** | `ROLLOUT_P0_TO_P1.md` | ✅ Done. Added `scripts/rollout_p0_p1_check.sh` + `make rollout-check` preflight with runtime hash allowlist validation, activation_time lead-window checks, signature quorum checks, core type coverage checks, and explicit break-glass mode/reporting (`docs/ops/ROLLOUT_AUTOMATION.md`). |
 | H5 | **Newtype pattern** | All crates | ✅ Done. `ubl_types` crate with `Cid`, `Did`, `Kid`, `Nonce`, `ChipType`, `World` newtypes (24 tests). Migrated `StoredChip.cid`/`receipt_cid` → `TypedCid`, `ExecutionMetadata.executor_did` → `TypedDid`, `UnifiedReceipt` fields (`world`/`did`/`kid`/`nonce`/`receipt_cid`/`prev_receipt_cid`), `PipelineReceipt.body_cid` → `TypedCid`. Serde-transparent wire compat preserved. |
-| H6 | **Parse, Don't Validate** | Pipeline + chip types | `auth.rs` does this well (`from_chip_body`). Rest of pipeline still uses raw `serde_json::Value`. Adopt progressively. |
+| H6 | **Parse, Don't Validate** | Pipeline + chip types | ✅ Done. Pipeline now enforces typed request parse once (`@type/@id/@world` + body object), with stages consuming `ParsedChipRequest` instead of re-validating raw request bodies. |
 
 ---
 
@@ -154,7 +154,7 @@ This section is additive and does not remove any existing items above. It is the
 | F1 | **PS3 — Runtime certification** | ✅ Done | `RuntimeInfo` extended with `runtime_hash` + `certs`, signed `SelfAttestation` (`ubl_runtime::runtime_cert`) verifies against DID key, runtime metadata attached to receipts, and gate endpoint `GET /v1/runtime/attestation` exposed in OpenAPI. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
 | F2 | **PS4 — Structured tracing** | ✅ Done | Runtime and gate migrated to `tracing` with per-stage structured spans and operational logging path for SLO/incident workflows. |
 | F3 | **PS5 — LLM Observer narration** | ✅ Done | Added deterministic on-demand narration endpoint `GET /v1/receipts/:cid/narrate` (optional `persist=true` stores `ubl/advisory` with hook `on_demand`) and MCP tool `ubl.narrate`. |
-| F4 | **Property-based testing** | Low | Started: proptest expansion in `ubl_canon` + `ubl_unc1` (CID/sign invariants, cross-mode/domain checks, numeric compare/rounding/denominator/IEEE-754 interval containment). Continue with `ubl_ai_nrf1` canon edge generators (Unicode/null-stripping/order) in next slice. |
+| F4 | **Property-based testing** | ✅ Done | Proptest expansion completed in `ubl_canon` + `ubl_unc1` + `ubl_ai_nrf1` (CID/sign invariants, cross-mode/domain checks, numeric edge behavior, and canon edge generators for order/null-stripping/Unicode-control/NFC constraints). |
 | F5 | **UNC-1 numeric opcodes** | ✅ Done | Implemented in `rb_vm` (`0x17..0x21`) with coverage in `crates/rb_vm/tests/num_opcodes.rs`. |
 | F6 | **UNC-1 KNOCK validation** | ✅ Done | KNOCK now validates strict `@num` atoms, rejects malformed numeric atoms (`KNOCK-009`), and preserves raw-float rejection path (`KNOCK-008`). |
 | F7 | **UNC-1 migration flags** | ✅ Done | Added rollout flags `REQUIRE_UNC1_NUMERIC` and `F64_IMPORT_MODE=bnd|reject`; added `normalize_numbers_to_unc1(...)` in `ubl_ai_nrf1::chip_format` compile flow. |

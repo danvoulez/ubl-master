@@ -61,6 +61,7 @@ impl AdapterRuntimeInfo {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ParsedChipRequest<'a> {
+    request: &'a ChipRequest,
     pub(super) chip_type: &'a str,
     pub(super) chip_id: Option<&'a str>,
     pub(super) world: &'a str,
@@ -68,8 +69,12 @@ pub(super) struct ParsedChipRequest<'a> {
 
 impl<'a> ParsedChipRequest<'a> {
     pub(super) fn parse(request: &'a ChipRequest) -> Result<Self, PipelineError> {
-        let chip_type = request
+        let body = request
             .body
+            .as_object()
+            .ok_or_else(|| PipelineError::InvalidChip("chip body must be object".to_string()))?;
+
+        let chip_type = body
             .get("@type")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PipelineError::InvalidChip("missing @type".to_string()))?;
@@ -80,25 +85,36 @@ impl<'a> ParsedChipRequest<'a> {
             )));
         }
 
-        let world = request
-            .body
+        let world = body
             .get("@world")
             .and_then(|v| v.as_str())
             .ok_or_else(|| PipelineError::InvalidChip("missing @world".to_string()))?;
         ubl_ai_nrf1::UblEnvelope::validate_world(world)
             .map_err(|e| PipelineError::InvalidChip(format!("@world: {}", e)))?;
 
-        let chip_id = request
-            .body
+        let chip_id = body
             .get("@id")
             .and_then(|v| v.as_str())
-            .or_else(|| request.body.get("id").and_then(|v| v.as_str()));
+            .or_else(|| body.get("id").and_then(|v| v.as_str()));
 
         Ok(Self {
+            request,
             chip_type,
             chip_id,
             world,
         })
+    }
+
+    pub(super) fn body(&self) -> &'a serde_json::Value {
+        &self.request.body
+    }
+
+    pub(super) fn parents(&self) -> &'a [String] {
+        &self.request.parents
+    }
+
+    pub(super) fn operation(&self) -> &'a str {
+        self.request.operation.as_deref().unwrap_or("create")
     }
 }
 

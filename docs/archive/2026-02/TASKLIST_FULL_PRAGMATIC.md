@@ -97,7 +97,7 @@
 - ✅ `(x)` P0 rich URL real verify (CID + DID signature + `rt_hash`) with shadow/strict modes
 - ✅ `(x)` P0/P1 TR bytecode registry: `transition_registry` (`@tr` override + env maps + profile defaults)
 - ✅ `(x)` H6 Parse-Don’t-Validate expansion in critical runtime paths (typed request parse for `@type/@id/@world`, typed onboarding dependency checks, adapter parse)
-- 🟨 `( )` F4 property testing expansion (canon + numeric edge cases) — started with proptests in `ubl_canon` + `ubl_unc1`
+- ✅ `(x)` F4 property testing expansion (canon + numeric edge cases) — completed with proptests in `ubl_canon` + `ubl_unc1` + `ubl_ai_nrf1` (order/null-stripping/Unicode-control/NFC edges)
 - ✅ `(x)` Cross-platform reproducibility CI matrix (Linux + macOS) — `.github/workflows/repro-matrix.yml`
 
 ### Phase M3 — Indexed Data Plane (April 19 → May 23, 2026)
@@ -129,7 +129,7 @@
 ## 4) Open Feature Backlog (After Critical Path or In Parallel If Cheap)
 
 - ✅ `(x)` F3 LLM Observer narration endpoint/productization (`GET /v1/receipts/:cid/narrate` + optional advisory persistence + MCP tool `ubl.narrate`)
-- 🟨 `( )` F4 property testing expansion (canon + numeric edge cases) — proptest expansion started in `ubl_canon` + `ubl_unc1`; next slice is `ubl_ai_nrf1` canon edge generators
+- ✅ `(x)` F4 property testing expansion (canon + numeric edge cases) — proptest expansion completed across `ubl_canon`, `ubl_unc1`, and `ubl_ai_nrf1` canon edge generators
 - ✅ `(x)` F5 UNC-1 numeric opcodes in RB-VM (`0x17..0x21` + coverage in `crates/rb_vm/tests/num_opcodes.rs`)
 - ✅ `(x)` F6 UNC-1 strict KNOCK validation path
 - ✅ `(x)` F7 UNC-1 migration flags rollout (`REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd|reject`, `normalize_numbers_to_unc1`)

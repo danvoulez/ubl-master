@@ -3082,6 +3082,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "leb128",
+ "proptest",
  "serde",
  "serde_json",
  "serde_yaml",

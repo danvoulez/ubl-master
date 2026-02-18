@@ -38,7 +38,7 @@ impl UblPipeline {
         );
 
         // ── Idempotency check: replay returns cached result (no re-execution) ──
-        let idem_key = IdempotencyKey::from_chip_body(&request.body);
+        let idem_key = IdempotencyKey::from_chip_body(parsed_request.body());
         let durable_idem_key = idem_key.as_ref().map(|k| k.to_durable_key());
         if let Some(ref key) = idem_key {
             let cached = if let (Some(durable), Some(durable_key)) =
@@ -62,7 +62,7 @@ impl UblPipeline {
                 let receipt = UnifiedReceipt::from_json(&cached.response_json)
                     .unwrap_or_else(|_| UnifiedReceipt::new("", "", "", ""));
                 info!(
-                    chip_type = %request.chip_type,
+                    chip_type = %parsed_request.chip_type,
                     world = %parsed_request.world,
                     receipt_cid = %cached.receipt_cid,
                     "pipeline idempotency replay"
@@ -91,9 +91,9 @@ impl UblPipeline {
 
         // Stage 1: WA (Write-Ahead)
         let wa_start = std::time::Instant::now();
-        let wa_receipt = self.stage_write_ahead(&request).await?;
+        let wa_receipt = self.stage_write_ahead(&parsed_request).await?;
         let wa_ms = wa_start.elapsed().as_millis() as i64;
-        debug!(chip_type = %request.chip_type, duration_ms = wa_ms, "stage wa completed");
+        debug!(chip_type = %parsed_request.chip_type, duration_ms = wa_ms, "stage wa completed");
 
         receipt
             .append_stage(StageExecution {
@@ -135,10 +135,10 @@ impl UblPipeline {
 
         // Stage 2: CHECK (Policy Evaluation)
         let check_start = std::time::Instant::now();
-        let check = self.stage_check(&request).await?;
+        let check = self.stage_check(&parsed_request).await?;
         let check_ms = check_start.elapsed().as_millis() as i64;
         debug!(
-            chip_type = %request.chip_type,
+            chip_type = %parsed_request.chip_type,
             duration_ms = check_ms,
             decision = ?check.decision,
             "stage check completed"
@@ -199,9 +199,7 @@ impl UblPipeline {
         if matches!(check.decision, Decision::Deny) {
             receipt.deny(&check.reason);
 
-            let wf_receipt = self
-                .create_deny_receipt(&request, &wa_receipt, &check)
-                .await?;
+            let wf_receipt = self.create_deny_receipt(&wa_receipt, &check).await?;
             let deny_ms = pipeline_start.elapsed().as_millis() as i64;
 
             receipt
@@ -256,7 +254,7 @@ impl UblPipeline {
                 replayed: false,
             };
             info!(
-                chip_type = %request.chip_type,
+                chip_type = %parsed_request.chip_type,
                 world = %parsed_request.world,
                 decision = "deny",
                 duration_ms = deny_ms,
@@ -270,9 +268,9 @@ impl UblPipeline {
 
         // Stage 3: TR (Transition - RB-VM execution)
         let tr_start = std::time::Instant::now();
-        let tr_receipt = self.stage_transition(&request, &check).await?;
+        let tr_receipt = self.stage_transition(&parsed_request, &check).await?;
         let tr_ms = tr_start.elapsed().as_millis() as i64;
-        debug!(chip_type = %request.chip_type, duration_ms = tr_ms, "stage tr completed");
+        debug!(chip_type = %parsed_request.chip_type, duration_ms = tr_ms, "stage tr completed");
 
         let fuel_used = tr_receipt
             .body
@@ -329,10 +327,10 @@ impl UblPipeline {
         // Stage 4: WF (Write-Finished)
         let wf_start = std::time::Instant::now();
         let wf_receipt = self
-            .stage_write_finished(&request, &wa_receipt, &tr_receipt, &check)
+            .stage_write_finished(&parsed_request, &wa_receipt, &tr_receipt, &check)
             .await?;
         let wf_ms = wf_start.elapsed().as_millis() as i64;
-        debug!(chip_type = %request.chip_type, duration_ms = wf_ms, "stage wf completed");
+        debug!(chip_type = %parsed_request.chip_type, duration_ms = wf_ms, "stage wf completed");
 
         receipt
             .append_stage(StageExecution {
@@ -392,18 +390,23 @@ impl UblPipeline {
                 reproducible: true,
             };
             let stored_chip_res = store
-                .store_executed_chip(request.body.clone(), unified_receipt_cid.clone(), metadata)
+                .store_executed_chip(
+                    parsed_request.body().clone(),
+                    unified_receipt_cid.clone(),
+                    metadata,
+                )
                 .await;
 
-            if request.chip_type == "ubl/key.rotate" {
+            if parsed_request.chip_type == "ubl/key.rotate" {
                 let rotation_chip_cid = stored_chip_res
                     .map_err(|e| PipelineError::StorageError(format!("key.rotate store: {}", e)))?;
 
-                let rotate_req = KeyRotateRequest::parse(&request.body)
+                let rotate_req = KeyRotateRequest::parse(parsed_request.body())
                     .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
                 let signing_seed = self.signing_key.to_bytes();
-                let material = derive_material(&rotate_req, &request.body, &signing_seed)
-                    .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?;
+                let material =
+                    derive_material(&rotate_req, parsed_request.body(), &signing_seed)
+                        .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?;
 
                 let mapping = mapping_chip(
                     world,
@@ -429,7 +432,7 @@ impl UblPipeline {
             } else if let Err(e) = stored_chip_res {
                 warn!(error = %e, "ChipStore persist failed (non-fatal)");
             }
-        } else if request.chip_type == "ubl/key.rotate" {
+        } else if parsed_request.chip_type == "ubl/key.rotate" {
             return Err(PipelineError::StorageError(
                 "ubl/key.rotate requires ChipStore persistence".to_string(),
             ));
@@ -460,7 +463,7 @@ impl UblPipeline {
         if let (Some(ref engine), Some(ref store)) = (&self.advisory_engine, &self.chip_store) {
             let adv = engine.post_wf_advisory(
                 wf_receipt.body_cid.as_str(),
-                &request.chip_type,
+                parsed_request.chip_type,
                 "allow",
                 total_ms,
             );
@@ -500,7 +503,7 @@ impl UblPipeline {
             .await?;
 
         info!(
-            chip_type = %request.chip_type,
+            chip_type = %parsed_request.chip_type,
             world = %parsed_request.world,
             decision = "allow",
             duration_ms = total_ms,

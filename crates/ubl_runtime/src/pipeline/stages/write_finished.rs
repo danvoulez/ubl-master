@@ -4,13 +4,13 @@ impl UblPipeline {
     /// Stage 4: WF - Write Finished
     pub(in crate::pipeline) async fn stage_write_finished(
         &self,
-        request: &ChipRequest,
+        request: &ParsedChipRequest<'_>,
         wa_receipt: &PipelineReceipt,
         tr_receipt: &PipelineReceipt,
         check: &CheckResult,
     ) -> Result<PipelineReceipt, PipelineError> {
         // Compute the final chip CID
-        let chip_nrf1 = ubl_ai_nrf1::to_nrf1_bytes(&request.body)
+        let chip_nrf1 = ubl_ai_nrf1::to_nrf1_bytes(request.body())
             .map_err(|e| PipelineError::Internal(format!("Chip CID: {}", e)))?;
         let chip_cid = ubl_ai_nrf1::compute_cid(&chip_nrf1)
             .map_err(|e| PipelineError::Internal(format!("Chip CID: {}", e)))?;
@@ -46,7 +46,6 @@ impl UblPipeline {
     /// Create a DENY receipt when policy fails
     pub(in crate::pipeline) async fn create_deny_receipt(
         &self,
-        _request: &ChipRequest,
         wa_receipt: &PipelineReceipt,
         check: &CheckResult,
     ) -> Result<PipelineReceipt, PipelineError> {

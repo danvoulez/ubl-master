@@ -14,11 +14,11 @@ impl UblPipeline {
     /// Stage 3: TR - Transition (RB-VM execution)
     pub(in crate::pipeline) async fn stage_transition(
         &self,
-        request: &ChipRequest,
+        request: &ParsedChipRequest<'_>,
         _check: &CheckResult,
     ) -> Result<PipelineReceipt, PipelineError> {
         // Encode chip body to NRF bytes and store as CAS input
-        let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(&request.body)
+        let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(request.body())
             .map_err(|e| PipelineError::Internal(format!("TR input NRF: {}", e)))?;
 
         let mut cas = PipelineCas::new();
@@ -36,7 +36,7 @@ impl UblPipeline {
             trace: true,
         };
 
-        let adapter_info = AdapterRuntimeInfo::parse_optional(&request.body)?;
+        let adapter_info = AdapterRuntimeInfo::parse_optional(request.body())?;
         let adapter_outcome = if let Some(info) = adapter_info.as_ref() {
             Some(
                 self.execute_wasm_adapter(info, &chip_nrf, &input_cid_str)
@@ -49,7 +49,7 @@ impl UblPipeline {
         // Resolve bytecode by chip type / chip override / env override.
         let resolution = self
             .transition_registry
-            .resolve(&request.chip_type, &request.body)
+            .resolve(request.chip_type, request.body())
             .map_err(|e| PipelineError::InvalidChip(format!("TR bytecode resolution: {}", e)))?;
         let bytecode_hash = format!(
             "b3:{}",
@@ -84,11 +84,11 @@ impl UblPipeline {
         }
 
         let key_rotation = if request.chip_type == "ubl/key.rotate" {
-            let rotate_req = KeyRotateRequest::parse(&request.body)
+            let rotate_req = KeyRotateRequest::parse(request.body())
                 .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
             let signing_seed = self.signing_key.to_bytes();
             Some(
-                derive_material(&rotate_req, &request.body, &signing_seed)
+                derive_material(&rotate_req, request.body(), &signing_seed)
                     .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?,
             )
         } else {

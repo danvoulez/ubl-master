@@ -268,6 +268,7 @@ pub fn compute_cid(nrf_bytes: &[u8]) -> Result<String, CompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
 
     // ── Roundtrip: every type must survive encode→decode ──────────
@@ -625,5 +626,87 @@ mod tests {
         let b1 = encode_to_vec(&NrfValue::Map(m1)).unwrap();
         let b2 = encode_to_vec(&NrfValue::Map(m2)).unwrap();
         assert_eq!(b1, b2, "map encoding must be key-sorted and deterministic");
+    }
+
+    proptest! {
+        #[test]
+        fn cid_is_invariant_under_object_insertion_order(
+            entries in proptest::collection::btree_map("[a-z]{1,8}", -10_000i64..10_000, 1..16)
+        ) {
+            let mut forward = serde_json::Map::new();
+            for (k, v) in &entries {
+                forward.insert(k.clone(), json!(*v));
+            }
+
+            let mut reverse = serde_json::Map::new();
+            for (k, v) in entries.iter().rev() {
+                reverse.insert(k.clone(), json!(*v));
+            }
+
+            let bytes_forward = to_nrf1_bytes(&Value::Object(forward)).unwrap();
+            let bytes_reverse = to_nrf1_bytes(&Value::Object(reverse)).unwrap();
+            prop_assert_eq!(&bytes_forward, &bytes_reverse);
+            prop_assert_eq!(compute_cid(&bytes_forward).unwrap(), compute_cid(&bytes_reverse).unwrap());
+        }
+
+        #[test]
+        fn map_null_stripping_matches_explicit_removal(
+            entries in proptest::collection::btree_map("[a-z]{1,8}", proptest::option::of(-10_000i64..10_000), 1..16)
+        ) {
+            let mut with_nulls = serde_json::Map::new();
+            let mut stripped = serde_json::Map::new();
+
+            for (k, v) in entries {
+                match v {
+                    Some(n) => {
+                        with_nulls.insert(k.clone(), json!(n));
+                        stripped.insert(k, json!(n));
+                    }
+                    None => {
+                        with_nulls.insert(k, Value::Null);
+                    }
+                }
+            }
+
+            let bytes_with_nulls = to_nrf1_bytes(&Value::Object(with_nulls)).unwrap();
+            let bytes_stripped = to_nrf1_bytes(&Value::Object(stripped)).unwrap();
+            prop_assert_eq!(bytes_with_nulls, bytes_stripped);
+        }
+
+        #[test]
+        fn rejects_control_chars_in_values(
+            control in 0u8..=31u8,
+            prefix in "[a-zA-Z0-9]{0,8}",
+            suffix in "[a-zA-Z0-9]{0,8}",
+        ) {
+            let s = format!("{prefix}{}{suffix}", char::from(control));
+            let err = json_to_nrf(&Value::String(s));
+            prop_assert!(err.is_err());
+            prop_assert!(err.unwrap_err().to_string().contains("ControlChar"));
+        }
+
+        #[test]
+        fn rejects_control_chars_in_keys(
+            control in 0u8..=31u8,
+            key_suffix in "[a-z]{0,6}"
+        ) {
+            let key = format!("k{}{}", char::from(control), key_suffix);
+            let mut map = serde_json::Map::new();
+            map.insert(key, json!(1));
+            let err = json_to_nrf(&Value::Object(map));
+            prop_assert!(err.is_err());
+            prop_assert!(err.unwrap_err().to_string().contains("ControlChar"));
+        }
+
+        #[test]
+        fn rejects_non_nfc_strings(
+            prefix in "[a-z]{0,6}",
+            suffix in "[a-z]{0,6}",
+        ) {
+            let nfd = format!("{prefix}e\u{0301}{suffix}");
+            let err = json_to_nrf(&Value::String(nfd));
+            prop_assert!(err.is_err());
+            prop_assert!(err.unwrap_err().to_string().contains("NotNFC"));
+        }
     }
 }

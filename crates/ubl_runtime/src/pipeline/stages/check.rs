@@ -4,15 +4,14 @@ impl UblPipeline {
     /// Stage 2: CHECK - Onboarding validation + Policy evaluation with full trace
     pub(in crate::pipeline) async fn stage_check(
         &self,
-        request: &ChipRequest,
+        request: &ParsedChipRequest<'_>,
     ) -> Result<CheckResult, PipelineError> {
         let _check_start = std::time::Instant::now();
-        let parsed_request = ParsedChipRequest::parse(request)?;
 
         // ── Onboarding pre-check: validate body + dependency chain ──
-        if crate::auth::is_onboarding_type(&request.chip_type) {
+        if crate::auth::is_onboarding_type(request.chip_type) {
             // 1. Parse chip body into typed onboarding payload
-            let onboarding = crate::auth::parse_onboarding_chip(&request.body)
+            let onboarding = crate::auth::parse_onboarding_chip(request.body())
                 .map_err(|e| PipelineError::InvalidChip(format!("Onboarding validation: {}", e)))?;
             let onboarding = onboarding.ok_or_else(|| {
                 PipelineError::InvalidChip(format!(
@@ -22,34 +21,37 @@ impl UblPipeline {
             })?;
 
             // 2. Validate @world format
-            let world_str = parsed_request.world;
+            let world_str = request.world;
 
             // 3. Check dependency chain against ChipStore
             if let Some(ref store) = self.chip_store {
                 let auth = crate::auth::AuthEngine::new();
-                auth.validate_onboarding_dependencies(&onboarding, &request.body, world_str, store)
-                    .await
-                    .map_err(|e| match e {
-                        crate::auth::AuthValidationError::InvalidChip(msg) => {
-                            PipelineError::InvalidChip(msg)
-                        }
-                        crate::auth::AuthValidationError::DependencyMissing(msg) => {
-                            PipelineError::DependencyMissing(msg)
-                        }
-                        crate::auth::AuthValidationError::Internal(msg) => {
-                            PipelineError::Internal(msg)
-                        }
-                    })?;
+                auth.validate_onboarding_dependencies(
+                    &onboarding,
+                    request.body(),
+                    world_str,
+                    store,
+                )
+                .await
+                .map_err(|e| match e {
+                    crate::auth::AuthValidationError::InvalidChip(msg) => {
+                        PipelineError::InvalidChip(msg)
+                    }
+                    crate::auth::AuthValidationError::DependencyMissing(msg) => {
+                        PipelineError::DependencyMissing(msg)
+                    }
+                    crate::auth::AuthValidationError::Internal(msg) => PipelineError::Internal(msg),
+                })?;
             }
         }
 
         // ── Key rotation pre-check: typed parse + capability + duplicate guard ──
         if request.chip_type == "ubl/key.rotate" {
-            let parsed = KeyRotateRequest::parse(&request.body)
+            let parsed = KeyRotateRequest::parse(request.body())
                 .map_err(|e| PipelineError::InvalidChip(format!("Key rotation: {}", e)))?;
-            let world_str = parsed_request.world;
+            let world_str = request.world;
 
-            crate::capability::require_cap(&request.body, "key:rotate", world_str).map_err(
+            crate::capability::require_cap(request.body(), "key:rotate", world_str).map_err(
                 |e| PipelineError::InvalidChip(format!("ubl/key.rotate capability: {}", e)),
             )?;
 
@@ -77,13 +79,10 @@ impl UblPipeline {
 
         // Convert to policy request
         let policy_request = PolicyChipRequest {
-            chip_type: request.chip_type.clone(),
-            body: request.body.clone(),
-            parents: request.parents.clone(),
-            operation: request
-                .operation
-                .clone()
-                .unwrap_or_else(|| "create".to_string()),
+            chip_type: request.chip_type.to_string(),
+            body: request.body().clone(),
+            parents: request.parents().to_vec(),
+            operation: request.operation().to_string(),
         };
 
         // Load policy chain
@@ -94,20 +93,20 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("Policy loading: {}", e)))?;
 
         // Create evaluation context
-        let body_bytes = serde_json::to_vec(&request.body)
+        let body_bytes = serde_json::to_vec(request.body())
             .map_err(|e| PipelineError::Internal(format!("Body serialization: {}", e)))?;
 
         let mut variables = HashMap::new();
         variables.insert(
             "chip.@type".to_string(),
-            serde_json::json!(parsed_request.chip_type),
+            serde_json::json!(request.chip_type),
         );
-        if let Some(chip_id) = parsed_request.chip_id {
+        if let Some(chip_id) = request.chip_id {
             variables.insert("chip.id".to_string(), serde_json::json!(chip_id));
         }
 
         let context = EvalContext {
-            chip: request.body.clone(),
+            chip: request.body().clone(),
             body_size: body_bytes.len(),
             variables,
         };
