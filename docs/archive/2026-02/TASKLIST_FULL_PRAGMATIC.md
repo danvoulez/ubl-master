@@ -66,7 +66,7 @@
 - ✅ `(x)` PR-A P0.3 secure bootstrap (capability scaffold)
 - ✅ `(x)` PR-A P0.4 receipts-as-authz rules
 - ✅ `(x)` PR-B P1.5 canonical stage events
-- ✅ `(x)` PR-B P1.6 ETag/cache on reads
+- ✅ `(x)` PR-B P1.6 ETag/cache on reads (`/v1/chips/:cid`, `/v1/cas/:cid`, `/v1/receipts/:cid`)
 - ✅ `(x)` PR-B P1.7 unified error taxonomy
 - ✅ `(x)` PR-C P2.8 manifest generator
 - ✅ `(x)` PR-C P2.9 MCP server proxy
