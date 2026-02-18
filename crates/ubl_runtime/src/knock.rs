@@ -703,6 +703,20 @@ mod tests {
     }
 
     #[test]
+    fn knock_require_unc1_numeric_rejects_raw_float_literals() {
+        with_env_var("REQUIRE_UNC1_NUMERIC", Some("true"), || {
+            let bytes = serde_json::to_vec(&json!({
+                "@type": "ubl/test",
+                "@world": "a/x/t/y",
+                "amount": 12.34
+            }))
+            .unwrap();
+            let err = knock(&bytes).unwrap_err();
+            assert!(matches!(err, KnockError::RawFloat(_)));
+        });
+    }
+
+    #[test]
     fn knock_accepts_integers_and_num_atoms() {
         // Integers are fine; @num objects are fine (they're objects, not floats)
         let bytes = serde_json::to_vec(&json!({

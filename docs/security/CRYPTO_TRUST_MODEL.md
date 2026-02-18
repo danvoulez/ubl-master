@@ -14,6 +14,9 @@ Guarantee end-to-end verifiable receipts and rich URLs with deterministic canoni
 - Receipt signing in WF via `UnifiedReceipt::finalize_and_sign`
 - Rich URL verification in `shadow` or `strict` mode by flag/scope
 - Canonical payload source is NRF bytes (`ubl_canon`)
+- Primary production signature algorithm is Ed25519
+- PQ dual-sign (`ML-DSA3`) is currently a feature-gated stub (`ubl_kms/pq_mldsa3`):
+  wire/API shape exists, PQ signature value is `None` until backend integration
 
 ## Signature Domains
 

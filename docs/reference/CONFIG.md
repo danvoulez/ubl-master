@@ -57,6 +57,8 @@ This file lists runtime flags used by the current implementation.
 
 | Variable | Default | Scope | Purpose |
 |---|---|---|---|
+| `REQUIRE_UNC1_NUMERIC` | `false` | knock + compile | When `true`, raw JSON numeric literals are rejected (must use UNC-1 `@num` atoms). |
+| `F64_IMPORT_MODE` | `reject` | knock + compile | Raw float handling: `reject` (fail) or `bnd` (convert to UNC-1 `bnd/1`). |
 | `REGISTRY_BASE_URL` | `http://localhost:3000` | config crate | Base URL used by `ubl_config`. |
 | `RUST_LOG` | internal default filter | gate | Controls tracing verbosity. |
 
@@ -70,4 +72,6 @@ UBL_CRYPTO_MODE=compat_v1
 UBL_RICHURL_VERIFY_MODE=shadow
 UBL_STAGE_SECRET=hex:<32-byte-hex>
 SIGNING_KEY_HEX=<32-byte-hex>
+REQUIRE_UNC1_NUMERIC=true
+F64_IMPORT_MODE=reject
 ```

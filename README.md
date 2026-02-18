@@ -52,3 +52,9 @@ Key docs:
 - Prefer deterministic, canonical paths for CID/sign/verify (`ubl_canon`, NRF).
 - Treat docs as code: update relevant docs in the same PR as behavior changes.
 - Archive superseded strategy/checklist docs under `docs/archive/` instead of deleting.
+
+## Security Notes
+
+- Production signature path is Ed25519 (receipt/runtime attestations).
+- PQ dual-sign (`ML-DSA3`) is feature-gated as a rollout stub (`ubl_kms/pq_mldsa3`):
+  API/wire shape is present, and PQ signature currently returns `None` until backend integration is completed.

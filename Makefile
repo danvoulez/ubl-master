@@ -1,4 +1,4 @@
-.PHONY: all build test fmt lint kat gate clean check load-validate rollout-check prod-slice-canary
+.PHONY: all build test fmt lint kat gate gate-prod clean check load-validate rollout-check prod-slice-canary
 
 all: build
 
@@ -24,6 +24,9 @@ kat:
 
 gate:
 	RUST_LOG=info cargo run -p ubl_gate
+
+gate-prod:
+	REQUIRE_UNC1_NUMERIC=true F64_IMPORT_MODE=reject RUST_LOG=info cargo run -p ubl_gate
 
 load-validate:
 	cargo test -p ubl_chipstore --test load_validation -- --ignored --nocapture
