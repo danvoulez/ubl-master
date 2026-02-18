@@ -28,6 +28,10 @@ pub enum ErrorCode {
     KnockNotObject,
     #[serde(rename = "KNOCK_RAW_FLOAT")]
     KnockRawFloat,
+    #[serde(rename = "KNOCK_MALFORMED_NUM")]
+    KnockMalformedNum,
+    #[serde(rename = "KNOCK_NUMERIC_LITERAL_NOT_ALLOWED")]
+    KnockNumericLiteralNotAllowed,
 
     // Pipeline errors (produce DENY receipt)
     #[serde(rename = "POLICY_DENIED")]
@@ -94,7 +98,9 @@ impl ErrorCode {
             | Self::KnockInvalidUtf8
             | Self::KnockMissingAnchor
             | Self::KnockNotObject
-            | Self::KnockRawFloat => 400,
+            | Self::KnockRawFloat
+            | Self::KnockMalformedNum
+            | Self::KnockNumericLiteralNotAllowed => 400,
 
             Self::PolicyDenied => 403,
             Self::DependencyMissing => 409,
@@ -134,6 +140,8 @@ impl ErrorCode {
             | Self::KnockMissingAnchor
             | Self::KnockNotObject
             | Self::KnockRawFloat
+            | Self::KnockMalformedNum
+            | Self::KnockNumericLiteralNotAllowed
             | Self::InvalidChip
             | Self::CanonError
             | Self::FuelExhausted
@@ -186,6 +194,8 @@ impl ErrorCode {
                 | Self::KnockMissingAnchor
                 | Self::KnockNotObject
                 | Self::KnockRawFloat
+                | Self::KnockMalformedNum
+                | Self::KnockNumericLiteralNotAllowed
                 | Self::Unauthorized
                 | Self::NotFound
                 | Self::TooManyRequests
@@ -294,6 +304,10 @@ fn classify_knock_error(msg: &str) -> ErrorCode {
         ErrorCode::KnockNotObject
     } else if msg.contains("KNOCK-008") {
         ErrorCode::KnockRawFloat
+    } else if msg.contains("KNOCK-009") {
+        ErrorCode::KnockMalformedNum
+    } else if msg.contains("KNOCK-010") {
+        ErrorCode::KnockNumericLiteralNotAllowed
     } else {
         ErrorCode::KnockInvalidUtf8 // fallback
     }
@@ -370,6 +384,8 @@ mod tests {
             ErrorCode::KnockMissingAnchor,
             ErrorCode::KnockNotObject,
             ErrorCode::KnockRawFloat,
+            ErrorCode::KnockMalformedNum,
+            ErrorCode::KnockNumericLiteralNotAllowed,
         ];
         for code in &codes {
             assert_eq!(code.http_status(), 400, "{:?} should be 400", code);
@@ -388,6 +404,16 @@ mod tests {
         );
         let ubl_err = UblError::from_pipeline_error(&err);
         assert_eq!(ubl_err.code, ErrorCode::KnockRawFloat);
+        assert_eq!(ubl_err.code.http_status(), 400);
+        assert!(!ubl_err.code.produces_receipt());
+    }
+
+    #[test]
+    fn knock_malformed_num_maps_to_400() {
+        let err =
+            PipelineError::Knock("KNOCK-009: malformed @num atom: $.amount missing m".to_string());
+        let ubl_err = UblError::from_pipeline_error(&err);
+        assert_eq!(ubl_err.code, ErrorCode::KnockMalformedNum);
         assert_eq!(ubl_err.code.http_status(), 400);
         assert!(!ubl_err.code.produces_receipt());
     }

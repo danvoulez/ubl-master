@@ -11,6 +11,7 @@
 //! 5. Valid UTF-8 (enforced by serde_json, but we check raw bytes too)
 //! 6. Required anchors: @type, @world
 //! 7. No raw floats (UNC-1 §3/§6: use @num atoms instead)
+//! 8. Strict `@num` atom validation (UNC-1 shape + field types)
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -18,6 +19,21 @@ use std::collections::HashSet;
 pub const MAX_BODY_BYTES: usize = 1_048_576; // 1 MB
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_ARRAY_LEN: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum F64ImportMode {
+    Reject,
+    Bnd,
+}
+
+impl F64ImportMode {
+    fn from_env() -> Self {
+        match std::env::var("F64_IMPORT_MODE") {
+            Ok(v) if v.eq_ignore_ascii_case("bnd") => Self::Bnd,
+            _ => Self::Reject,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KnockError {
@@ -37,6 +53,10 @@ pub enum KnockError {
     NotObject,
     #[error("KNOCK-008: raw float in payload violates UNC-1 — use @num atoms: {0}")]
     RawFloat(String),
+    #[error("KNOCK-009: malformed @num atom: {0}")]
+    MalformedNum(String),
+    #[error("KNOCK-010: numeric literals are disabled (set as @num atoms) at {0}")]
+    NumericLiteralNotAllowed(String),
 }
 
 /// Validate raw bytes before JSON parsing.
@@ -57,6 +77,14 @@ pub fn knock_raw(bytes: &[u8]) -> Result<(), KnockError> {
 
 /// Validate parsed JSON value for structural limits and required anchors.
 pub fn knock_parsed(value: &Value) -> Result<(), KnockError> {
+    let require_unc1 = std::env::var("REQUIRE_UNC1_NUMERIC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    knock_parsed_with_options(value, require_unc1)
+}
+
+fn knock_parsed_with_options(value: &Value, require_unc1: bool) -> Result<(), KnockError> {
     let obj = value.as_object().ok_or(KnockError::NotObject)?;
 
     // Required anchors
@@ -71,8 +99,10 @@ pub fn knock_parsed(value: &Value) -> Result<(), KnockError> {
     check_depth(value, 0)?;
     check_arrays(value)?;
 
-    // UNC-1 §6: reject raw floats — must use @num atoms
-    check_no_floats(value)?;
+    // UNC-1 strict path:
+    // - validate @num objects
+    // - optionally require every numeric literal to be represented as @num
+    check_numeric_nodes(value, "$", require_unc1)?;
 
     Ok(())
 }
@@ -83,7 +113,11 @@ pub fn knock(bytes: &[u8]) -> Result<Value, KnockError> {
     knock_raw(bytes)?;
 
     // Parse JSON (also validates UTF-8 at serde level)
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| KnockError::InvalidUtf8)?;
+    let mut value: Value = serde_json::from_slice(bytes).map_err(|_| KnockError::InvalidUtf8)?;
+
+    if matches!(F64ImportMode::from_env(), F64ImportMode::Bnd) {
+        normalize_f64_to_bnd(&mut value)?;
+    }
 
     knock_parsed(&value)?;
 
@@ -113,28 +147,205 @@ fn check_depth(value: &Value, depth: usize) -> Result<(), KnockError> {
     Ok(())
 }
 
-/// UNC-1 §3/§6: raw JSON floats are never canonical.
-/// Numbers must be i64/u64 integers or @num atoms (objects).
-fn check_no_floats(value: &Value) -> Result<(), KnockError> {
+fn check_numeric_nodes(value: &Value, path: &str, require_unc1: bool) -> Result<(), KnockError> {
     match value {
         Value::Number(n) => {
             if !n.is_i64() && !n.is_u64() {
-                return Err(KnockError::RawFloat(format!("{}", n)));
+                return Err(KnockError::RawFloat(format!("{} at {}", n, path)));
+            }
+            if require_unc1 {
+                return Err(KnockError::NumericLiteralNotAllowed(path.to_string()));
             }
         }
         Value::Array(arr) => {
-            for v in arr {
-                check_no_floats(v)?;
+            for (idx, v) in arr.iter().enumerate() {
+                check_numeric_nodes(v, &format!("{}[{}]", path, idx), require_unc1)?;
             }
         }
         Value::Object(map) => {
-            for v in map.values() {
-                check_no_floats(v)?;
+            if map.contains_key("@num") {
+                validate_num_atom(map, path)?;
+                return Ok(());
+            }
+
+            for (k, v) in map {
+                check_numeric_nodes(v, &format!("{}.{}", path, k), require_unc1)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn normalize_f64_to_bnd(value: &mut Value) -> Result<(), KnockError> {
+    match value {
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                return Ok(());
+            }
+            let Some(f) = n.as_f64() else {
+                return Err(KnockError::RawFloat(format!("{}", n)));
+            };
+            let bnd = ubl_unc1::from_f64_bits(f.to_bits()).map_err(KnockError::MalformedNum)?;
+            *value = serde_json::to_value(&bnd)
+                .map_err(|e| KnockError::MalformedNum(format!("failed to encode BND: {}", e)))?;
+            Ok(())
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                normalize_f64_to_bnd(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            if map.contains_key("@num") {
+                return Ok(());
+            }
+            for item in map.values_mut() {
+                normalize_f64_to_bnd(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_num_atom(
+    map: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), KnockError> {
+    let tag = map
+        .get("@num")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| KnockError::MalformedNum(format!("{}.@num must be string", path)))?;
+
+    match tag {
+        "int/1" => {
+            ensure_allowed_keys(map, &["@num", "v", "u"], path, tag)?;
+            ensure_bigint_field(map, "v", path)?;
+            ensure_optional_unit(map, path)?;
+        }
+        "dec/1" => {
+            ensure_allowed_keys(map, &["@num", "m", "s", "u"], path, tag)?;
+            ensure_bigint_field(map, "m", path)?;
+            ensure_u32_field(map, "s", path)?;
+            ensure_optional_unit(map, path)?;
+        }
+        "rat/1" => {
+            ensure_allowed_keys(map, &["@num", "p", "q", "u"], path, tag)?;
+            ensure_bigint_field(map, "p", path)?;
+            let q = ensure_bigint_field(map, "q", path)?;
+            if is_zero_bigint(&q) {
+                return Err(KnockError::MalformedNum(format!(
+                    "{}.q must be non-zero for rat/1",
+                    path
+                )));
+            }
+            ensure_optional_unit(map, path)?;
+        }
+        "bnd/1" => {
+            ensure_allowed_keys(map, &["@num", "lo", "hi", "u"], path, tag)?;
+            let lo = map
+                .get("lo")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| KnockError::MalformedNum(format!("{}.lo must be object", path)))?;
+            let hi = map
+                .get("hi")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| KnockError::MalformedNum(format!("{}.hi must be object", path)))?;
+
+            validate_num_atom(lo, &format!("{}.lo", path))?;
+            validate_num_atom(hi, &format!("{}.hi", path))?;
+            ensure_optional_unit(map, path)?;
+        }
+        _ => {
+            return Err(KnockError::MalformedNum(format!(
+                "{}.@num unsupported tag '{}'",
+                path, tag
+            )))
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_allowed_keys(
+    map: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    path: &str,
+    tag: &str,
+) -> Result<(), KnockError> {
+    for k in map.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(KnockError::MalformedNum(format!(
+                "{} contains unknown field '{}' for {}",
+                path, k, tag
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_bigint_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<String, KnockError> {
+    let s = map.get(field).and_then(|v| v.as_str()).ok_or_else(|| {
+        KnockError::MalformedNum(format!("{}.{} must be bigint string", path, field))
+    })?;
+    if !is_bigint_literal(s) {
+        return Err(KnockError::MalformedNum(format!(
+            "{}.{} invalid bigint literal '{}'",
+            path, field, s
+        )));
+    }
+    Ok(s.to_string())
+}
+
+fn ensure_u32_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &str,
+) -> Result<u32, KnockError> {
+    let n = map
+        .get(field)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| KnockError::MalformedNum(format!("{}.{} must be u32", path, field)))?;
+    u32::try_from(n)
+        .map_err(|_| KnockError::MalformedNum(format!("{}.{} out of range for u32", path, field)))
+}
+
+fn ensure_optional_unit(
+    map: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), KnockError> {
+    if let Some(v) = map.get("u") {
+        if !v.is_string() {
+            return Err(KnockError::MalformedNum(format!(
+                "{}.u must be string when present",
+                path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_bigint_literal(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let start = if bytes[0] == b'-' { 1 } else { 0 };
+    if start >= bytes.len() {
+        return false;
+    }
+    bytes[start..].iter().all(|c| c.is_ascii_digit())
+}
+
+fn is_zero_bigint(s: &str) -> bool {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    !s.is_empty() && s.chars().all(|c| c == '0')
 }
 
 fn check_arrays(value: &Value) -> Result<(), KnockError> {
@@ -259,6 +470,27 @@ fn scan_object_keys(s: &str) -> Result<(), KnockError> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_env_var<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var(key).ok();
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        f();
+        if let Some(p) = prev {
+            std::env::set_var(key, p);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
 
     fn valid_chip() -> Vec<u8> {
         serde_json::to_vec(&json!({
@@ -380,26 +612,94 @@ mod tests {
 
     #[test]
     fn knock_rejects_raw_float_unc1() {
-        let bytes = serde_json::to_vec(&json!({
-            "@type": "ubl/test",
-            "@world": "a/x/t/y",
-            "amount": 12.34
-        }))
-        .unwrap();
-        let err = knock(&bytes).unwrap_err();
-        assert!(matches!(err, KnockError::RawFloat(_)));
+        with_env_var("F64_IMPORT_MODE", Some("reject"), || {
+            let bytes = serde_json::to_vec(&json!({
+                "@type": "ubl/test",
+                "@world": "a/x/t/y",
+                "amount": 12.34
+            }))
+            .unwrap();
+            let err = knock(&bytes).unwrap_err();
+            assert!(matches!(err, KnockError::RawFloat(_)));
+        });
     }
 
     #[test]
     fn knock_rejects_nested_float_unc1() {
+        with_env_var("F64_IMPORT_MODE", Some("reject"), || {
+            let bytes = serde_json::to_vec(&json!({
+                "@type": "ubl/test",
+                "@world": "a/x/t/y",
+                "data": {"price": 9.99}
+            }))
+            .unwrap();
+            let err = knock(&bytes).unwrap_err();
+            assert!(matches!(err, KnockError::RawFloat(_)));
+        });
+    }
+
+    #[test]
+    fn knock_rejects_malformed_num_atom() {
         let bytes = serde_json::to_vec(&json!({
             "@type": "ubl/test",
             "@world": "a/x/t/y",
-            "data": {"price": 9.99}
+            "price": {"@num": "dec/1", "m": "12x", "s": 2}
         }))
         .unwrap();
         let err = knock(&bytes).unwrap_err();
-        assert!(matches!(err, KnockError::RawFloat(_)));
+        assert!(matches!(err, KnockError::MalformedNum(_)));
+    }
+
+    #[test]
+    fn knock_rejects_rat_with_zero_denominator() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "ratio": {"@num": "rat/1", "p": "3", "q": "0"}
+        }))
+        .unwrap();
+        let err = knock(&bytes).unwrap_err();
+        assert!(matches!(err, KnockError::MalformedNum(_)));
+    }
+
+    #[test]
+    fn knock_rejects_num_atom_unknown_fields() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "price": {"@num": "dec/1", "m": "1234", "s": 2, "x": "forbidden"}
+        }))
+        .unwrap();
+        let err = knock(&bytes).unwrap_err();
+        assert!(matches!(err, KnockError::MalformedNum(_)));
+    }
+
+    #[test]
+    fn knock_bnd_import_mode_normalizes_raw_float() {
+        with_env_var("F64_IMPORT_MODE", Some("bnd"), || {
+            let bytes = serde_json::to_vec(&json!({
+                "@type": "ubl/test",
+                "@world": "a/x/t/y",
+                "amount": 12.34
+            }))
+            .unwrap();
+            let parsed = knock(&bytes).unwrap();
+            assert_eq!(parsed["amount"]["@num"], "bnd/1");
+        });
+    }
+
+    #[test]
+    fn knock_require_unc1_numeric_rejects_integer_literals() {
+        with_env_var("REQUIRE_UNC1_NUMERIC", Some("true"), || {
+            let bytes = serde_json::to_vec(&json!({
+                "@type": "ubl/test",
+                "@world": "a/x/t/y",
+                "count": 42
+            }))
+            .unwrap();
+            let err = knock(&bytes).unwrap_err();
+            assert!(matches!(err, KnockError::NumericLiteralNotAllowed(_)));
+        });
     }
 
     #[test]

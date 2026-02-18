@@ -14,6 +14,7 @@ unicode-normalization = "0.1"
 leb128 = "0.2"
 blake3 = "1"
 hex = "0.4"
+ubl_unc1 = { path = "../ubl_unc1" }
 
 [dev-dependencies]
 hex-literal = "0.4"

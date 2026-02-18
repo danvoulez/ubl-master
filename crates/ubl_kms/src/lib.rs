@@ -10,8 +10,13 @@
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+#[cfg(feature = "pq_mldsa3")]
+pub mod pq_mldsa3;
+
 // Re-export key types so downstream crates don't need ed25519_dalek directly
 pub use ed25519_dalek::{SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey};
+#[cfg(feature = "pq_mldsa3")]
+pub use pq_mldsa3::{dual_sign_bytes_with_stub, verify_pq_stub_signature, PqSignatureStub};
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;

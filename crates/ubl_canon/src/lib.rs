@@ -145,6 +145,7 @@ fn verify_signature(vk: &VerifyingKey, message: &[u8], sig: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use proptest::prelude::*;
     use serde_json::json;
 
@@ -229,6 +230,63 @@ mod tests {
 
             prop_assert!(verify_raw_v1(&payload, domains::RECEIPT, &vk, &sig).unwrap());
             prop_assert!(!verify_raw_v1(&payload, domains::RICH_URL, &vk, &sig).unwrap());
+        }
+
+        #[test]
+        fn cid_matches_blake3_of_nrf_bytes(
+            entries in proptest::collection::btree_map("[a-z]{1,8}", -10_000i64..10_000, 1..24)
+        ) {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in entries {
+                obj.insert(k, serde_json::json!(v));
+            }
+            let value = serde_json::Value::Object(obj);
+            let cid = cid_of(&value).unwrap();
+            let nrf = to_nrf_bytes(&value).unwrap();
+            let expected = format!("b3:{}", hex::encode(blake3::hash(&nrf).as_bytes()));
+            prop_assert_eq!(cid, expected);
+        }
+
+        #[test]
+        fn sign_raw_v1_is_deterministic_for_same_input(payload in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let sk = SigningKey::from_bytes(&[41u8; 32]);
+            let sig1 = sign_raw_v1(&payload, domains::RB_VM, &sk);
+            let sig2 = sign_raw_v1(&payload, domains::RB_VM, &sk);
+            prop_assert_eq!(sig1, sig2);
+        }
+
+        #[test]
+        fn sign_raw_v2_is_deterministic_for_same_input(payload in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let sk = SigningKey::from_bytes(&[43u8; 32]);
+            let sig1 = sign_raw_v2_hash_first(&payload, domains::RB_VM, &sk);
+            let sig2 = sign_raw_v2_hash_first(&payload, domains::RB_VM, &sk);
+            prop_assert_eq!(sig1, sig2);
+        }
+
+        #[test]
+        fn cross_mode_verification_fails(payload in proptest::collection::vec(any::<u8>(), 1..128)) {
+            let sk = SigningKey::from_bytes(&[47u8; 32]);
+            let vk = sk.verifying_key();
+            let sig_v1 = sign_raw_v1(&payload, domains::RECEIPT, &sk);
+            let sig_v2 = sign_raw_v2_hash_first(&payload, domains::RECEIPT, &sk);
+
+            prop_assert!(!verify_raw_v2_hash_first(&payload, domains::RECEIPT, &vk, &sig_v1).unwrap());
+            prop_assert!(!verify_raw_v1(&payload, domains::RECEIPT, &vk, &sig_v2).unwrap());
+        }
+
+        #[test]
+        fn signature_bitflip_is_rejected_v1(payload in proptest::collection::vec(any::<u8>(), 1..128)) {
+            let sk = SigningKey::from_bytes(&[53u8; 32]);
+            let vk = sk.verifying_key();
+            let sig = sign_raw_v1(&payload, domains::RICH_URL, &sk);
+            let b64 = sig.strip_prefix("ed25519:").unwrap();
+            let mut sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).unwrap();
+            sig_bytes[0] ^= 0x01;
+            let tampered = format!(
+                "ed25519:{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes)
+            );
+            prop_assert!(!verify_raw_v1(&payload, domains::RICH_URL, &vk, &tampered).unwrap());
         }
     }
 }

@@ -130,10 +130,10 @@
 
 - ✅ `(x)` F3 LLM Observer narration endpoint/productization (`GET /v1/receipts/:cid/narrate` + optional advisory persistence + MCP tool `ubl.narrate`)
 - ✅ `(x)` F5 UNC-1 numeric opcodes in RB-VM (`0x17..0x21` + coverage in `crates/rb_vm/tests/num_opcodes.rs`)
-- ⬜ `( )` F6 UNC-1 strict KNOCK validation path
-- ⬜ `( )` F7 UNC-1 migration flags rollout
-- ⬜ `( )` F10 CAS backends (`Fs`/`S3`) for ChipStore
-- ⬜ `( )` F13 PQ signature stubs (feature-gated)
+- ✅ `(x)` F6 UNC-1 strict KNOCK validation path
+- ✅ `(x)` F7 UNC-1 migration flags rollout (`REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd|reject`, `normalize_numbers_to_unc1`)
+- ✅ `(x)` F10 CAS backends (`Fs`/`S3`) for ChipStore
+- ✅ `(x)` F13 PQ signature stubs (feature-gated via `ubl_kms/pq_mldsa3`)
 
 ---
 

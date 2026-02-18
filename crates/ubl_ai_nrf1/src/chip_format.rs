@@ -6,6 +6,21 @@
 use crate::{to_nrf1_bytes, CompileError};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum F64ImportMode {
+    Reject,
+    Bnd,
+}
+
+impl F64ImportMode {
+    pub fn from_env() -> Self {
+        match std::env::var("F64_IMPORT_MODE") {
+            Ok(v) if v.eq_ignore_ascii_case("bnd") => Self::Bnd,
+            _ => Self::Reject,
+        }
+    }
+}
+
 /// A .chip file in YAML format (Chip-as-Code)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChipFile {
@@ -126,7 +141,16 @@ impl ChipFile {
     /// Compile ChipFile to NRF-1 binary
     pub fn compile(&self) -> Result<CompiledChip, CompileError> {
         // Convert to canonical JSON
-        let canonical_json = self.to_json()?;
+        let mut canonical_json = self.to_json()?;
+
+        normalize_numbers_to_unc1(&mut canonical_json, F64ImportMode::from_env())?;
+
+        let require_unc1 = std::env::var("REQUIRE_UNC1_NUMERIC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if require_unc1 {
+            assert_no_numeric_literals(&canonical_json, "$")?;
+        }
 
         // Convert to NRF-1 bytes
         let nrf1_bytes = to_nrf1_bytes(&canonical_json)?;
@@ -161,6 +185,84 @@ impl ChipFile {
             "ubl/wasm.module" => 0x17,
             _ => 0xFF, // Unknown type
         }
+    }
+}
+
+/// Normalize raw floating-point numbers into UNC-1 `@num` atoms according to migration mode.
+///
+/// `Reject`: returns an error if a raw float is found.
+/// `Bnd`: converts every raw float into `@num: "bnd/1"` via IEEE-754 boundary mapping.
+pub fn normalize_numbers_to_unc1(
+    value: &mut serde_json::Value,
+    mode: F64ImportMode,
+) -> Result<(), CompileError> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                return Ok(());
+            }
+            let raw = n.to_string();
+            match mode {
+                F64ImportMode::Reject => Err(CompileError::InvalidFormat(format!(
+                    "raw float '{}' violates UNC-1; use @num atom",
+                    raw
+                ))),
+                F64ImportMode::Bnd => {
+                    let f = n.as_f64().ok_or_else(|| {
+                        CompileError::InvalidFormat(format!(
+                            "raw float '{}' cannot be represented as f64",
+                            raw
+                        ))
+                    })?;
+                    let bnd = ubl_unc1::from_f64_bits(f.to_bits())
+                        .map_err(|e| CompileError::InvalidFormat(format!("UNC-1 import: {}", e)))?;
+                    *value = serde_json::to_value(&bnd)
+                        .map_err(|e| CompileError::InvalidFormat(format!("UNC-1 encode: {}", e)))?;
+                    Ok(())
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                normalize_numbers_to_unc1(item, mode)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key("@num") {
+                return Ok(());
+            }
+            for item in map.values_mut() {
+                normalize_numbers_to_unc1(item, mode)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn assert_no_numeric_literals(value: &serde_json::Value, path: &str) -> Result<(), CompileError> {
+    match value {
+        serde_json::Value::Number(_) => Err(CompileError::InvalidFormat(format!(
+            "numeric literal not allowed at {} when REQUIRE_UNC1_NUMERIC=true",
+            path
+        ))),
+        serde_json::Value::Array(arr) => {
+            for (idx, item) in arr.iter().enumerate() {
+                assert_no_numeric_literals(item, &format!("{}[{}]", path, idx))?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key("@num") {
+                return Ok(());
+            }
+            for (k, item) in map {
+                assert_no_numeric_literals(item, &format!("{}.{}", path, k))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -232,5 +334,19 @@ policy:
         assert_eq!(compiled.nrf1_bytes[0], 0xF2); // Magic
         assert_eq!(compiled.nrf1_bytes[1], 0x01); // Version
         assert_eq!(compiled.nrf1_bytes[2], 0x10); // User type code
+    }
+
+    #[test]
+    fn normalize_numbers_reject_mode_blocks_raw_float() {
+        let mut v = serde_json::json!({"amount": 12.34});
+        let err = normalize_numbers_to_unc1(&mut v, F64ImportMode::Reject).unwrap_err();
+        assert!(err.to_string().contains("raw float"));
+    }
+
+    #[test]
+    fn normalize_numbers_bnd_mode_converts_raw_float() {
+        let mut v = serde_json::json!({"amount": 12.34});
+        normalize_numbers_to_unc1(&mut v, F64ImportMode::Bnd).unwrap();
+        assert_eq!(v["amount"]["@num"], "bnd/1");
     }
 }

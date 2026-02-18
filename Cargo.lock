@@ -3086,6 +3086,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 1.0.69",
+ "ubl_unc1",
  "unicode-normalization",
 ]
 
@@ -3262,6 +3263,7 @@ dependencies = [
  "ubl_kms",
  "ubl_receipt",
  "ubl_types",
+ "ubl_unc1",
  "wasmtime",
  "wat",
 ]

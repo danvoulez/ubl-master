@@ -17,3 +17,7 @@ bs58 = "0.5"
 
 [dev-dependencies]
 serde_json = "1"
+
+[features]
+default = []
+pq_mldsa3 = []

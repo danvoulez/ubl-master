@@ -1390,5 +1390,73 @@ mod tests {
             let result = mul(&left, &zero).unwrap();
             prop_assert_eq!(result, zero);
         }
+
+        #[test]
+        fn compare_is_reflexive_for_ints(a in any::<i64>()) {
+            let v = Num::Int { v: a.to_string(), u: None };
+            prop_assert_eq!(
+                compare(&v, &v).unwrap(),
+                Num::Int { v: "0".to_string(), u: None }
+            );
+        }
+
+        #[test]
+        fn compare_is_antisymmetric_for_ints(a in any::<i64>(), b in any::<i64>()) {
+            let left = Num::Int { v: a.to_string(), u: None };
+            let right = Num::Int { v: b.to_string(), u: None };
+            let ab = compare(&left, &right).unwrap();
+            let ba = compare(&right, &left).unwrap();
+
+            let ab_i = if let Num::Int { v, .. } = ab { v.parse::<i32>().unwrap() } else { unreachable!() };
+            let ba_i = if let Num::Int { v, .. } = ba { v.parse::<i32>().unwrap() } else { unreachable!() };
+            prop_assert_eq!(ab_i, -ba_i);
+        }
+
+        #[test]
+        fn to_dec_is_idempotent_for_ints(
+            a in any::<i64>(),
+            scale in 0u32..12u32,
+            rm in 0u8..6u8
+        ) {
+            let mode = RoundingMode::from_u8(rm).unwrap();
+            let n = Num::Int { v: a.to_string(), u: None };
+            let dec1 = to_dec(&n, scale, mode).unwrap();
+            let dec2 = to_dec(&dec1, scale, mode).unwrap();
+            prop_assert_eq!(dec1, dec2);
+        }
+
+        #[test]
+        fn to_rat_respects_denominator_limit_for_dec(
+            m in -1_000_000i64..1_000_000i64,
+            s in 0u32..9u32,
+            limit_den in 1u64..1_000u64
+        ) {
+            let dec = Num::Dec { m: m.to_string(), s, u: None };
+            let rat = to_rat(&dec, limit_den).unwrap();
+            match rat {
+                Num::Rat { q, .. } => {
+                    let q_u = q.parse::<u64>().unwrap();
+                    prop_assert!(q_u <= limit_den);
+                    prop_assert!(q_u >= 1);
+                }
+                _ => panic!("to_rat must return RAT"),
+            }
+        }
+
+        #[test]
+        fn from_f64_bits_interval_contains_exact_value(x in -1.0e12f64..1.0e12f64) {
+            let bits = x.to_bits();
+            let n = from_f64_bits(bits).unwrap();
+            match n {
+                Num::Bnd { lo, hi, .. } => {
+                    let lo_r = to_rational(&lo).unwrap();
+                    let hi_r = to_rational(&hi).unwrap();
+                    let exact = exact_f64_rational(x);
+                    prop_assert!(lo_r <= exact);
+                    prop_assert!(exact <= hi_r);
+                }
+                _ => panic!("from_f64_bits must return BND"),
+            }
+        }
     }
 }

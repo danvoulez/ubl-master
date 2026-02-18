@@ -147,20 +147,20 @@ This section is additive and does not remove any existing items above. It is the
 
 ---
 
-## Open — Next Features (7 remaining)
+## Open — Next Features
 
 | # | Task | Priority | Notes |
 |---|---|---|---|
 | F1 | **PS3 — Runtime certification** | ✅ Done | `RuntimeInfo` extended with `runtime_hash` + `certs`, signed `SelfAttestation` (`ubl_runtime::runtime_cert`) verifies against DID key, runtime metadata attached to receipts, and gate endpoint `GET /v1/runtime/attestation` exposed in OpenAPI. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
 | F2 | **PS4 — Structured tracing** | Medium | Replace `eprintln!` with `tracing` crate. Structured spans per pipeline stage. Metrics: chips/sec, fuel/chip, deny rate, p99 latency. |
 | F3 | **PS5 — LLM Observer narration** | ✅ Done | Added deterministic on-demand narration endpoint `GET /v1/receipts/:cid/narrate` (optional `persist=true` stores `ubl/advisory` with hook `on_demand`) and MCP tool `ubl.narrate`. |
-| F4 | **Property-based testing** | Low | Add proptest for canon edge cases (Unicode, ordering, decimal, null-stripping). |
-| F5 | **UNC-1 numeric opcodes** | Medium | `num.add`, `num.mul`, `num.to_dec`, `num.from_f64_bits`, `num.compare`, etc. for rb_vm. Depends on H9 (UNC-1 core ops). Byte assignments 0x17+ available. See `docs/vm/OPCODES_NUM.md`. |
-| F6 | **UNC-1 KNOCK validation** | Medium | Reject raw `float`, `NaN/Inf`, malformed `@num` objects at KNOCK stage. Add `normalize_numbers_to_unc1(json)` step in `chip_format.rs` before `to_nrf1_bytes`. |
-| F7 | **UNC-1 migration flags** | Low | Gate flags `REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd\|reject`. Compat phase first, then enforce. See `docs/migration/UNC1_MIGRATION.md`. |
+| F4 | **Property-based testing** | Low | Started: proptest expansion in `ubl_canon` + `ubl_unc1` (CID/sign invariants, cross-mode/domain checks, numeric compare/rounding/denominator/IEEE-754 interval containment). Continue with `ubl_ai_nrf1` canon edge generators (Unicode/null-stripping/order) in next slice. |
+| F5 | **UNC-1 numeric opcodes** | ✅ Done | Implemented in `rb_vm` (`0x17..0x21`) with coverage in `crates/rb_vm/tests/num_opcodes.rs`. |
+| F6 | **UNC-1 KNOCK validation** | ✅ Done | KNOCK now validates strict `@num` atoms, rejects malformed numeric atoms (`KNOCK-009`), and preserves raw-float rejection path (`KNOCK-008`). |
+| F7 | **UNC-1 migration flags** | ✅ Done | Added rollout flags `REQUIRE_UNC1_NUMERIC` and `F64_IMPORT_MODE=bnd|reject`; added `normalize_numbers_to_unc1(...)` in `ubl_ai_nrf1::chip_format` compile flow. |
 | F9 | **Key rotation as chip** | ✅ Done | `ubl/key.rotate` implemented with typed payload validation, mandatory `key:rotate` capability check, deterministic Ed25519 material derivation during TR, and persisted `ubl/key.map` old→new mapping in ChipStore. Includes replay-safe flow tests. |
-| F10 | **CAS backends for ChipStore** | Low | Add `CasBackend` trait with `Fs(PathBuf)` and `S3 { bucket, prefix }` variants alongside existing in-memory + sled. Pattern from `ubl-ultimate-main/services/registry-api/src/cas.rs`. |
-| F13 | **Post-quantum signature stubs** | Low | Feature-gated `pq_mldsa3` module for ML-DSA3 (Dilithium3) dual-signing alongside Ed25519. Stub now, real when NIST PQC libraries stabilize. |
+| F10 | **CAS backends for ChipStore** | ✅ Done | Added `FsBackend` and `S3Backend` (S3-compatible local emulation) with roundtrip tests and no regression on existing backends. |
+| F13 | **Post-quantum signature stubs** | ✅ Done | Added feature-gated `ubl_kms::pq_mldsa3` stub module (`--features pq_mldsa3`) with dual-sign API shape and tests. |
 
 ---
 

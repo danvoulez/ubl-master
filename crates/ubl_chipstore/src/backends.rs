@@ -4,6 +4,7 @@ use crate::{ChipQuery, ChipStoreBackend, ChipStoreError, QueryResult, StoredChip
 use async_trait::async_trait;
 use serde_json;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use ubl_types::Cid as TypedCid;
@@ -131,6 +132,221 @@ impl InMemoryBackend {
 impl Default for InMemoryBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Filesystem backend (JSON per chip CID).
+///
+/// Storage layout:
+/// - `{root}/chips/{cid_sanitized}.json`
+pub struct FsBackend {
+    root: PathBuf,
+}
+
+impl FsBackend {
+    pub fn new<P: AsRef<Path>>(root: P) -> Result<Self, ChipStoreError> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(root.join("chips"))
+            .map_err(|e| ChipStoreError::Backend(format!("FsBackend init: {}", e)))?;
+        Ok(Self { root })
+    }
+
+    fn chips_dir(&self) -> PathBuf {
+        self.root.join("chips")
+    }
+
+    fn chip_path(&self, cid: &str) -> PathBuf {
+        self.chips_dir().join(format!("{}.json", sanitize_cid(cid)))
+    }
+
+    fn load_chip_by_cid(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
+        let path = self.chip_path(cid);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ChipStoreError::Backend(format!("FsBackend read: {}", e)))?;
+        let chip: StoredChip = serde_json::from_slice(&bytes)
+            .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        Ok(Some(chip))
+    }
+
+    fn iter_all_chips(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        let mut chips = Vec::new();
+        let entries = std::fs::read_dir(self.chips_dir())
+            .map_err(|e| ChipStoreError::Backend(format!("FsBackend read_dir: {}", e)))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| ChipStoreError::Backend(format!("FsBackend dir entry: {}", e)))?;
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| ChipStoreError::Backend(format!("FsBackend read: {}", e)))?;
+            let chip: StoredChip = serde_json::from_slice(&bytes)
+                .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+            chips.push(chip);
+        }
+        Ok(chips)
+    }
+}
+
+#[async_trait]
+impl ChipStoreBackend for FsBackend {
+    async fn put_chip(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
+        let serialized =
+            serde_json::to_vec(chip).map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+        let path = self.chip_path(chip.cid.as_str());
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serialized)
+            .map_err(|e| ChipStoreError::Backend(format!("FsBackend write tmp: {}", e)))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| ChipStoreError::Backend(format!("FsBackend rename: {}", e)))?;
+        Ok(())
+    }
+
+    async fn get_chip(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
+        self.load_chip_by_cid(cid)
+    }
+
+    async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
+        for chip in self.iter_all_chips()? {
+            if chip.receipt_cid.as_str() == receipt_cid {
+                return Ok(Some(chip));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
+        Ok(self.chip_path(cid).exists())
+    }
+
+    async fn query_chips(&self, query: &ChipQuery) -> Result<QueryResult, ChipStoreError> {
+        let mut chips: Vec<StoredChip> = self
+            .iter_all_chips()?
+            .into_iter()
+            .filter(|chip| matches_query(chip, query))
+            .collect();
+        Ok(apply_pagination(&mut chips, query))
+    }
+
+    async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        let mut chips: Vec<StoredChip> = self
+            .iter_all_chips()?
+            .into_iter()
+            .filter(|chip| chip.chip_type == chip_type)
+            .collect();
+        chips.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(chips)
+    }
+
+    async fn get_related_chips(&self, cid: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        if let Some(chip) = self.load_chip_by_cid(cid)? {
+            let mut out = Vec::new();
+            for related in chip.related_chips {
+                if let Some(found) = self.load_chip_by_cid(&related)? {
+                    out.push(found);
+                }
+            }
+            Ok(out)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError> {
+        let path = self.chip_path(cid);
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|e| ChipStoreError::Backend(format!("FsBackend delete: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        // FS backend does full scans; no persisted secondary indexes to rebuild.
+        Ok(())
+    }
+}
+
+/// S3-compatible backend (local emulation for now).
+///
+/// Uses the same semantics as object storage with `bucket/prefix`, backed by `FsBackend`.
+pub struct S3Backend {
+    bucket: String,
+    prefix: String,
+    fs: FsBackend,
+}
+
+impl S3Backend {
+    pub fn new(bucket: &str, prefix: &str) -> Result<Self, ChipStoreError> {
+        let local_root = std::env::var("UBL_CHIPSTORE_S3_LOCAL_ROOT")
+            .unwrap_or_else(|_| "./data/chipstore-s3".to_string());
+        let fs = FsBackend::new(
+            PathBuf::from(local_root)
+                .join(sanitize_component(bucket))
+                .join(sanitize_component(prefix)),
+        )?;
+        Ok(Self {
+            bucket: bucket.to_string(),
+            prefix: prefix.to_string(),
+            fs,
+        })
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+}
+
+#[async_trait]
+impl ChipStoreBackend for S3Backend {
+    async fn put_chip(&self, chip: &StoredChip) -> Result<(), ChipStoreError> {
+        self.fs.put_chip(chip).await
+    }
+
+    async fn get_chip(&self, cid: &str) -> Result<Option<StoredChip>, ChipStoreError> {
+        self.fs.get_chip(cid).await
+    }
+
+    async fn get_chip_by_receipt_cid(
+        &self,
+        receipt_cid: &str,
+    ) -> Result<Option<StoredChip>, ChipStoreError> {
+        self.fs.get_chip_by_receipt_cid(receipt_cid).await
+    }
+
+    async fn exists(&self, cid: &str) -> Result<bool, ChipStoreError> {
+        self.fs.exists(cid).await
+    }
+
+    async fn query_chips(&self, query: &ChipQuery) -> Result<QueryResult, ChipStoreError> {
+        self.fs.query_chips(query).await
+    }
+
+    async fn get_chips_by_type(&self, chip_type: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.fs.get_chips_by_type(chip_type).await
+    }
+
+    async fn get_related_chips(&self, cid: &str) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.fs.get_related_chips(cid).await
+    }
+
+    async fn delete_chip(&self, cid: &str) -> Result<(), ChipStoreError> {
+        self.fs.delete_chip(cid).await
+    }
+
+    async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
+        self.fs.rebuild_indexes().await
     }
 }
 
@@ -670,13 +886,37 @@ fn index_composite_key(key: &str, cid: &str) -> Vec<u8> {
     out
 }
 
+fn sanitize_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sanitize_cid(cid: &str) -> String {
+    cid.replace(':', "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ChipStore, ExecutionMetadata};
     use serde_json::json;
     use std::sync::Arc;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
     use ubl_types::Did as TypedDid;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn test_metadata() -> ExecutionMetadata {
         ExecutionMetadata {
@@ -761,5 +1001,91 @@ mod tests {
         assert_eq!(recovered.total_count, 1);
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn fs_backend_roundtrip() {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("ubl_chipstore_fs_{}_{}", std::process::id(), nonce));
+        let backend = Arc::new(FsBackend::new(&path).expect("fs backend"));
+        let store = ChipStore::new(backend);
+
+        let receipt_cid = "b3:1111111111111111111111111111111111111111111111111111111111111111";
+        let cid = store
+            .store_executed_chip(
+                json!({
+                    "@type": "ubl/document",
+                    "@id": "fs-1",
+                    "@ver": "1.0",
+                    "@world": "a/fs/t/prod",
+                    "status": "ok"
+                }),
+                receipt_cid.to_string(),
+                test_metadata(),
+            )
+            .await
+            .expect("store");
+
+        let by_cid = store.get_chip(&cid).await.expect("get by cid");
+        assert!(by_cid.is_some());
+        let by_receipt = store
+            .get_chip_by_receipt_cid(receipt_cid)
+            .await
+            .expect("get by receipt");
+        assert!(by_receipt.is_some());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn s3_backend_local_emulation_roundtrip() {
+        let _guard = env_lock().lock().await;
+        let mut root = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        root.push(format!(
+            "ubl_chipstore_s3_local_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::env::set_var("UBL_CHIPSTORE_S3_LOCAL_ROOT", &root);
+
+        let bucket = format!("bucket-{}", nonce);
+        let prefix = "tenant/prod";
+        let backend = Arc::new(S3Backend::new(&bucket, prefix).expect("s3 backend"));
+        assert_eq!(backend.bucket(), bucket);
+        assert_eq!(backend.prefix(), prefix);
+        let store = ChipStore::new(backend);
+
+        let receipt_cid = "b3:2222222222222222222222222222222222222222222222222222222222222222";
+        let cid = store
+            .store_executed_chip(
+                json!({
+                    "@type": "ubl/advisory",
+                    "@id": "s3-1",
+                    "@ver": "1.0",
+                    "@world": "a/s3/t/prod",
+                    "status": "ok"
+                }),
+                receipt_cid.to_string(),
+                test_metadata(),
+            )
+            .await
+            .expect("store");
+        assert!(store.exists(&cid).await.expect("exists"));
+        assert!(store
+            .get_chip_by_receipt_cid(receipt_cid)
+            .await
+            .expect("lookup")
+            .is_some());
+
+        std::env::remove_var("UBL_CHIPSTORE_S3_LOCAL_ROOT");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
