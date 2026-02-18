@@ -128,16 +128,16 @@ This section is additive and does not remove any existing items above. It is the
 | H4 (P0→P1 rollout automation) | M5 | Required for controlled production transition. |
 | H6 (Parse, Don't Validate) | M2 | Move critical chip flow to typed parsing first. |
 | F1 (Runtime certification) | M4 | Core deliverable for "Certified Runtime." |
-| F2 (Structured tracing) | M4 | Required for operability gate G4. |
+| F2 (Structured tracing) | M4 | ✅ Completed; supports operability gate G4. |
 | F4 (Property testing) | M2 | Supports determinism/confidence proof. |
-| F5/F6/F7 (UNC-1 runtime/migration) | M2 → M4 | Keep behind migration flags until deterministic baseline is locked. |
+| F5/F6/F7 (UNC-1 runtime/migration) | M2 → M4 | ✅ Completed with strict KNOCK path + migration flags rollout. |
 | F9 (Key rotation as chip) | M4 | Complements N2 secret lifecycle. |
-| F10 (CAS backends) | Post-M5 | Keep after "Achieved" unless production workload demands earlier. |
-| F13 (PQ signature stubs) | Post-M5 | Keep feature-gated and non-blocking for initial achievement gate. |
+| F10 (CAS backends) | Post-M5 | ✅ Completed (`FsBackend` + `S3Backend` emulation path). |
+| F13 (PQ signature stubs) | Post-M5 | ✅ Completed (feature-gated `pq_mldsa3` stubs). |
 
 ---
 
-## Open — Hardening the Base (2 remaining)
+## Open — Hardening the Base (1 remaining)
 
 | # | Task | Location | Notes |
 |---|---|---|---|
@@ -152,7 +152,7 @@ This section is additive and does not remove any existing items above. It is the
 | # | Task | Priority | Notes |
 |---|---|---|---|
 | F1 | **PS3 — Runtime certification** | ✅ Done | `RuntimeInfo` extended with `runtime_hash` + `certs`, signed `SelfAttestation` (`ubl_runtime::runtime_cert`) verifies against DID key, runtime metadata attached to receipts, and gate endpoint `GET /v1/runtime/attestation` exposed in OpenAPI. Future: `runtime-llm`, `runtime-wasm`, `runtime-tee` modules. |
-| F2 | **PS4 — Structured tracing** | Medium | Replace `eprintln!` with `tracing` crate. Structured spans per pipeline stage. Metrics: chips/sec, fuel/chip, deny rate, p99 latency. |
+| F2 | **PS4 — Structured tracing** | ✅ Done | Runtime and gate migrated to `tracing` with per-stage structured spans and operational logging path for SLO/incident workflows. |
 | F3 | **PS5 — LLM Observer narration** | ✅ Done | Added deterministic on-demand narration endpoint `GET /v1/receipts/:cid/narrate` (optional `persist=true` stores `ubl/advisory` with hook `on_demand`) and MCP tool `ubl.narrate`. |
 | F4 | **Property-based testing** | Low | Started: proptest expansion in `ubl_canon` + `ubl_unc1` (CID/sign invariants, cross-mode/domain checks, numeric compare/rounding/denominator/IEEE-754 interval containment). Continue with `ubl_ai_nrf1` canon edge generators (Unicode/null-stripping/order) in next slice. |
 | F5 | **UNC-1 numeric opcodes** | ✅ Done | Implemented in `rb_vm` (`0x17..0x21`) with coverage in `crates/rb_vm/tests/num_opcodes.rs`. |

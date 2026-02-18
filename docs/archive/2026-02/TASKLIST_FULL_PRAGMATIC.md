@@ -129,6 +129,7 @@
 ## 4) Open Feature Backlog (After Critical Path or In Parallel If Cheap)
 
 - ✅ `(x)` F3 LLM Observer narration endpoint/productization (`GET /v1/receipts/:cid/narrate` + optional advisory persistence + MCP tool `ubl.narrate`)
+- 🟨 `( )` F4 property testing expansion (canon + numeric edge cases) — proptest expansion started in `ubl_canon` + `ubl_unc1`; next slice is `ubl_ai_nrf1` canon edge generators
 - ✅ `(x)` F5 UNC-1 numeric opcodes in RB-VM (`0x17..0x21` + coverage in `crates/rb_vm/tests/num_opcodes.rs`)
 - ✅ `(x)` F6 UNC-1 strict KNOCK validation path
 - ✅ `(x)` F7 UNC-1 migration flags rollout (`REQUIRE_UNC1_NUMERIC`, `F64_IMPORT_MODE=bnd|reject`, `normalize_numbers_to_unc1`)
