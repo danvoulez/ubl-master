@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/vcx_pack",
+  "tools/vcx_pack_cli",
+  "vendor/ubl_ai_nrf1",
+]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+blake3 = "1"
+hex = "0.4"
+leb128 = "0.2"
+unicode-normalization = "0.1"
+base64 = "0.22"

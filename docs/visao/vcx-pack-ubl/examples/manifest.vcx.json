@@ -1,0 +1,58 @@
+{
+  "@type": "vcx/manifest",
+  "@id": "m:demo",
+  "@ver": "1.0",
+  "@world": "a/demo/t/prod",
+  "timebase": {
+    "@num": "rat/1",
+    "p": "1",
+    "q": "90000"
+  },
+  "duration_ticks": {
+    "@num": "int/1",
+    "v": "180000"
+  },
+  "video": {
+    "codec": "VCX-IC0",
+    "fps": {
+      "@num": "rat/1",
+      "p": "30000",
+      "q": "1001"
+    },
+    "width": {
+      "@num": "int/1",
+      "v": "1280"
+    },
+    "height": {
+      "@num": "int/1",
+      "v": "720"
+    },
+    "chroma": "420",
+    "bitdepth": {
+      "@num": "int/1",
+      "v": "8"
+    },
+    "matrix": "bt709"
+  },
+  "gots": [
+    {
+      "start_tick": {
+        "@num": "int/1",
+        "v": "0"
+      },
+      "dur_ticks": {
+        "@num": "int/1",
+        "v": "180000"
+      },
+      "tiles": [
+        {
+          "cid": "b3:PLACEHOLDER",
+          "mime": "application/vcx-ic0t",
+          "role": "base"
+        }
+      ]
+    }
+  ],
+  "features": [],
+  "semantics": []
+}
