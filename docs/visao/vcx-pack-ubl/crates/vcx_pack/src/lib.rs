@@ -1,4 +1,3 @@
-
 use anyhow::{bail, Context, Result};
 use blake3::Hash;
 use serde_json::Value;
@@ -7,6 +6,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use ubl_ai_nrf1::nrf::{encode_to_vec, json_to_nrf, NrfValue};
+
+pub mod realtime_predictability;
+pub mod streaming_protocol;
 
 pub const PACK_MAGIC: &[u8; 4] = b"VCX1";
 pub const MERKLE_MAGIC: &[u8; 4] = b"VMRK";
@@ -38,7 +40,6 @@ pub struct PackHeader {
 impl PackHeader {
     pub const LEN: u64 = 96;
 
-    
     pub fn write_to<W: Write>(&self, mut w: W) -> Result<()> {
         w.write_all(PACK_MAGIC)?;
         w.write_all(&self.version.to_le_bytes())?;
@@ -151,10 +152,10 @@ impl MimeTag {
 /// Index header + entries are binary and deterministic.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
-    pub cid: [u8; 32],         // BLAKE3 hash bytes
+    pub cid: [u8; 32], // BLAKE3 hash bytes
     pub mime_tag: MimeTag,
     pub flags: u16,
-    pub payload_off: u64,      // absolute file offset
+    pub payload_off: u64, // absolute file offset
     pub payload_len: u64,
     pub payload_hash: [u8; 32], // BLAKE3(payload_raw)
 }
@@ -320,7 +321,11 @@ pub fn cid_for_json_value(value: &Value) -> Result<([u8; 32], String, Vec<u8>)> 
     let nrf = json_to_nrf(value)?;
     let nrf_bytes = encode_to_vec(&nrf)?;
     let h = blake3::hash(&nrf_bytes);
-    Ok((h.as_bytes().clone(), format!("b3:{}", hex::encode(h.as_bytes())), nrf_bytes))
+    Ok((
+        h.as_bytes().clone(),
+        format!("b3:{}", hex::encode(h.as_bytes())),
+        nrf_bytes,
+    ))
 }
 
 /// Compute payload CID bytes: cid = BLAKE3(NRF-1.1(Bytes(payload_raw))).
@@ -328,7 +333,10 @@ pub fn cid_for_payload_bytes(payload_raw: &[u8]) -> Result<([u8; 32], String)> {
     let nrf = NrfValue::Bytes(payload_raw.to_vec());
     let nrf_bytes = encode_to_vec(&nrf)?;
     let h = blake3::hash(&nrf_bytes);
-    Ok((h.as_bytes().clone(), format!("b3:{}", hex::encode(h.as_bytes()))))
+    Ok((
+        h.as_bytes().clone(),
+        format!("b3:{}", hex::encode(h.as_bytes())),
+    ))
 }
 
 /// Strict UNC-1 mode: reject any JSON numbers anywhere in the manifest.
@@ -375,9 +383,7 @@ pub fn validate_no_json_numbers(value: &Value) -> Result<()> {
 /// Ensure the manifest is a UBL chip (envelope anchors present), because VCX-PACK is meant
 /// to plug directly into the UBL pipeline/registry.
 pub fn validate_ubl_manifest_envelope(manifest_json: &Value) -> Result<()> {
-    let obj = manifest_json
-        .as_object()
-        .context("ManifestMustBeObject")?;
+    let obj = manifest_json.as_object().context("ManifestMustBeObject")?;
     if !obj.contains_key("@type") {
         bail!("ManifestMissingAnchor(@type)");
     }
@@ -393,7 +399,6 @@ pub fn validate_ubl_manifest_envelope(manifest_json: &Value) -> Result<()> {
     Ok(())
 }
 
-
 /// Build a pack in-memory and write to the provided writer.
 pub fn build_pack<W: Write + Seek>(
     mut w: W,
@@ -407,7 +412,8 @@ pub fn build_pack<W: Write + Seek>(
     }
 
     // Manifest bytes (NRF-1.1)
-    let (_manifest_cid_bytes, _manifest_cid_str, manifest_bytes) = cid_for_json_value(manifest_json)?;
+    let (_manifest_cid_bytes, _manifest_cid_str, manifest_bytes) =
+        cid_for_json_value(manifest_json)?;
 
     // Prepare entries (compute CIDs and raw payload hashes)
     let mut entries: Vec<(IndexEntry, Vec<u8>)> = Vec::with_capacity(payloads.len());
@@ -476,7 +482,13 @@ pub fn build_pack<W: Write + Seek>(
     // payload leaves
     for (i, (e, _)) in entries.iter().enumerate() {
         let leaf_i = 2 + i as u32;
-        leaves.push(hash_leaf(leaf_i, 2, &e.payload_hash, e.payload_len, Some(&e.cid)));
+        leaves.push(hash_leaf(
+            leaf_i,
+            2,
+            &e.payload_hash,
+            e.payload_len,
+            Some(&e.cid),
+        ));
     }
 
     let levels = build_merkle_levels(&leaves);
@@ -553,7 +565,13 @@ pub fn build_pack<W: Write + Seek>(
     Ok(header)
 }
 
-fn hash_leaf(i: u32, kind: u8, content_hash: &[u8; 32], content_len: u64, cid: Option<&[u8; 32]>) -> [u8; 32] {
+fn hash_leaf(
+    i: u32,
+    kind: u8,
+    content_hash: &[u8; 32],
+    content_len: u64,
+    cid: Option<&[u8; 32]>,
+) -> [u8; 32] {
     // kind: 0=manifest, 1=index, 2=payload
     let mut input = Vec::with_capacity(4 + 1 + 32 + 8 + 32);
     input.extend_from_slice(b"vcx-leaf/v1\0");
@@ -584,7 +602,11 @@ fn build_merkle_levels(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
         let mut i = 0usize;
         while i < prev.len() {
             let left = prev[i];
-            let right = if i + 1 < prev.len() { prev[i + 1] } else { prev[i] };
+            let right = if i + 1 < prev.len() {
+                prev[i + 1]
+            } else {
+                prev[i]
+            };
             next.push(hash_node(&left, &right));
             i += 2;
         }
@@ -623,7 +645,10 @@ pub fn read_and_verify_pack<R: Read + Seek>(mut r: R, full: bool) -> Result<Pack
     r.read_exact(&mut index_bytes)?;
     let (entries, parsed_index_bytes_len) = parse_index(&index_bytes)?;
     // ensure any trailing bytes after parsed_index_bytes_len are zero (padding)
-    if index_bytes[parsed_index_bytes_len..].iter().any(|b| *b != 0) {
+    if index_bytes[parsed_index_bytes_len..]
+        .iter()
+        .any(|b| *b != 0)
+    {
         bail!("NonZeroPaddingInIndex");
     }
 
@@ -661,7 +686,13 @@ pub fn read_and_verify_pack<R: Read + Seek>(mut r: R, full: bool) -> Result<Pack
     leaves.push(hash_leaf(1, 1, &index_hash, header.index_len, None));
     for (i, e) in entries.iter().enumerate() {
         let leaf_i = 2 + i as u32;
-        leaves.push(hash_leaf(leaf_i, 2, &e.payload_hash, e.payload_len, Some(&e.cid)));
+        leaves.push(hash_leaf(
+            leaf_i,
+            2,
+            &e.payload_hash,
+            e.payload_len,
+            Some(&e.cid),
+        ));
     }
     let levels = build_merkle_levels(&leaves);
     let root = *levels.last().unwrap().first().unwrap();

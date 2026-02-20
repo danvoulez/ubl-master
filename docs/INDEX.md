@@ -22,6 +22,7 @@ This is the entry point for all project documentation.
 | Bootstrap/rollout policy flow | `ROLLOUT_P0_TO_P1.md` | Ops + Security | Active |
 | Vision and strategic horizons | `docs/visao/MANIFESTO_DA_REINVENCAO.md` | Core Runtime | Active |
 | Media protocol vision (VCX) | `docs/visao/VCX-Core.md` | Core Runtime | Active |
+| Media streaming/editing protocol (VSEP-1) | `docs/visao/VCX-Streaming-Editing-Protocol-v1.md` | Core Runtime | Active |
 | API contract | `/openapi.json` + `crates/ubl_runtime/src/manifest.rs` | Gate | Active |
 | Environment/config flags | `docs/reference/README.md` + runtime/gate env reads in code | Runtime + Gate | Active |
 | Error taxonomy | `crates/ubl_runtime/src/error_response.rs` | Runtime | Active |
