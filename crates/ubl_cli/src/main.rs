@@ -80,6 +80,46 @@ enum Commands {
         #[arg(long)]
         hex: bool,
     },
+    /// Silicon chip compiler and disassembler
+    Silicon {
+        #[command(subcommand)]
+        command: SiliconCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SiliconCommands {
+    /// Compile a silicon chip JSON to rb_vm TLV bytecode.
+    ///
+    /// Reads a self-contained silicon chip bundle (a JSON file with embedded
+    /// bit/circuit/chip definitions) and outputs:
+    ///   - the chip CID (content address of the chip body)
+    ///   - the bytecode CID (content address of the compiled TLV bytes)
+    ///   - the hex-encoded TLV bytecode
+    ///
+    /// Bundle format (single JSON file):
+    ///   {
+    ///     "chip":    { <ubl/silicon.chip body> },
+    ///     "circuits": [ { "cid": "b3:...", "body": { <ubl/silicon.circuit body> } }, ... ],
+    ///     "bits":    [ { "cid": "b3:...", "body": { <ubl/silicon.bit body> } }, ... ]
+    ///   }
+    Compile {
+        /// Path to silicon bundle JSON file
+        bundle: String,
+        /// Print only the bytecode hex (machine-readable, no labels)
+        #[arg(long)]
+        hex_only: bool,
+    },
+    /// Disassemble silicon-compiled rb_vm TLV bytecode to human-readable listing.
+    ///
+    /// Accepts either a hex string or a binary bytecode file.
+    Disasm {
+        /// Hex string of bytecode, or path to a binary bytecode file
+        input: String,
+        /// Treat input as a binary file path (default: treat as hex string)
+        #[arg(long)]
+        file: bool,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +143,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Fixture { output_dir, count } => cmd_fixture(&output_dir, count)?,
         Commands::Url { receipt_cid, host } => cmd_url(&receipt_cid, &host)?,
         Commands::Disasm { input, hex } => cmd_disasm(&input, hex)?,
+        Commands::Silicon { command } => match command {
+            SiliconCommands::Compile { bundle, hex_only } => {
+                cmd_silicon_compile(&bundle, hex_only).await?
+            }
+            SiliconCommands::Disasm { input, file } => cmd_silicon_disasm(&input, file)?,
+        },
     }
 
     Ok(())
@@ -405,6 +451,225 @@ fn cmd_disasm(input: &str, is_hex: bool) -> Result<(), Box<dyn std::error::Error
     };
 
     println!("=== RB-VM Disassembly ({} bytes) ===\n", bytecode.len());
+    match rb_vm::disassemble(&bytecode) {
+        Ok(listing) => print!("{}", listing),
+        Err(e) => eprintln!("Disassembly error: {}", e),
+    }
+    Ok(())
+}
+
+// ── silicon compile ─────────────────────────────────────────────
+//
+// Bundle format (self-contained JSON):
+// {
+//   "chip":     { <ubl/silicon.chip body> },
+//   "circuits": [ { "cid": "b3:...", "body": { <ubl/silicon.circuit body> } }, ... ],
+//   "bits":     [ { "cid": "b3:...", "body": { <ubl/silicon.bit body> } }, ... ]
+// }
+//
+// The circuit body's "bits" array and the chip body's "circuits" array use the
+// bundle CIDs ("b3:...") as symbolic references.  The command:
+//   1. Stores all bits → records bundle_cid → stored_cid mapping.
+//   2. Rewrites each circuit's "bits" array with stored CIDs, stores circuits.
+//   3. Rewrites the chip's "circuits" array with stored CIDs, stores chip.
+//   4. Resolves the chip graph and compiles to rb_vm TLV bytecode.
+//   5. Prints chip CID, bytecode CID, hex bytecode, and disassembly.
+
+async fn cmd_silicon_compile(
+    bundle_path: &str,
+    hex_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use ubl_chipstore::{ChipStore, ExecutionMetadata, InMemoryBackend};
+    use ubl_runtime::silicon_chip::{
+        compile_chip_to_rb_vm, parse_silicon, resolve_chip_graph, SiliconRequest,
+        TYPE_SILICON_BIT, TYPE_SILICON_CHIP, TYPE_SILICON_CIRCUIT,
+    };
+    use ubl_types::Did as TypedDid;
+
+    // ── parse bundle ────────────────────────────────────────────
+    let bundle_str = std::fs::read_to_string(bundle_path)?;
+    let bundle: Value = serde_json::from_str(&bundle_str)?;
+
+    let chip_body = bundle
+        .get("chip")
+        .ok_or("bundle missing 'chip' field")?
+        .clone();
+    let circuits_arr = bundle
+        .get("circuits")
+        .and_then(|v| v.as_array())
+        .ok_or("bundle missing 'circuits' array")?
+        .clone();
+    let bits_arr = bundle
+        .get("bits")
+        .and_then(|v| v.as_array())
+        .ok_or("bundle missing 'bits' array")?
+        .clone();
+
+    // ── in-memory store + shared metadata ───────────────────────
+    let backend = Arc::new(InMemoryBackend::new());
+    let store = ChipStore::new(backend);
+    let meta = ExecutionMetadata {
+        runtime_version: "ublx/0.1.0".to_string(),
+        execution_time_ms: 0,
+        fuel_consumed: 0,
+        policies_applied: vec![],
+        executor_did: TypedDid::new_unchecked("did:key:ublx"),
+        reproducible: true,
+    };
+
+    // ── 1. Store bits: bundle_cid → stored_cid ──────────────────
+    let mut cid_map: HashMap<String, String> = HashMap::new();
+    for entry in &bits_arr {
+        let bundle_cid = entry
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .ok_or("bits[] entry missing 'cid'")?
+            .to_string();
+        let body = entry
+            .get("body")
+            .ok_or("bits[] entry missing 'body'")?
+            .clone();
+        let mut chip_data = body;
+        if let Some(obj) = chip_data.as_object_mut() {
+            obj.insert("@type".to_string(), Value::String(TYPE_SILICON_BIT.to_string()));
+            obj.entry("@world".to_string())
+                .or_insert(Value::String("a/ublx/t/cli".to_string()));
+        }
+        let receipt_cid = format!("b3:receipt-bit-{}", &bundle_cid[3..].chars().take(8).collect::<String>());
+        let stored_cid = store
+            .store_executed_chip(chip_data, receipt_cid, meta.clone())
+            .await?;
+        cid_map.insert(bundle_cid, stored_cid);
+    }
+
+    // ── 2. Store circuits (rewrite bits[] with stored CIDs) ──────
+    for entry in &circuits_arr {
+        let bundle_cid = entry
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .ok_or("circuits[] entry missing 'cid'")?
+            .to_string();
+        let body = entry
+            .get("body")
+            .ok_or("circuits[] entry missing 'body'")?
+            .clone();
+        let mut chip_data = body;
+        if let Some(obj) = chip_data.as_object_mut() {
+            obj.insert("@type".to_string(), Value::String(TYPE_SILICON_CIRCUIT.to_string()));
+            obj.entry("@world".to_string())
+                .or_insert(Value::String("a/ublx/t/cli".to_string()));
+            // Rewrite bits[] using cid_map (bundle CID → stored CID)
+            if let Some(bits_val) = obj.get("bits").and_then(|v| v.as_array()).cloned() {
+                let rewritten: Vec<Value> = bits_val
+                    .iter()
+                    .map(|b| {
+                        let s = b.as_str().unwrap_or("");
+                        Value::String(cid_map.get(s).cloned().unwrap_or_else(|| s.to_string()))
+                    })
+                    .collect();
+                obj.insert("bits".to_string(), Value::Array(rewritten));
+            }
+        }
+        let receipt_cid = format!("b3:receipt-ckt-{}", &bundle_cid[3..].chars().take(8).collect::<String>());
+        let stored_cid = store
+            .store_executed_chip(chip_data, receipt_cid, meta.clone())
+            .await?;
+        cid_map.insert(bundle_cid, stored_cid);
+    }
+
+    // ── 3. Store chip (rewrite circuits[] with stored CIDs) ──────
+    let mut chip_data = chip_body.clone();
+    if let Some(obj) = chip_data.as_object_mut() {
+        obj.insert("@type".to_string(), Value::String(TYPE_SILICON_CHIP.to_string()));
+        obj.entry("@world".to_string())
+            .or_insert(Value::String("a/ublx/t/cli".to_string()));
+        if let Some(circs_val) = obj.get("circuits").and_then(|v| v.as_array()).cloned() {
+            let rewritten: Vec<Value> = circs_val
+                .iter()
+                .map(|c| {
+                    let s = c.as_str().unwrap_or("");
+                    Value::String(cid_map.get(s).cloned().unwrap_or_else(|| s.to_string()))
+                })
+                .collect();
+            obj.insert("circuits".to_string(), Value::Array(rewritten));
+        }
+    }
+    let chip_store_cid = store
+        .store_executed_chip(chip_data.clone(), "b3:receipt-chip".to_string(), meta.clone())
+        .await?;
+
+    // ── chip body CID = BLAKE3 content address of the raw body ───
+    let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(&chip_body)?;
+    let chip_content_cid = ubl_ai_nrf1::compute_cid(&chip_nrf)?;
+
+    // ── 4. Resolve + compile ─────────────────────────────────────
+    let chip = match parse_silicon(TYPE_SILICON_CHIP, &chip_data)? {
+        SiliconRequest::Chip(c) => c,
+        _ => return Err("chip body did not parse as ubl/silicon.chip".into()),
+    };
+    let circuits = resolve_chip_graph(&chip, &store).await?;
+    let bytecode = compile_chip_to_rb_vm(&circuits)?;
+
+    // ── 5. Output ────────────────────────────────────────────────
+    let bc_hash = blake3::hash(&bytecode);
+    let bc_cid = format!("b3:{}", hex::encode(bc_hash.as_bytes()));
+    let bc_hex = hex::encode(&bytecode);
+
+    if hex_only {
+        println!("{}", bc_hex);
+    } else {
+        println!("=== Silicon Compile ===");
+        println!();
+        println!("Chip CID (content):  {}", chip_content_cid);
+        println!("Store CID:           {}", chip_store_cid);
+        println!("Bytecode CID:        {}", bc_cid);
+        println!(
+            "Bytecode size:       {} bytes ({} instructions)",
+            bytecode.len(),
+            count_tlv_instrs(&bytecode)
+        );
+        println!();
+        println!("=== Bytecode (hex) ===");
+        println!("{}", bc_hex);
+        println!();
+        println!("=== Disassembly ===");
+        match rb_vm::disassemble(&bytecode) {
+            Ok(listing) => print!("{}", listing),
+            Err(e) => eprintln!("Disassembly error: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+/// Count TLV instructions in a bytecode buffer (each is 3-byte header + payload).
+fn count_tlv_instrs(bytecode: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i + 2 < bytecode.len() {
+        let len = u16::from_be_bytes([bytecode[i + 1], bytecode[i + 2]]) as usize;
+        i += 3 + len;
+        count += 1;
+    }
+    count
+}
+
+// ── silicon disasm ───────────────────────────────────────────────
+
+fn cmd_silicon_disasm(input: &str, is_file: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let bytecode = if is_file {
+        std::fs::read(input)?
+    } else {
+        let clean = input.replace([' ', '\n', '\t'], "");
+        hex::decode(&clean)?
+    };
+
+    println!("=== Silicon Chip Disassembly ({} bytes, {} instructions) ===\n",
+        bytecode.len(),
+        count_tlv_instrs(&bytecode),
+    );
     match rb_vm::disassemble(&bytecode) {
         Ok(listing) => print!("{}", listing),
         Err(e) => eprintln!("Disassembly error: {}", e),
