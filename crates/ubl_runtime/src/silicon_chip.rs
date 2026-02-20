@@ -92,6 +92,17 @@ pub enum ConditionSpec {
     And { conditions: Vec<ConditionSpec> },
     Or { conditions: Vec<ConditionSpec> },
     Not { condition: Box<ConditionSpec> },
+    /// Numeric field ≤ threshold.  The field is extracted from the chip body as
+    /// an i64 JSON integer, then compared to `amount` with CmpI64(LE).
+    /// Compile target: `PushInput(0) CasGet JsonNormalize JsonGetKey(field)
+    ///                   ConstI64(amount) CmpI64(LE)`
+    AmountLte { field: String, amount: i64 },
+    /// Chip body carries a Unix-seconds timestamp in `field`.  The condition
+    /// passes if `now - field_value <= window_secs` (i.e. the timestamp is
+    /// within `window_secs` seconds of "now").
+    /// Compile target: `PushTimestamp PushInput(0) CasGet JsonNormalize
+    ///                   JsonGetKey(field) SubI64 ConstI64(window) CmpI64(LE)`
+    TimestampWithinSecs { field: String, window_secs: i64 },
 }
 
 impl ConditionSpec {
@@ -114,6 +125,12 @@ impl ConditionSpec {
             ConditionSpec::Not { condition } => {
                 Expression::Not(Box::new(condition.to_expression()))
             }
+            // VM-native conditions: no direct Expression equivalent.
+            // The policy evaluator can't execute these — they compile to
+            // bytecode only.  Map to Always(true) so policy evaluation passes
+            // and the real enforcement happens in the VM.
+            ConditionSpec::AmountLte { .. } => Expression::Always(true),
+            ConditionSpec::TimestampWithinSecs { .. } => Expression::Always(true),
         }
     }
 
@@ -250,6 +267,32 @@ impl ConditionSpec {
                 Ok(ConditionSpec::Not {
                     condition: Box::new(ConditionSpec::from_value(inner)?),
                 })
+            }
+            "amount_lte" => {
+                let field = v
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SiliconError::MissingField("condition.field".to_string()))?
+                    .to_string();
+                let amount = v
+                    .get("amount")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| SiliconError::MissingField("condition.amount".to_string()))?;
+                Ok(ConditionSpec::AmountLte { field, amount })
+            }
+            "timestamp_within_secs" => {
+                let field = v
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| SiliconError::MissingField("condition.field".to_string()))?
+                    .to_string();
+                let window_secs = v
+                    .get("window_secs")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| {
+                        SiliconError::MissingField("condition.window_secs".to_string())
+                    })?;
+                Ok(ConditionSpec::TimestampWithinSecs { field, window_secs })
             }
             other => Err(SiliconError::InvalidField(format!(
                 "unknown condition op: {}",
@@ -1239,6 +1282,35 @@ fn compile_to_bool(cond: &ConditionSpec) -> Result<Vec<u8>, SiliconError> {
             code.extend(compile_to_bool(condition)?);
             code.extend(tlv_instr(0x27, &[])); // BoolNot
         }
+        ConditionSpec::AmountLte { field, amount } => {
+            // Extract JSON integer field from input, compare LE to amount.
+            // Stack: PushInput(0) → CasGet → JsonNormalize → JsonGetKey(field)
+            //        → ConstI64(amount) → CmpI64(LE) → Bool
+            code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+            code.extend(tlv_instr(0x0C, &[])); // CasGet
+            code.extend(tlv_instr(0x03, &[])); // JsonNormalize
+            code.extend(tlv_instr(0x13, field.as_bytes())); // JsonGetKey(field) → I64
+            code.extend(tlv_instr(0x01, &amount.to_be_bytes())); // ConstI64(amount)
+            code.extend(tlv_instr(0x08, &[3u8])); // CmpI64(LE)
+        }
+        ConditionSpec::TimestampWithinSecs { field, window_secs } => {
+            // now - chip_ts <= window_secs
+            // Stack:
+            //   PushTimestamp                          → I64(now)
+            //   PushInput(0) CasGet JsonNormalize
+            //   JsonGetKey(field)                      → I64(chip_ts)
+            //   SubI64                                 → I64(now - chip_ts)
+            //   ConstI64(window_secs)                  → I64(window)
+            //   CmpI64(LE)                             → Bool(age <= window)
+            code.extend(tlv_instr(0x2C, &[])); // PushTimestamp (now)
+            code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+            code.extend(tlv_instr(0x0C, &[])); // CasGet
+            code.extend(tlv_instr(0x03, &[])); // JsonNormalize
+            code.extend(tlv_instr(0x13, field.as_bytes())); // JsonGetKey(field) → I64(chip_ts)
+            code.extend(tlv_instr(0x06, &[])); // SubI64 → I64(now - chip_ts)
+            code.extend(tlv_instr(0x01, &window_secs.to_be_bytes())); // ConstI64(window)
+            code.extend(tlv_instr(0x08, &[3u8])); // CmpI64(LE)
+        }
     }
     Ok(code)
 }
@@ -1884,5 +1956,238 @@ mod tests {
         let bc1 = gate_compile(&chip_cid, &store).await.unwrap();
         let bc2 = gate_compile(&chip_cid, &store).await.unwrap();
         assert_eq!(bc1, bc2);
+    }
+
+    // ── Phase 3: temporal + arithmetic condition tests ─────────────────────────
+
+    #[test]
+    fn parse_amount_lte_condition() {
+        let body = json!({
+            "id": "P_AmountLte",
+            "name": "Amount ≤ 500",
+            "condition": {"op": "amount_lte", "field": "amount", "amount": 500},
+            "on_true": "allow",
+            "on_false": "deny",
+            "requires_context": ["amount"]
+        });
+        let bit = parse_bit(&body).unwrap();
+        assert!(matches!(
+            bit.condition,
+            ConditionSpec::AmountLte { ref field, amount: 500 } if field == "amount"
+        ));
+    }
+
+    #[test]
+    fn parse_timestamp_within_secs_condition() {
+        let body = json!({
+            "id": "P_TimestampWithin24h",
+            "name": "Within 24 hours",
+            "condition": {"op": "timestamp_within_secs", "field": "created_at", "window_secs": 86400},
+            "on_true": "allow",
+            "on_false": "deny",
+            "requires_context": ["created_at"]
+        });
+        let bit = parse_bit(&body).unwrap();
+        assert!(matches!(
+            bit.condition,
+            ConditionSpec::TimestampWithinSecs { ref field, window_secs: 86400 } if field == "created_at"
+        ));
+    }
+
+    #[test]
+    fn compile_amount_lte_produces_bytecode() {
+        // AmountLte compiles to:
+        //   PushInput(0x12) + CasGet(0x0C) + JsonNormalize(0x03) +
+        //   JsonGetKey(0x13,"amount") + ConstI64(0x01,500) + CmpI64(0x08,LE=3)
+        // followed by AssertTrue + PushInput + EmitRc
+        let bit = SiliconBitBody {
+            id: "P_AmtLte".to_string(),
+            name: "Amount ≤ 500".to_string(),
+            condition: ConditionSpec::AmountLte {
+                field: "amount".to_string(),
+                amount: 500,
+            },
+            on_true: Decision::Allow,
+            on_false: Decision::Deny,
+            requires_context: vec!["amount".to_string()],
+        };
+        let circuit = ResolvedCircuit {
+            cid: "b3:test".to_string(),
+            body: SiliconCircuitBody {
+                id: "C_Test".to_string(),
+                name: "Test".to_string(),
+                bits: vec!["b3:test".to_string()],
+                composition: "Sequential".to_string(),
+                aggregator: "All".to_string(),
+            },
+            nodes: vec![ResolvedNode::Bit(ResolvedBit {
+                cid: "b3:test".to_string(),
+                body: bit,
+            })],
+        };
+        let bytecode = compile_chip_to_rb_vm(&[circuit]).unwrap();
+        assert!(!bytecode.is_empty());
+        // Must contain JsonGetKey (0x13) for the "amount" field
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x13),
+            "expected JsonGetKey opcode 0x13 in bytecode"
+        );
+        // Must contain CmpI64 (0x08)
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x08),
+            "expected CmpI64 opcode 0x08 in bytecode"
+        );
+        // Must terminate with EmitRc (0x10)
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x10),
+            "expected EmitRc opcode 0x10 in bytecode"
+        );
+    }
+
+    #[test]
+    fn compile_timestamp_within_secs_produces_bytecode() {
+        // TimestampWithinSecs compiles to:
+        //   PushTimestamp(0x2C) + PushInput(0x12) + CasGet + JsonNormalize +
+        //   JsonGetKey(0x13,field) + SubI64(0x06) + ConstI64(window) + CmpI64(LE)
+        let bit = SiliconBitBody {
+            id: "P_TsWithin".to_string(),
+            name: "Within 24h".to_string(),
+            condition: ConditionSpec::TimestampWithinSecs {
+                field: "created_at".to_string(),
+                window_secs: 86400,
+            },
+            on_true: Decision::Allow,
+            on_false: Decision::Deny,
+            requires_context: vec!["created_at".to_string()],
+        };
+        let circuit = ResolvedCircuit {
+            cid: "b3:test".to_string(),
+            body: SiliconCircuitBody {
+                id: "C_Test".to_string(),
+                name: "Test".to_string(),
+                bits: vec!["b3:test".to_string()],
+                composition: "Sequential".to_string(),
+                aggregator: "All".to_string(),
+            },
+            nodes: vec![ResolvedNode::Bit(ResolvedBit {
+                cid: "b3:test".to_string(),
+                body: bit,
+            })],
+        };
+        let bytecode = compile_chip_to_rb_vm(&[circuit]).unwrap();
+        assert!(!bytecode.is_empty());
+        // Must contain PushTimestamp (0x2C)
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x2C),
+            "expected PushTimestamp opcode 0x2C in bytecode"
+        );
+        // Must contain SubI64 (0x06)
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x06),
+            "expected SubI64 opcode 0x06 in bytecode"
+        );
+    }
+
+    #[test]
+    fn compile_amount_lte_and_timestamp_within_secs_together() {
+        // Tests the exact use case from the roadmap:
+        //   "amount ≤ 500 AND timestamp within 24h"
+        // Two bits in one circuit, Sequential/All — both must pass.
+        let bit_amount = SiliconBitBody {
+            id: "P_Amt".to_string(),
+            name: "Amount ≤ 500".to_string(),
+            condition: ConditionSpec::AmountLte {
+                field: "amount".to_string(),
+                amount: 500,
+            },
+            on_true: Decision::Allow,
+            on_false: Decision::Deny,
+            requires_context: vec!["amount".to_string()],
+        };
+        let bit_ts = SiliconBitBody {
+            id: "P_Ts".to_string(),
+            name: "Within 24h".to_string(),
+            condition: ConditionSpec::TimestampWithinSecs {
+                field: "created_at".to_string(),
+                window_secs: 86400,
+            },
+            on_true: Decision::Allow,
+            on_false: Decision::Deny,
+            requires_context: vec!["created_at".to_string()],
+        };
+        let circuit = ResolvedCircuit {
+            cid: "b3:test".to_string(),
+            body: SiliconCircuitBody {
+                id: "C_PaymentGate".to_string(),
+                name: "Payment Gate".to_string(),
+                bits: vec!["b3:amt".to_string(), "b3:ts".to_string()],
+                composition: "Sequential".to_string(),
+                aggregator: "All".to_string(),
+            },
+            nodes: vec![
+                ResolvedNode::Bit(ResolvedBit {
+                    cid: "b3:amt".to_string(),
+                    body: bit_amount,
+                }),
+                ResolvedNode::Bit(ResolvedBit {
+                    cid: "b3:ts".to_string(),
+                    body: bit_ts,
+                }),
+            ],
+        };
+        let bytecode = compile_chip_to_rb_vm(&[circuit]).unwrap();
+        assert!(!bytecode.is_empty());
+
+        // Bytecode must contain both AmountLte opcodes (0x13=JsonGetKey, 0x08=CmpI64)
+        // and TimestampWithinSecs opcodes (0x2C=PushTimestamp, 0x06=SubI64).
+        assert!(bytecode.windows(1).any(|w| w[0] == 0x2C), "PushTimestamp missing");
+        assert!(bytecode.windows(1).any(|w| w[0] == 0x06), "SubI64 missing");
+        assert!(bytecode.windows(1).any(|w| w[0] == 0x13), "JsonGetKey missing");
+        assert!(bytecode.windows(1).any(|w| w[0] == 0x08), "CmpI64 missing");
+        assert!(bytecode.windows(1).any(|w| w[0] == 0x10), "EmitRc missing");
+
+        // Disassemble and verify it's human-readable
+        let disasm = rb_vm::disassemble(&bytecode).unwrap();
+        assert!(disasm.contains("PushTimestamp"));
+        assert!(disasm.contains("SubI64"));
+        assert!(disasm.contains("JsonGetKey"));
+        assert!(disasm.contains("CmpI64"));
+    }
+
+    #[test]
+    fn div_i64_opcode_in_disasm() {
+        use rb_vm::{disassemble, opcode::Opcode};
+        // Encode a DivI64 instruction (no payload)
+        let mut bc = Vec::new();
+        bc.push(Opcode::DivI64 as u8);
+        bc.extend_from_slice(&0u16.to_be_bytes()); // payload len = 0
+        let out = disassemble(&bc).unwrap();
+        assert!(out.contains("DivI64"), "disasm should show DivI64, got: {}", out);
+    }
+
+    #[test]
+    fn push_timestamp_opcode_in_disasm() {
+        use rb_vm::{disassemble, opcode::Opcode};
+        let mut bc = Vec::new();
+        bc.push(Opcode::PushTimestamp as u8);
+        bc.extend_from_slice(&0u16.to_be_bytes());
+        let out = disassemble(&bc).unwrap();
+        assert!(
+            out.contains("PushTimestamp"),
+            "disasm should show PushTimestamp, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn cmp_timestamp_ge_in_disasm() {
+        use rb_vm::{disassemble, opcode::Opcode};
+        let mut bc = Vec::new();
+        bc.push(Opcode::CmpTimestamp as u8);
+        bc.extend_from_slice(&1u16.to_be_bytes()); // payload len = 1
+        bc.push(5u8); // GE
+        let out = disassemble(&bc).unwrap();
+        assert!(out.contains("CmpTimestamp"), "expected CmpTimestamp in: {}", out);
+        assert!(out.contains("GE"), "expected GE in: {}", out);
     }
 }

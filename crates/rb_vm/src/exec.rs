@@ -547,6 +547,59 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                     self.push(Value::I64(if b { 1 } else { 0 }));
                 }
 
+                // DivI64: Pop b,a (I64) → push I64(a / b). Division by zero yields 0.
+                Opcode::DivI64 => {
+                    let b = match self.pop()? {
+                        I64(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::DivI64)),
+                    };
+                    let a = match self.pop()? {
+                        I64(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::DivI64)),
+                    };
+                    let r = if b == 0 { 0 } else { a.saturating_div(b) };
+                    self.push(I64(r));
+                }
+
+                // PushTimestamp: Push current Unix time as I64(seconds since epoch).
+                // In ghost/deterministic mode callers should supply time via input context;
+                // this opcode is provided for convenience and live-enforcement use.
+                Opcode::PushTimestamp => {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    self.push(I64(secs));
+                }
+
+                // CmpTimestamp: payload 1-byte cmp-op (same as CmpI64).
+                // Pop I64(b) then I64(a); push Bool(a op b).
+                // Typical use: stack has [chip_ts, now]; CmpTimestamp(GE) → now >= chip_ts.
+                Opcode::CmpTimestamp => {
+                    if ins.payload.len() != 1 {
+                        return Err(ExecError::InvalidPayload(Opcode::CmpTimestamp));
+                    }
+                    let b = match self.pop()? {
+                        I64(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::CmpTimestamp)),
+                    };
+                    let a = match self.pop()? {
+                        I64(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::CmpTimestamp)),
+                    };
+                    let op = ins.payload[0];
+                    let ok = match op {
+                        0 => a == b,
+                        1 => a != b,
+                        2 => a < b,
+                        3 => a <= b,
+                        4 => a > b,
+                        5 => a >= b,
+                        _ => return Err(ExecError::InvalidPayload(Opcode::CmpTimestamp)),
+                    };
+                    self.push(Bool(ok));
+                }
+
                 Opcode::EmitRc => {
                     if self.cfg.trace {
                         self.trace.push(TraceStep {

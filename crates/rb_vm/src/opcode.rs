@@ -45,6 +45,11 @@ pub enum Opcode {
     BoolOr = 0x28,            // pop b,a (Bool) -> push Bool(a || b)
     BoolAnd = 0x29,           // pop b,a (Bool) -> push Bool(a && b)
     BoolToI64 = 0x2A,         // pop Bool -> push I64(1 or 0)
+
+    // ── Phase 3: arithmetic + temporal ──────────────────────────────────────
+    DivI64 = 0x2B,            // pop b,a (I64) -> push I64(a / b), saturating (div-by-zero → 0)
+    PushTimestamp = 0x2C,     // push I64(unix_secs_now) — wall-clock seconds since epoch
+    CmpTimestamp = 0x2D,      // payload: 1-byte cmp-op (same as CmpI64); pop I64 ts, push Bool
 }
 
 impl TryFrom<u8> for Opcode {
@@ -94,6 +99,9 @@ impl TryFrom<u8> for Opcode {
             0x28 => BoolOr,
             0x29 => BoolAnd,
             0x2A => BoolToI64,
+            0x2B => DivI64,
+            0x2C => PushTimestamp,
+            0x2D => CmpTimestamp,
             _ => return Err(()),
         })
     }

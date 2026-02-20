@@ -90,6 +90,18 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
         Opcode::PushBool if payload.len() == 1 => {
             format!("({})", if payload[0] != 0 { "true" } else { "false" })
         }
+        Opcode::CmpTimestamp if payload.len() == 1 => {
+            let cmp = match payload[0] {
+                0 => "EQ",
+                1 => "NE",
+                2 => "LT",
+                3 => "LE",
+                4 => "GT",
+                5 => "GE",
+                n => return format!("(cmp=0x{:02x}?)", n),
+            };
+            format!("({})", cmp)
+        }
         _ if !payload.is_empty() => {
             format!("({} bytes)", payload.len())
         }
