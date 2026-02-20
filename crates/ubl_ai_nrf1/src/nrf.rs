@@ -168,12 +168,18 @@ fn decode_varint32<R: Read>(r: &mut R) -> Result<u32> {
         r.read_exact(&mut byte)?;
         bytes_read += 1;
         let b = byte[0];
-        result |= ((b & 0x7f) as u32) << shift;
+        let val = (b & 0x7f) as u32;
+        // On the 5th byte (shift == 28) only 4 bits fit in u32; reject anything higher
+        // to prevent shift-left overflow (panic in debug, silent wrap in release).
+        if shift == 28 && val > 0x0F {
+            bail!("VarIntOverflow: value exceeds 32-bit limit");
+        }
+        result |= val << shift;
         if (b & 0x80) == 0 {
             break;
         }
         shift += 7;
-        if shift > 28 || bytes_read > 5 {
+        if shift > 28 || bytes_read >= 5 {
             bail!("NonMinimalVarint");
         }
     }
