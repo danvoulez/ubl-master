@@ -20,6 +20,13 @@ pub struct DurableStore {
     dsn: String,
 }
 
+/// GAP-15: persisted stage-secret rotation state.
+#[derive(Debug, Clone)]
+pub struct StageSecretsRow {
+    pub current: String,
+    pub prev: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommitInput {
     pub receipt_cid: String,
@@ -410,9 +417,89 @@ impl DurableStore {
 
             CREATE INDEX IF NOT EXISTS idx_outbox_status_next
             ON outbox (status, next_attempt_at);
+
+            -- GAP-6: cross-restart nonce replay guard with 24h TTL
+            CREATE TABLE IF NOT EXISTS seen_nonces (
+              nonce      TEXT PRIMARY KEY,
+              created_at INTEGER NOT NULL,
+              expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_seen_nonces_expires
+            ON seen_nonces (expires_at);
+
+            -- GAP-15: persisted stage-secret rotation state (singleton row id=1)
+            CREATE TABLE IF NOT EXISTS stage_secrets (
+              id         INTEGER PRIMARY KEY CHECK (id = 1),
+              current    TEXT NOT NULL,
+              prev       TEXT,
+              rotated_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| DurableError::Sqlite(e.to_string()))
+    }
+
+    /// GAP-6: insert nonce if not already seen (and not expired). Returns `true` if newly inserted.
+    /// Also prunes expired nonces on each call (index-assisted, cheap).
+    pub fn nonce_mark_if_new(&self, nonce: &str, ttl: Duration) -> Result<bool, DurableError> {
+        let mut conn = self.open_conn()?;
+        self.apply_pragmas(&conn)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now + ttl.as_secs().max(1) as i64;
+
+        // Prune expired (indexed, best-effort before insert)
+        tx.execute(
+            "DELETE FROM seen_nonces WHERE expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_nonces (nonce, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            params![nonce, now, expires_at],
+        )
+        .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+
+        let inserted = tx.changes() > 0;
+        tx.commit()
+            .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+        Ok(inserted)
+    }
+
+    /// GAP-15: persist current and (optionally) previous stage secret (singleton id=1).
+    pub fn put_stage_secrets(&self, current: &str, prev: Option<&str>) -> Result<(), DurableError> {
+        let conn = self.open_conn()?;
+        self.apply_pragmas(&conn)?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO stage_secrets (id, current, prev, rotated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               current    = excluded.current,
+               prev       = excluded.prev,
+               rotated_at = excluded.rotated_at",
+            params![current, prev, now],
+        )
+        .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// GAP-15: load persisted stage secrets (if any).
+    pub fn get_stage_secrets(&self) -> Result<Option<StageSecretsRow>, DurableError> {
+        let conn = self.open_conn()?;
+        self.apply_pragmas(&conn)?;
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT current, prev FROM stage_secrets WHERE id = 1",
+                params![],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| DurableError::Sqlite(e.to_string()))?;
+        Ok(row.map(|(current, prev)| StageSecretsRow { current, prev }))
     }
 
     fn ensure_parent_dir(&self) -> Result<(), DurableError> {

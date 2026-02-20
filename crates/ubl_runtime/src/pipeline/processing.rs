@@ -85,6 +85,25 @@ impl UblPipeline {
         let world = parsed_request.world;
         let nonce = Self::generate_nonce();
 
+        // GAP-6: cross-restart nonce tracking (24h TTL) when SQLite is enabled.
+        // The in-memory guard is the fast path; SQLite adds cross-restart durability.
+        {
+            let mut seen = self.seen_nonces.write().await;
+            if seen.contains(&nonce) {
+                return Err(PipelineError::InvalidChip("replay: duplicate nonce (in-memory)".to_string()));
+            }
+            seen.insert(nonce.clone());
+        }
+        if let Some(ds) = &self.durable_store {
+            let ttl = std::time::Duration::from_secs(24 * 60 * 60);
+            let is_new = ds
+                .nonce_mark_if_new(&nonce, ttl)
+                .map_err(|e| PipelineError::StorageError(format!("nonce persist: {}", e)))?;
+            if !is_new {
+                return Err(PipelineError::InvalidChip("replay: nonce already seen (durable)".to_string()));
+            }
+        }
+
         // Create the unified receipt — it evolves through each stage
         let mut receipt = UnifiedReceipt::new(world, &self.did, &self.kid, &nonce)
             .with_runtime_info((*self.runtime_info).clone());
@@ -438,6 +457,30 @@ impl UblPipeline {
                     .map_err(|e| {
                         PipelineError::StorageError(format!("key.rotate mapping store: {}", e))
                     })?;
+
+                // GAP-15: rotate the stage secret so the auth chain remains valid
+                // after the signing key changes. UnifiedReceipt reads UBL_STAGE_SECRET
+                // and UBL_STAGE_SECRET_PREV from env at verify time.
+                {
+                    let new_sk = crate::key_rotation::derive_new_signing_key(
+                        parsed_request.body(),
+                        &signing_seed,
+                    )
+                    .map_err(|e| PipelineError::Internal(format!("key rotation new key: {}", e)))?;
+                    let new_secret = super::derive_stage_secret(&new_sk);
+                    let new_secret_env = format!("hex:{}", hex::encode(new_secret));
+                    let prev = std::env::var("UBL_STAGE_SECRET").ok();
+                    std::env::set_var("UBL_STAGE_SECRET", &new_secret_env);
+                    if let Some(ref p) = prev {
+                        std::env::set_var("UBL_STAGE_SECRET_PREV", p);
+                    }
+                    if let Some(ds) = &self.durable_store {
+                        ds.put_stage_secrets(&new_secret_env, prev.as_deref())
+                            .map_err(|e| PipelineError::StorageError(
+                                format!("stage secret persist: {}", e),
+                            ))?;
+                    }
+                }
             } else if let Err(e) = stored_chip_res {
                 warn!(error = %e, "ChipStore persist failed (non-fatal)");
             }

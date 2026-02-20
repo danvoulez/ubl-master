@@ -149,21 +149,106 @@ impl EventStore {
         Ok(())
     }
 
+    /// Choose the most selective dimensional index available for this query.
+    /// Returns `(tree_name, value)` or `None` to fall back to time-scan.
+    fn choose_best_index<'a>(&self, q: &'a EventQuery) -> Option<(&'static str, String)> {
+        // Prefer the most selective / most common audit filters first.
+        // chip_type supports glob in matches_query(); only use the index for exact matches.
+        if let Some(t) = &q.chip_type {
+            if !t.contains('*') {
+                return Some((TREE_IDX_TYPE, t.clone()));
+            }
+        }
+        if let Some(w) = &q.world {
+            return Some((TREE_IDX_WORLD, w.clone()));
+        }
+        if let Some(a) = &q.actor {
+            return Some((TREE_IDX_ACTOR, a.clone()));
+        }
+        if let Some(c) = &q.code {
+            return Some((TREE_IDX_CODE, c.clone()));
+        }
+        // stage/decision are stored uppercase in events; only use index for uppercase queries
+        // to avoid missing matches from the case-insensitive check in matches_query.
+        if let Some(s) = &q.stage {
+            if s == &s.to_ascii_uppercase() {
+                return Some((TREE_IDX_STAGE, s.clone()));
+            }
+        }
+        if let Some(d) = &q.decision {
+            if d == &d.to_ascii_uppercase() {
+                return Some((TREE_IDX_DECISION, d.clone()));
+            }
+        }
+        None
+    }
+
+    /// Scan a dimensional index for all event IDs >= start_ms that share `value`.
+    fn scan_dim_index(
+        &self,
+        tree_name: &str,
+        value: &str,
+        start_ms: i64,
+    ) -> Result<Vec<String>, EventStoreError> {
+        let idx = self
+            .db
+            .open_tree(tree_name)
+            .map_err(|e| EventStoreError::Sled(e.to_string()))?;
+        let prefix = format!("{}\x1f", value).into_bytes();
+        let start_key = format!("{}\x1f{:020}\x1f", value, start_ms).into_bytes();
+
+        let mut ids = Vec::new();
+        for item in idx.range(start_key..) {
+            let (k, _v) = item.map_err(|e| EventStoreError::Sled(e.to_string()))?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Some(event_id) = extract_event_id_from_index_key(&k) {
+                ids.push(event_id);
+            }
+        }
+        Ok(ids)
+    }
+
     pub fn query(&self, query: &EventQuery) -> Result<Vec<Value>, EventStoreError> {
         let events = self
             .db
             .open_tree(TREE_EVENTS)
             .map_err(|e| EventStoreError::Sled(e.to_string()))?;
+
+        let limit = query.limit.unwrap_or(200).clamp(1, 2_000);
+        let start_ms = parse_since_to_ms(query.since.as_deref()).unwrap_or(0);
+
+        let mut out = Vec::with_capacity(limit);
+
+        // Fast path: use a dimensional index when one matches the query.
+        if let Some((tree, value)) = self.choose_best_index(query) {
+            let ids = self.scan_dim_index(tree, &value, start_ms)?;
+            for event_id in ids {
+                let Some(raw) = events
+                    .get(event_id.as_bytes())
+                    .map_err(|e| EventStoreError::Sled(e.to_string()))?
+                else {
+                    continue;
+                };
+                let event: Value = serde_json::from_slice(&raw)
+                    .map_err(|e| EventStoreError::Serde(e.to_string()))?;
+                if matches_query(&event, query) {
+                    out.push(event);
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Fallback: time-scan (original behaviour; handles glob chip_type, mixed-case, etc.)
         let idx_time = self
             .db
             .open_tree(TREE_IDX_TIME)
             .map_err(|e| EventStoreError::Sled(e.to_string()))?;
-
-        let limit = query.limit.unwrap_or(200).clamp(1, 2_000);
-        let start_ms = parse_since_to_ms(query.since.as_deref()).unwrap_or(0);
         let start_key = format!("{:020}\x1f", start_ms);
-
-        let mut out = Vec::with_capacity(limit);
         for item in idx_time.range(start_key.as_bytes()..) {
             let (k, _v) = item.map_err(|e| EventStoreError::Sled(e.to_string()))?;
             let Some(event_id) = extract_event_id_from_index_key(&k) else {

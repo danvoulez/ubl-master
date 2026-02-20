@@ -88,7 +88,24 @@ fn load_transition_registry() -> Arc<TransitionRegistry> {
     }
 }
 
-fn derive_stage_secret(signing_key: &SigningKey) -> [u8; 32] {
+/// GAP-15: if the DurableStore has a persisted stage-secret row, load it into env
+/// so that `UnifiedReceipt::verify_auth_chain` uses the correct current/prev values
+/// after a restart that followed a key rotation.
+fn apply_persisted_stage_secrets(durable: &Option<Arc<DurableStore>>) {
+    let Some(ds) = durable else { return };
+    match ds.get_stage_secrets() {
+        Ok(Some(row)) => {
+            std::env::set_var("UBL_STAGE_SECRET", row.current);
+            if let Some(prev) = row.prev {
+                std::env::set_var("UBL_STAGE_SECRET_PREV", prev);
+            }
+        }
+        Ok(None) => {}
+        Err(_) => {}
+    }
+}
+
+pub(crate) fn derive_stage_secret(signing_key: &SigningKey) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_keyed(&signing_key.to_bytes());
     hasher.update(b"ubl.stage_secret.v1");
     *hasher.finalize().as_bytes()
@@ -192,6 +209,8 @@ impl UblPipeline {
         let vk = key.verifying_key();
         let did = did_from_verifying_key(&vk);
         let kid = kid_from_verifying_key(&vk);
+        let durable_store = load_durable_store();
+        apply_persisted_stage_secrets(&durable_store);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -205,7 +224,7 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
-            durable_store: load_durable_store(),
+            durable_store,
             transition_registry: load_transition_registry(),
         }
     }
@@ -216,6 +235,8 @@ impl UblPipeline {
         let vk = key.verifying_key();
         let did = did_from_verifying_key(&vk);
         let kid = kid_from_verifying_key(&vk);
+        let durable_store = load_durable_store();
+        apply_persisted_stage_secrets(&durable_store);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -229,7 +250,7 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
-            durable_store: load_durable_store(),
+            durable_store,
             transition_registry: load_transition_registry(),
         }
     }
@@ -240,6 +261,8 @@ impl UblPipeline {
         let vk = key.verifying_key();
         let did = did_from_verifying_key(&vk);
         let kid = kid_from_verifying_key(&vk);
+        let durable_store = load_durable_store();
+        apply_persisted_stage_secrets(&durable_store);
         Self {
             policy_loader: PolicyLoader::new(storage),
             fuel_limit: DEFAULT_FUEL_LIMIT,
@@ -253,7 +276,7 @@ impl UblPipeline {
             kid,
             signing_key: Arc::new(key),
             ledger: Arc::new(NullLedger),
-            durable_store: load_durable_store(),
+            durable_store,
             transition_registry: load_transition_registry(),
         }
     }

@@ -71,6 +71,23 @@ impl KeyRotateRequest {
     }
 }
 
+/// GAP-15: derive the new signing key for a rotation chip (runtime-only).
+/// Uses the same deterministic derivation as `derive_material` so the key is
+/// reproducible from `(chip_body, runtime_signing_seed)` alone.
+pub fn derive_new_signing_key(
+    body: &Value,
+    runtime_signing_seed: &[u8; 32],
+) -> Result<SigningKey, KeyRotationError> {
+    let chip_cid = ubl_canon::cid_of(body).map_err(|e| KeyRotationError::Canon(e.to_string()))?;
+    let digest = blake3::keyed_hash(
+        runtime_signing_seed,
+        format!("ubl/key.rotate/v1\0{}", chip_cid).as_bytes(),
+    );
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(digest.as_bytes());
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 pub fn derive_material(
     req: &KeyRotateRequest,
     body: &Value,
