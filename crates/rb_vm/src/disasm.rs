@@ -83,6 +83,13 @@ fn format_payload(op: Opcode, payload: &[u8]) -> String {
             Ok(s) => format!("(\"{}\")", s),
             Err(_) => format!("({} bytes, non-utf8)", payload.len()),
         },
+        Opcode::JsonGetKeyBytes | Opcode::JsonHasKey => match std::str::from_utf8(payload) {
+            Ok(s) => format!("(\"{}\")", s),
+            Err(_) => format!("({} bytes, non-utf8)", payload.len()),
+        },
+        Opcode::PushBool if payload.len() == 1 => {
+            format!("({})", if payload[0] != 0 { "true" } else { "false" })
+        }
         _ if !payload.is_empty() => {
             format!("({} bytes)", payload.len())
         }

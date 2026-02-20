@@ -15,6 +15,10 @@ pub enum TrBytecodeProfile {
     PassV1,
     AuditV1,
     NumericV1,
+    /// Silicon bit/circuit/chip: passthrough + store definition in CAS.
+    SiliconDefinitionV1,
+    /// Silicon compile: full compilation to rb_vm bytecode.
+    SiliconCompileV1,
 }
 
 impl TrBytecodeProfile {
@@ -23,6 +27,8 @@ impl TrBytecodeProfile {
             Self::PassV1 => "pass_v1",
             Self::AuditV1 => "audit_v1",
             Self::NumericV1 => "numeric_v1",
+            Self::SiliconDefinitionV1 => "silicon_definition_v1",
+            Self::SiliconCompileV1 => "silicon_compile_v1",
         }
     }
 
@@ -31,6 +37,10 @@ impl TrBytecodeProfile {
             "pass_v1" | "pass" => Some(Self::PassV1),
             "audit_v1" | "audit" => Some(Self::AuditV1),
             "numeric_v1" | "numeric" | "num_v1" | "num" => Some(Self::NumericV1),
+            "silicon_definition_v1" | "silicon_definition" | "silicon_def" => {
+                Some(Self::SiliconDefinitionV1)
+            }
+            "silicon_compile_v1" | "silicon_compile" => Some(Self::SiliconCompileV1),
             _ => None,
         }
     }
@@ -122,6 +132,12 @@ impl TransitionRegistry {
             "ubl/payment" | "ubl/invoice" | "ubl/settlement" | "ubl/quote" => {
                 TrBytecodeProfile::NumericV1
             }
+            // Silicon definition chips: store the definition, emit receipt.
+            "ubl/silicon.bit" | "ubl/silicon.circuit" | "ubl/silicon.chip" => {
+                TrBytecodeProfile::SiliconDefinitionV1
+            }
+            // Silicon compile chip: compilation is handled in stage_transition.
+            "ubl/silicon.compile" => TrBytecodeProfile::SiliconCompileV1,
             _ => TrBytecodeProfile::PassV1,
         }
     }
@@ -154,6 +170,28 @@ impl TransitionRegistry {
                 code.extend(tlv_instr(0x0D, &[])); // SetRcBody
                 code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
                 code.extend(tlv_instr(0x0E, &[])); // AttachProof
+                code.extend(tlv_instr(0x10, &[])); // EmitRc
+                code
+            }
+            // Silicon definition: normalize, hash, store in CAS, attach proof, emit receipt.
+            // The CAS store proves the definition is content-addressed (CID = BLAKE3 of NRF-1).
+            TrBytecodeProfile::SiliconDefinitionV1 => {
+                let mut code = Vec::new();
+                code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+                code.extend(tlv_instr(0x0C, &[])); // CasGet
+                code.extend(tlv_instr(0x03, &[])); // JsonNormalize
+                code.extend(tlv_instr(0x0B, &[])); // CasPut — store normalized definition
+                code.extend(tlv_instr(0x11, &[])); // Drop (CAS CID off stack)
+                code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
+                code.extend(tlv_instr(0x0E, &[])); // AttachProof — attach input CID as proof
+                code.extend(tlv_instr(0x10, &[])); // EmitRc
+                code
+            }
+            // Silicon compile: stage_transition handles actual compilation.
+            // This bytecode is a passthrough — the real work happens in execute_silicon_compile_transition.
+            TrBytecodeProfile::SiliconCompileV1 => {
+                let mut code = Vec::new();
+                code.extend(tlv_instr(0x12, &0u16.to_be_bytes())); // PushInput(0)
                 code.extend(tlv_instr(0x10, &[])); // EmitRc
                 code
             }

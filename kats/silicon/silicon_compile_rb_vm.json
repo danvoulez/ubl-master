@@ -1,0 +1,20 @@
+{
+  "@type": "ubl/silicon.compile",
+  "@ver": "1.0",
+  "@world": "a/lab/t/dev",
+  "chip_cid": "b3:<replace-with-CHIP_PaymentGate-cid>",
+  "target": "rb_vm",
+  "_kat": {
+    "description": "Compilation request: resolve chip→circuits→bits, compile to rb_vm TLV bytecode. Receipt contains silicon_compile.bytecode_cid. That CID can then be used as @tr.bytecode_hex in future chips.",
+    "expected_parse": "ok",
+    "expected_tr_profile": "silicon_compile_v1",
+    "expected_receipt_fields": [
+      "silicon_compile.chip_cid",
+      "silicon_compile.bytecode_cid",
+      "silicon_compile.circuit_count",
+      "silicon_compile.bit_count",
+      "silicon_compile.bytecode_len",
+      "artifacts.bytecode"
+    ]
+  }
+}

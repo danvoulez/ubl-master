@@ -550,10 +550,36 @@ impl GateManifest {
                 "required": ["chip"]
             }
         }));
+        // MCP canonical alias
+        tools.push(json!({
+            "name": "ubl.chip.submit",
+            "description": "Submit a chip through the UBL pipeline (KNOCK→WA→CHECK→TR→WF). Returns a receipt.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chip": {
+                        "type": "object",
+                        "description": "The chip body (must include @type, @ver, @world, @id)",
+                    }
+                },
+                "required": ["chip"]
+            }
+        }));
 
         // ubl.query — get a chip by CID
         tools.push(json!({
             "name": "ubl.query",
+            "description": "Retrieve a chip by its content-addressed CID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cid": { "type": "string", "description": "Content ID (b3:...)" }
+                },
+                "required": ["cid"]
+            }
+        }));
+        tools.push(json!({
+            "name": "ubl.chip.get",
             "description": "Retrieve a chip by its content-addressed CID.",
             "inputSchema": {
                 "type": "object",
@@ -589,6 +615,17 @@ impl GateManifest {
                 "required": ["cid"]
             }
         }));
+        tools.push(json!({
+            "name": "ubl.chip.verify",
+            "description": "Verify a chip's integrity by recomputing its CID from stored content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cid": { "type": "string", "description": "Content ID to verify" }
+                },
+                "required": ["cid"]
+            }
+        }));
 
         // registry.listTypes — list registered chip types
         tools.push(json!({
@@ -611,6 +648,39 @@ impl GateManifest {
                     "persist": { "type": "boolean", "description": "Persist narration advisory chip" }
                 },
                 "required": ["cid"]
+            }
+        }));
+        tools.push(json!({
+            "name": "ubl.receipt.trace",
+            "description": "Fetch receipt trace metadata by receipt CID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cid": { "type": "string", "description": "Receipt CID" }
+                },
+                "required": ["cid"]
+            }
+        }));
+        tools.push(json!({
+            "name": "ubl.cid",
+            "description": "Compute CID from canonical NRF-1 bytes for a JSON value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "value": { "type": "object", "description": "JSON value to canonicalize and hash" }
+                }
+            }
+        }));
+        tools.push(json!({
+            "name": "ubl.rb.execute",
+            "description": "Execute RB-VM bytecode and return deterministic execution outcome.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "bytecode_hex": { "type": "string", "description": "TLV bytecode as hex string" },
+                    "fuel_limit": { "type": "integer", "description": "Optional VM fuel limit" }
+                },
+                "required": ["bytecode_hex"]
             }
         }));
 

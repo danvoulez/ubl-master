@@ -57,6 +57,16 @@ enum AuditTransitionOutcome {
     Advisory(AuditAdvisoryOutcome),
 }
 
+#[derive(Debug, Clone)]
+struct SiliconCompileOutcome {
+    chip_cid: String,
+    target: String,
+    circuit_count: usize,
+    bit_count: usize,
+    bytecode_len: usize,
+    bytecode_cid: String,
+}
+
 impl UblPipeline {
     /// Stage 3: TR - Transition (RB-VM execution)
     pub(in crate::pipeline) async fn stage_transition(
@@ -106,7 +116,8 @@ impl UblPipeline {
             .map_err(|e| PipelineError::Internal(format!("TR bytecode decode: {}", e)))?;
 
         // Execute VM
-        let mut vm = Vm::new(cfg, cas, &signer, canon, vec![input_cid.clone()]);
+        let mut vm = Vm::new(cfg, cas, &signer, canon, vec![input_cid.clone()])
+            .with_body_size(chip_nrf.len());
         let outcome = vm.run(&instructions).map_err(|e| match e {
             ExecError::FuelExhausted => PipelineError::FuelExhausted(format!(
                 "VM fuel exhausted (limit: {})",
@@ -185,6 +196,20 @@ impl UblPipeline {
             Some(
                 derive_material(&rotate_req, request.body(), &signing_seed)
                     .map_err(|e| PipelineError::Internal(format!("Key rotation: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let silicon_compile = if request.chip_type == crate::silicon_chip::TYPE_SILICON_COMPILE {
+            Some(
+                self.execute_silicon_compile_transition(
+                    request,
+                    &input_cid_str,
+                    outcome.fuel_used,
+                    &check.trace,
+                )
+                .await?,
             )
         } else {
             None
@@ -398,6 +423,19 @@ impl UblPipeline {
                 "new_did": rotation.new_did,
                 "new_kid": rotation.new_kid,
                 "new_key_cid": rotation.new_key_cid,
+            });
+        }
+        if let Some(ref compile) = silicon_compile {
+            tr_body["artifacts"] = serde_json::json!({
+                "bytecode": compile.bytecode_cid,
+            });
+            tr_body["silicon_compile"] = serde_json::json!({
+                "chip_cid": compile.chip_cid,
+                "target": compile.target,
+                "circuit_count": compile.circuit_count,
+                "bit_count": compile.bit_count,
+                "bytecode_len": compile.bytecode_len,
+                "bytecode_cid": compile.bytecode_cid,
             });
         }
 
@@ -1132,6 +1170,105 @@ impl UblPipeline {
             advisory_markdown_cid,
             advisory_json_cid,
             input_count,
+        })
+    }
+
+    async fn execute_silicon_compile_transition(
+        &self,
+        request: &ParsedChipRequest<'_>,
+        _input_cid: &str,
+        fuel_used: u64,
+        policy_trace: &[PolicyTraceEntry],
+    ) -> Result<SiliconCompileOutcome, PipelineError> {
+        use crate::silicon_chip::{
+            compile_chip_to_rb_vm, parse_silicon, resolve_chip_graph, SiliconRequest,
+        };
+
+        let compile = match parse_silicon(request.chip_type, request.body())
+            .map_err(|e| PipelineError::InvalidChip(format!("silicon.compile parse: {}", e)))?
+        {
+            SiliconRequest::Compile(c) => c,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "silicon.compile transition received non-compile request".to_string(),
+                ));
+            }
+        };
+
+        let store = self.chip_store.as_ref().ok_or_else(|| {
+            PipelineError::StorageError("ubl/silicon.compile requires ChipStore".to_string())
+        })?;
+
+        // Load the silicon.chip from ChipStore.
+        let chip_stored = store
+            .get_chip(&compile.chip_cid)
+            .await
+            .map_err(|e| PipelineError::StorageError(format!("silicon.compile chip lookup: {}", e)))?
+            .ok_or_else(|| {
+                PipelineError::InvalidChip(format!(
+                    "silicon.compile chip_cid not found: {}",
+                    compile.chip_cid
+                ))
+            })?;
+
+        let chip_body =
+            crate::silicon_chip::parse_silicon(crate::silicon_chip::TYPE_SILICON_CHIP, &chip_stored.chip_data)
+                .map_err(|e| PipelineError::InvalidChip(format!("silicon.compile chip parse: {}", e)))?;
+        let chip_body = match chip_body {
+            SiliconRequest::Chip(c) => c,
+            _ => {
+                return Err(PipelineError::InvalidChip(
+                    "chip_cid does not point to a ubl/silicon.chip".to_string(),
+                ));
+            }
+        };
+
+        // Resolve full circuit graph (chip → circuits → bits).
+        let circuits = resolve_chip_graph(&chip_body, store)
+            .await
+            .map_err(|e| PipelineError::Internal(format!("silicon.compile graph resolve: {}", e)))?;
+
+        let circuit_count = circuits.len();
+        let bit_count: usize = circuits.iter().map(|c| c.nodes.len()).sum();
+
+        // Compile to TLV bytecode.
+        let bytecode = compile_chip_to_rb_vm(&circuits)
+            .map_err(|e| PipelineError::InvalidChip(format!("silicon.compile: {}", e)))?;
+        let bytecode_len = bytecode.len();
+
+        // Store bytecode artifact in ChipStore.
+        let bytecode_b3 = format!(
+            "b3:{}",
+            hex::encode(blake3::hash(&bytecode).as_bytes())
+        );
+        let bytecode_artifact = serde_json::json!({
+            "@type": "ubl/silicon.bytecode.v1",
+            "@world": request.world,
+            "chip_cid": compile.chip_cid,
+            "target": compile.target.as_str(),
+            "bytecode_hex": hex::encode(&bytecode),
+            "bytecode_len": bytecode_len,
+            "bytecode_b3": bytecode_b3,
+            "circuit_count": circuit_count,
+            "bit_count": bit_count,
+        });
+        let bytecode_cid = self
+            .store_audit_artifact(
+                store,
+                bytecode_artifact,
+                fuel_used,
+                policy_trace,
+                "silicon/compile-tr/0.1",
+            )
+            .await?;
+
+        Ok(SiliconCompileOutcome {
+            chip_cid: compile.chip_cid,
+            target: compile.target.as_str().to_string(),
+            circuit_count,
+            bit_count,
+            bytecode_len,
+            bytecode_cid,
         })
     }
 

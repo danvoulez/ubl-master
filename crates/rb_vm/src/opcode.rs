@@ -34,6 +34,17 @@ pub enum Opcode {
     NumWithUnit = 0x1F,       // payload: utf8 unit; pop num -> push num
     NumAssertUnit = 0x20,     // payload: utf8 unit; pop num -> push same num
     NumCompare = 0x21,        // pop b,a (num) -> push int/1 as num
+
+    // ── Phase 2: string comparison + bool-stack composition ─────────────────
+    JsonGetKeyBytes = 0x22,   // payload: utf-8 key; pop Json -> push Bytes (string value)
+    JsonHasKey = 0x23,        // payload: utf-8 key; pop Json -> push Bool (key exists)
+    EqBytes = 0x24,           // pop b,a (Bytes) -> push Bool(a == b)
+    PushBodySize = 0x25,      // push I64(vm.body_size)
+    PushBool = 0x26,          // payload: 1 byte (0=false, 1=true); push Bool
+    BoolNot = 0x27,           // pop Bool -> push !Bool
+    BoolOr = 0x28,            // pop b,a (Bool) -> push Bool(a || b)
+    BoolAnd = 0x29,           // pop b,a (Bool) -> push Bool(a && b)
+    BoolToI64 = 0x2A,         // pop Bool -> push I64(1 or 0)
 }
 
 impl TryFrom<u8> for Opcode {
@@ -74,6 +85,15 @@ impl TryFrom<u8> for Opcode {
             0x1F => NumWithUnit,
             0x20 => NumAssertUnit,
             0x21 => NumCompare,
+            0x22 => JsonGetKeyBytes,
+            0x23 => JsonHasKey,
+            0x24 => EqBytes,
+            0x25 => PushBodySize,
+            0x26 => PushBool,
+            0x27 => BoolNot,
+            0x28 => BoolOr,
+            0x29 => BoolAnd,
+            0x2A => BoolToI64,
             _ => return Err(()),
         })
     }

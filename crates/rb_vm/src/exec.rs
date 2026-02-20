@@ -62,6 +62,8 @@ pub struct Vm<'a, C: CasProvider, S: SignProvider, K: CanonProvider> {
     rc_body: serde_json::Value,
     proofs: Vec<Cid>,
     trace: Vec<TraceStep>,
+    /// Body size in bytes — exposed to bytecode via PushBodySize (0x25).
+    body_size: usize,
 }
 
 #[derive(Debug)]
@@ -88,7 +90,15 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
             rc_body: json!({}),
             proofs: Vec::new(),
             trace: Vec::new(),
+            body_size: 0,
         }
+    }
+
+    /// Set the body size (bytes of the chip's NRF-1 representation).
+    /// Exposed to bytecode via `PushBodySize` (0x25). Call before `run()`.
+    pub fn with_body_size(mut self, size: usize) -> Self {
+        self.body_size = size;
+        self
     }
 
     fn charge(&mut self, units: Fuel) -> Result<(), ExecError> {
@@ -427,6 +437,116 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         .map_err(|e| ExecError::Deny(format!("num_compare: {}", e)))?;
                     self.push(Value::Num(result));
                 }
+
+                // ── Phase 2: string comparison + bool-stack composition ──────────
+
+                // JsonGetKeyBytes: Pop Json, extract key as UTF-8 string → push Bytes.
+                // Deny if key is missing or not a string value.
+                Opcode::JsonGetKeyBytes => {
+                    let key = std::str::from_utf8(ins.payload)
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::JsonGetKeyBytes))?;
+                    let v = match self.pop()? {
+                        Value::Json(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::JsonGetKeyBytes)),
+                    };
+                    let s = v
+                        .get(key)
+                        .and_then(|val| val.as_str())
+                        .ok_or_else(|| {
+                            ExecError::Deny(format!("json_key_missing_or_not_string: {}", key))
+                        })?;
+                    self.push(Value::Bytes(s.as_bytes().to_vec()));
+                }
+
+                // JsonHasKey: Pop Json → push Bool(key exists and is non-null).
+                Opcode::JsonHasKey => {
+                    let key = std::str::from_utf8(ins.payload)
+                        .map_err(|_| ExecError::InvalidPayload(Opcode::JsonHasKey))?;
+                    let v = match self.pop()? {
+                        Value::Json(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::JsonHasKey)),
+                    };
+                    let exists = v
+                        .get(key)
+                        .map(|val| !val.is_null())
+                        .unwrap_or(false);
+                    self.push(Value::Bool(exists));
+                }
+
+                // EqBytes: Pop Bytes b, Bytes a → push Bool(a == b).
+                // Also accepts Cid on either side (compared as strings).
+                Opcode::EqBytes => {
+                    let b = match self.pop()? {
+                        Value::Bytes(v) => v,
+                        Value::Cid(c) => c.0.into_bytes(),
+                        _ => return Err(ExecError::TypeMismatch(Opcode::EqBytes)),
+                    };
+                    let a = match self.pop()? {
+                        Value::Bytes(v) => v,
+                        Value::Cid(c) => c.0.into_bytes(),
+                        _ => return Err(ExecError::TypeMismatch(Opcode::EqBytes)),
+                    };
+                    self.push(Value::Bool(a == b));
+                }
+
+                // PushBodySize: Push I64(vm.body_size) — the NRF-1 byte count of the chip body.
+                Opcode::PushBodySize => {
+                    self.push(Value::I64(self.body_size as i64));
+                }
+
+                // PushBool: Push Bool constant. Payload: 1 byte (0=false, anything else=true).
+                Opcode::PushBool => {
+                    if ins.payload.len() != 1 {
+                        return Err(ExecError::InvalidPayload(Opcode::PushBool));
+                    }
+                    self.push(Value::Bool(ins.payload[0] != 0));
+                }
+
+                // BoolNot: Pop Bool → push !Bool.
+                Opcode::BoolNot => {
+                    let b = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolNot)),
+                    };
+                    self.push(Value::Bool(!b));
+                }
+
+                // BoolOr: Pop b, a (Bool) → push Bool(a || b).
+                Opcode::BoolOr => {
+                    let b = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolOr)),
+                    };
+                    let a = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolOr)),
+                    };
+                    self.push(Value::Bool(a || b));
+                }
+
+                // BoolAnd: Pop b, a (Bool) → push Bool(a && b).
+                Opcode::BoolAnd => {
+                    let b = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolAnd)),
+                    };
+                    let a = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolAnd)),
+                    };
+                    self.push(Value::Bool(a && b));
+                }
+
+                // BoolToI64: Pop Bool → push I64(1 if true, 0 if false).
+                // Used for KofN: sum n bools with AddI64, then CmpI64(GE, k).
+                Opcode::BoolToI64 => {
+                    let b = match self.pop()? {
+                        Value::Bool(v) => v,
+                        _ => return Err(ExecError::TypeMismatch(Opcode::BoolToI64)),
+                    };
+                    self.push(Value::I64(if b { 1 } else { 0 }));
+                }
+
                 Opcode::EmitRc => {
                     if self.cfg.trace {
                         self.trace.push(TraceStep {

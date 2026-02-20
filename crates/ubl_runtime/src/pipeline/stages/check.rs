@@ -94,6 +94,78 @@ impl UblPipeline {
             })?;
         }
 
+        // ── Silicon chips: bit / circuit / chip / compile ────────────────────────
+        if crate::silicon_chip::is_silicon_type(request.chip_type) {
+            crate::silicon_chip::validate_for_check(
+                request.chip_type,
+                request.body(),
+                self.chip_store.as_deref(),
+            )
+            .await
+            .map_err(|e| match e {
+                crate::silicon_chip::SiliconError::ChipStore(_) => {
+                    PipelineError::Internal(format!("Silicon validation store: {}", e))
+                }
+                _ => PipelineError::InvalidChip(format!("Silicon validation: {}", e)),
+            })?;
+        }
+
+        // ── @silicon_gate: live silicon enforcement ───────────────────────────────
+        // Any chip body may declare "@silicon_gate": "<ubl/silicon.chip CID>".
+        // The gate's compiled bytecode runs (ghost mode) against the incoming
+        // chip body.  ExecError::Deny → reject here before any TR execution.
+        if let Some(gate_cid) = request.body().get("@silicon_gate").and_then(|v| v.as_str()) {
+            if let Some(ref store) = self.chip_store {
+                let gate_start = std::time::Instant::now();
+
+                let bytecode = crate::silicon_chip::gate_compile(gate_cid, store)
+                    .await
+                    .map_err(|e| {
+                        PipelineError::InvalidChip(format!("@silicon_gate compile: {}", e))
+                    })?;
+
+                let instructions = tlv::decode_stream(&bytecode).map_err(|e| {
+                    PipelineError::Internal(format!("@silicon_gate decode: {}", e))
+                })?;
+
+                // NRF-encode the incoming chip body as the VM's input #0.
+                let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(request.body()).map_err(|e| {
+                    PipelineError::Internal(format!("@silicon_gate nrf: {}", e))
+                })?;
+
+                let mut cas = PipelineCas::new();
+                let input_cid = cas.put(&chip_nrf);
+                let signer = PipelineSigner {
+                    signing_key: self.signing_key.clone(),
+                    kid: self.kid.clone(),
+                };
+                let cfg = VmConfig {
+                    fuel_limit: self.fuel_limit,
+                    ghost: true,
+                    trace: false,
+                };
+                let mut vm = Vm::new(cfg, cas, &signer, PipelineCanon, vec![input_cid])
+                    .with_body_size(chip_nrf.len());
+
+                if let Err(ExecError::Deny(reason)) = vm.run(&instructions) {
+                    let gate_ms = gate_start.elapsed().as_millis() as i64;
+                    return Ok(CheckResult {
+                        decision: Decision::Deny,
+                        reason: format!("@silicon_gate '{}' denied: {}", gate_cid, reason),
+                        short_circuited: true,
+                        trace: vec![PolicyTraceEntry {
+                            level: "silicon_gate".to_string(),
+                            policy_id: format!("silicon_gate:{}", gate_cid),
+                            result: Decision::Deny,
+                            reason: format!("silicon gate denied: {}", reason),
+                            rb_results: vec![],
+                            duration_ms: gate_ms,
+                        }],
+                    });
+                }
+            }
+        }
+
         // Convert to policy request
         let policy_request = PolicyChipRequest {
             chip_type: request.chip_type.to_string(),

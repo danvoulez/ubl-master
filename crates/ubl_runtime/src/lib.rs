@@ -28,6 +28,7 @@ pub mod policy_lock;
 pub mod rate_limit;
 pub mod reasoning_bit;
 pub mod rich_url;
+pub mod silicon_chip;
 pub mod runtime_cert;
 pub mod transition_registry;
 pub mod wasm_adapter;
@@ -46,6 +47,11 @@ pub use auth::{
     TenantCircle, UserIdentity, WorldScope, ONBOARDING_TYPES,
 };
 pub use runtime_cert::SelfAttestation;
+pub use silicon_chip::{
+    is_silicon_type, CompileTarget, ConditionSpec, HalProfile, SiliconBitBody, SiliconChipBody,
+    SiliconCircuitBody, SiliconCompileBody, SiliconError, SiliconRequest, SILICON_TYPES,
+    TYPE_SILICON_BIT, TYPE_SILICON_CHIP, TYPE_SILICON_CIRCUIT, TYPE_SILICON_COMPILE,
+};
 pub use ubl_receipt::{PolicyTraceEntry, RbResult, WaReceiptBody, WfReceiptBody};
 pub use wasm_adapter::{
     AdapterRegistration, AdapterRegistry, SandboxConfig, WasmExecutor, WasmtimeExecutor,

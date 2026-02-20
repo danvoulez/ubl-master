@@ -7,7 +7,10 @@ use askama::Template;
 use async_stream::stream;
 use axum::{
     body::Bytes,
-    extract::{Form, Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Form, Path, Query, State,
+    },
     http::{header, HeaderMap, StatusCode},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
     response::{Html, IntoResponse, Response},
@@ -16,9 +19,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ubl_chipstore::{ChipStore, SledBackend};
@@ -45,8 +49,68 @@ struct AppState {
     advisory_engine: Arc<AdvisoryEngine>,
     http_client: reqwest::Client,
     canon_rate_limiter: Option<Arc<CanonRateLimiter>>,
+    mcp_token_rate_limiter: Arc<McpTokenRateLimiter>,
     durable_store: Option<Arc<DurableStore>>,
     event_store: Option<Arc<EventStore>>,
+}
+
+#[derive(Clone)]
+struct McpTokenRateLimiter {
+    per_minute: usize,
+    buckets: Arc<tokio::sync::RwLock<HashMap<String, VecDeque<Instant>>>>,
+}
+
+impl McpTokenRateLimiter {
+    fn from_env() -> Self {
+        let per_minute = std::env::var("UBL_MCP_TOKEN_RPM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(120)
+            .max(1);
+        Self {
+            per_minute,
+            buckets: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns retry-after seconds when limited.
+    async fn check(&self, token_id: &str) -> Option<u64> {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut buckets = self.buckets.write().await;
+        let bucket = buckets
+            .entry(token_id.to_string())
+            .or_insert_with(VecDeque::new);
+
+        while bucket
+            .front()
+            .is_some_and(|ts| now.duration_since(*ts) >= window)
+        {
+            bucket.pop_front();
+        }
+
+        if bucket.len() >= self.per_minute {
+            let retry_after = bucket
+                .front()
+                .map(|oldest| {
+                    let elapsed = now.duration_since(*oldest);
+                    window.saturating_sub(elapsed).as_secs().saturating_add(1)
+                })
+                .unwrap_or(1);
+            return Some(retry_after);
+        }
+
+        bucket.push_back(now);
+        None
+    }
+}
+
+#[derive(Clone)]
+struct McpWsAuth {
+    token_id: String,
+    token_cid: String,
+    world: String,
+    scope: Vec<String>,
 }
 
 fn outbox_endpoint_from_env() -> Option<String> {
@@ -251,6 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let manifest = Arc::new(GateManifest::default());
+    let mcp_token_rate_limiter = Arc::new(McpTokenRateLimiter::from_env());
 
     let state = AppState {
         pipeline,
@@ -261,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .timeout(Duration::from_secs(10))
             .build()?,
         canon_rate_limiter: load_canon_rate_limiter(),
+        mcp_token_rate_limiter,
         durable_store,
         event_store,
     };
@@ -2976,6 +3042,7 @@ fn build_router(state: AppState) -> Router {
         .route("/mcp/manifest", get(mcp_manifest))
         .route("/.well-known/webmcp.json", get(webmcp_manifest))
         .route("/mcp/rpc", post(mcp_rpc))
+        .route("/mcp/ws", get(mcp_ws_upgrade))
         .with_state(state)
 }
 
@@ -3649,6 +3716,30 @@ async fn mcp_rpc(
     State(state): State<AppState>,
     Json(rpc): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let (status, payload) = handle_mcp_rpc_request(&state, rpc, None).await;
+    (status, Json(payload))
+}
+
+fn mcp_error_value(id: Value, code: i32, message: impl Into<String>, data: Option<Value>) -> Value {
+    let mut err = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        }
+    });
+    if let Some(data) = data {
+        err["error"]["data"] = data;
+    }
+    err
+}
+
+async fn handle_mcp_rpc_request(
+    state: &AppState,
+    rpc: Value,
+    ws_auth: Option<&McpWsAuth>,
+) -> (StatusCode, Value) {
     let id = rpc.get("id").cloned().unwrap_or(json!(null));
     let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = rpc.get("params").cloned().unwrap_or(json!({}));
@@ -3656,10 +3747,12 @@ async fn mcp_rpc(
     if rpc.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": { "code": -32600, "message": "Invalid Request: missing jsonrpc 2.0" }
-            })),
+            mcp_error_value(
+                id,
+                -32600,
+                "Invalid Request: missing jsonrpc 2.0",
+                None,
+            ),
         );
     }
 
@@ -3668,37 +3761,366 @@ async fn mcp_rpc(
             let manifest = state.manifest.to_mcp_manifest();
             (
                 StatusCode::OK,
-                Json(json!({
+                json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": { "tools": manifest["tools"] }
-                })),
+                }),
             )
         }
 
         "tools/call" => {
+            if let Some(auth) = ws_auth {
+                if let Some(retry_after) = state
+                    .mcp_token_rate_limiter
+                    .check(&auth.token_id)
+                    .await
+                {
+                    return (
+                        StatusCode::OK,
+                        mcp_error_value(
+                            id,
+                            -32006,
+                            format!("Rate limit exceeded for token; retry in {}s", retry_after),
+                            Some(json!({ "retry_after_seconds": retry_after })),
+                        ),
+                    );
+                }
+            }
+
             let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            dispatch_tool_call(&state, tool_name, &arguments, id).await
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                dispatch_tool_call(state, tool_name, &arguments, id.clone()),
+            )
+            .await
+            {
+                Ok((status, Json(payload))) => (status, payload),
+                Err(_) => (
+                    StatusCode::OK,
+                    mcp_error_value(
+                        id,
+                        -32000,
+                        "Tool call timed out (30s limit)",
+                        Some(json!({ "timeout_seconds": 30 })),
+                    ),
+                ),
+            }
         }
 
         _ => (
             StatusCode::OK,
-            Json(json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": { "code": -32601, "message": format!("Method not found: {}", method) }
-            })),
+            mcp_error_value(id, -32601, format!("Method not found: {}", method), None),
         ),
     }
 }
 
+fn parse_bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = auth.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+        return None;
+    }
+    Some(token.trim().to_string())
+}
+
+async fn validate_mcp_ws_bearer(state: &AppState, headers: &HeaderMap) -> Result<McpWsAuth, Response> {
+    let Some(token_id) = parse_bearer_token(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "UNAUTHORIZED",
+                "message": "missing Authorization: Bearer <token>"
+            })),
+        )
+            .into_response());
+    };
+
+    let token_query = ubl_chipstore::ChipQuery {
+        chip_type: Some("ubl/token".to_string()),
+        tags: vec![format!("id:{}", token_id)],
+        created_after: None,
+        created_before: None,
+        executor_did: None,
+        limit: Some(10),
+        offset: None,
+    };
+    let token_result = state.chip_store.query(&token_query).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "@type": "ubl/error",
+                "code": "INTERNAL_ERROR",
+                "message": format!("token query failed: {}", e)
+            })),
+        )
+            .into_response()
+    })?;
+
+    let Some(token_chip) = token_result.chips.into_iter().find(|chip| {
+        chip.chip_data.get("@id").and_then(|v| v.as_str()) == Some(token_id.as_str())
+    }) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"UNAUTHORIZED",
+                "message":"token not found"
+            })),
+        )
+            .into_response());
+    };
+
+    let session = ubl_runtime::SessionToken::from_chip_body(&token_chip.chip_data).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"UNAUTHORIZED",
+                "message": format!("invalid token chip: {}", e)
+            })),
+        )
+            .into_response()
+    })?;
+
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&session.expires_at)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"UNAUTHORIZED",
+                    "message": format!("invalid token expiry: {}", e)
+                })),
+            )
+                .into_response()
+        })?;
+    if expires_at <= chrono::Utc::now() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"UNAUTHORIZED",
+                "message":"token expired"
+            })),
+        )
+            .into_response());
+    }
+
+    if !(session.has_scope("*")
+        || session.has_scope("mcp")
+        || session.has_scope("read")
+        || session.has_scope("write"))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"POLICY_DENIED",
+                "message":"token scope does not allow MCP access"
+            })),
+        )
+            .into_response());
+    }
+
+    let revoke_query = ubl_chipstore::ChipQuery {
+        chip_type: Some("ubl/revoke".to_string()),
+        tags: vec![format!("target_cid:{}", token_chip.cid.as_str())],
+        created_after: None,
+        created_before: None,
+        executor_did: None,
+        limit: Some(1),
+        offset: None,
+    };
+    let revoked = state
+        .chip_store
+        .query(&revoke_query)
+        .await
+        .map(|r| r.total_count > 0)
+        .unwrap_or(false);
+    if revoked {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "@type":"ubl/error",
+                "code":"UNAUTHORIZED",
+                "message":"token revoked"
+            })),
+        )
+            .into_response());
+    }
+
+    Ok(McpWsAuth {
+        token_id,
+        token_cid: token_chip.cid.as_str().to_string(),
+        world: token_chip
+            .chip_data
+            .get("@world")
+            .and_then(|v| v.as_str())
+            .unwrap_or("a/system")
+            .to_string(),
+        scope: session.scope,
+    })
+}
+
+async fn mcp_ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match validate_mcp_ws_bearer(&state, &headers).await {
+        Ok(auth) => auth,
+        Err(resp) => return resp,
+    };
+
+    ws.on_upgrade(move |socket| mcp_ws_session(socket, state, auth))
+        .into_response()
+}
+
+async fn mcp_ws_session(mut socket: WebSocket, state: AppState, auth: McpWsAuth) {
+    info!(
+        token_id = %auth.token_id,
+        token_cid = %auth.token_cid,
+        world = %auth.world,
+        scope_count = auth.scope.len(),
+        "mcp/ws session started"
+    );
+    while let Some(next) = socket.recv().await {
+        let msg = match next {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "mcp/ws receive failed");
+                break;
+            }
+        };
+
+        match msg {
+            Message::Text(text) => {
+                let rpc: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = mcp_error_value(
+                            json!(null),
+                            -32700,
+                            format!("Parse error: {}", e),
+                            None,
+                        );
+                        let _ = socket.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+                let (_status, payload) = handle_mcp_rpc_request(&state, rpc, Some(&auth)).await;
+                if socket
+                    .send(Message::Text(payload.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Binary(bytes) => {
+                let text = match String::from_utf8(bytes.to_vec()) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        let err = mcp_error_value(
+                            json!(null),
+                            -32700,
+                            "Parse error: binary payload must be UTF-8 JSON-RPC text",
+                            None,
+                        );
+                        let _ = socket.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+                let rpc: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = mcp_error_value(
+                            json!(null),
+                            -32700,
+                            format!("Parse error: {}", e),
+                            None,
+                        );
+                        let _ = socket.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+                let (_status, payload) = handle_mcp_rpc_request(&state, rpc, Some(&auth)).await;
+                if socket
+                    .send(Message::Text(payload.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => break,
+        }
+    }
+    info!(token_id = %auth.token_id, "mcp/ws session ended");
+}
+
 /// Dispatch an MCP tools/call to the appropriate handler.
+#[derive(Default)]
+struct McpRbCas {
+    store: HashMap<String, Vec<u8>>,
+}
+
+impl rb_vm::CasProvider for McpRbCas {
+    fn put(&mut self, bytes: &[u8]) -> rb_vm::Cid {
+        let hash = blake3::hash(bytes);
+        let cid = format!("b3:{}", hex::encode(hash.as_bytes()));
+        self.store.insert(cid.clone(), bytes.to_vec());
+        rb_vm::Cid(cid)
+    }
+
+    fn get(&self, cid: &rb_vm::Cid) -> Option<Vec<u8>> {
+        self.store.get(&cid.0).cloned()
+    }
+}
+
+struct McpRbSigner;
+
+impl rb_vm::SignProvider for McpRbSigner {
+    fn sign_jws(&self, _payload_nrf_bytes: &[u8]) -> Vec<u8> {
+        vec![0_u8; 64]
+    }
+
+    fn kid(&self) -> String {
+        "did:key:zMcpWs#rb".to_string()
+    }
+}
+
+struct McpRbCanon;
+
+impl rb_vm::canon::CanonProvider for McpRbCanon {
+    fn canon(&self, v: serde_json::Value) -> serde_json::Value {
+        rb_vm::RhoCanon.canon(v)
+    }
+}
+
 async fn dispatch_tool_call(
     state: &AppState,
     tool_name: &str,
     arguments: &Value,
     id: Value,
 ) -> (StatusCode, Json<Value>) {
-    match tool_name {
+    let canonical_tool = match tool_name {
+        "ubl.chip.submit" => "ubl.deliver",
+        "ubl.chip.get" => "ubl.query",
+        "ubl.chip.verify" => "ubl.verify",
+        other => other,
+    };
+
+    match canonical_tool {
         "ubl.deliver" => {
             let chip = arguments.get("chip").cloned().unwrap_or(json!({}));
             let bytes = serde_json::to_vec(&chip).unwrap_or_default();
@@ -3854,6 +4276,211 @@ async fn dispatch_tool_call(
                         "jsonrpc": "2.0", "id": id,
                         "error": { "code": -32603, "message": e.to_string() }
                     })),
+                ),
+            }
+        }
+
+        "ubl.receipt.trace" => {
+            let cid = arguments.get("cid").and_then(|v| v.as_str()).unwrap_or("");
+            if cid.is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(mcp_error_value(
+                        id,
+                        -32602,
+                        "missing required argument: cid",
+                        None,
+                    )),
+                );
+            }
+
+            if let Some(store) = state.durable_store.as_ref() {
+                match store.get_receipt(cid) {
+                    Ok(Some(receipt_json)) => {
+                        if let Err(ubl_err) = verify_receipt_auth_chain(cid, &receipt_json) {
+                            return (
+                                StatusCode::OK,
+                                Json(mcp_error_value(
+                                    id,
+                                    ubl_err.code.mcp_code(),
+                                    ubl_err.message,
+                                    Some(ubl_err.to_json()),
+                                )),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        return (
+                            StatusCode::OK,
+                            Json(mcp_error_value(
+                                id,
+                                -32004,
+                                format!("Receipt {} not found", cid),
+                                None,
+                            )),
+                        );
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::OK,
+                            Json(mcp_error_value(
+                                id,
+                                -32603,
+                                format!("Receipt fetch failed: {}", e),
+                                None,
+                            )),
+                        );
+                    }
+                }
+            }
+
+            match state.chip_store.get_chip_by_receipt_cid(cid).await {
+                Ok(Some(chip)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": serde_json::to_string(&json!({
+                            "receipt_cid": cid,
+                            "chip_cid": chip.cid,
+                            "chip_type": chip.chip_type,
+                            "execution_metadata": chip.execution_metadata,
+                        })).unwrap_or_default() }] }
+                    })),
+                ),
+                Ok(None) => (
+                    StatusCode::OK,
+                    Json(mcp_error_value(
+                        id,
+                        -32004,
+                        format!("Receipt {} not found", cid),
+                        None,
+                    )),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(mcp_error_value(id, -32603, e.to_string(), None)),
+                ),
+            }
+        }
+
+        "ubl.cid" => {
+            let payload = arguments
+                .get("value")
+                .or_else(|| arguments.get("json"))
+                .or_else(|| arguments.get("chip"))
+                .cloned()
+                .unwrap_or(json!({}));
+            match ubl_ai_nrf1::to_nrf1_bytes(&payload)
+                .and_then(|bytes| ubl_ai_nrf1::compute_cid(&bytes))
+            {
+                Ok(cid) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc":"2.0", "id": id,
+                        "result": { "content": [{ "type":"text", "text": serde_json::to_string(&json!({
+                            "cid": cid
+                        })).unwrap_or_default() }]}
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(mcp_error_value(
+                        id,
+                        -32602,
+                        format!("CID compute failed: {}", e),
+                        None,
+                    )),
+                ),
+            }
+        }
+
+        "ubl.rb.execute" => {
+            let bytecode_hex = arguments
+                .get("bytecode_hex")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if bytecode_hex.is_empty() {
+                return (
+                    StatusCode::OK,
+                    Json(mcp_error_value(
+                        id,
+                        -32602,
+                        "missing required argument: bytecode_hex",
+                        None,
+                    )),
+                );
+            }
+
+            let fuel_limit = arguments
+                .get("fuel_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1_000_000)
+                .max(1);
+            let bytecode = match hex::decode(bytecode_hex) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        StatusCode::OK,
+                        Json(mcp_error_value(
+                            id,
+                            -32602,
+                            format!("invalid bytecode_hex: {}", e),
+                            None,
+                        )),
+                    );
+                }
+            };
+            let instructions = match rb_vm::tlv::decode_stream(&bytecode) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        StatusCode::OK,
+                        Json(mcp_error_value(
+                            id,
+                            -32602,
+                            format!("invalid bytecode stream: {}", e),
+                            None,
+                        )),
+                    );
+                }
+            };
+
+            let signer = McpRbSigner;
+            let mut vm = rb_vm::Vm::new(
+                rb_vm::VmConfig {
+                    fuel_limit,
+                    ghost: false,
+                    trace: true,
+                },
+                McpRbCas::default(),
+                &signer,
+                McpRbCanon,
+                vec![],
+            );
+
+            match vm.run(&instructions) {
+                Ok(outcome) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "jsonrpc":"2.0", "id": id,
+                        "result": { "content": [{ "type":"text", "text": serde_json::to_string(&json!({
+                            "rc_cid": outcome.rc_cid.map(|c| c.0),
+                            "rc_sig": outcome.rc_sig,
+                            "rc_payload_cid": outcome.rc_payload_cid.map(|c| c.0),
+                            "steps": outcome.steps,
+                            "fuel_used": outcome.fuel_used,
+                            "trace_len": outcome.trace.len(),
+                        })).unwrap_or_default() }]}
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(mcp_error_value(
+                        id,
+                        -32602,
+                        format!("rb execute failed: {}", e),
+                        None,
+                    )),
                 ),
             }
         }
@@ -4032,6 +4659,7 @@ mod tests {
             advisory_engine,
             http_client: reqwest::Client::new(),
             canon_rate_limiter: canon_limiter,
+            mcp_token_rate_limiter: Arc::new(McpTokenRateLimiter::from_env()),
             durable_store: None,
             event_store: None,
         }

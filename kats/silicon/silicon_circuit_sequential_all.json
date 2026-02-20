@@ -1,0 +1,16 @@
+{
+  "@type": "ubl/silicon.circuit",
+  "@ver": "1.0",
+  "@world": "a/lab/t/dev",
+  "id": "C_AuthGate",
+  "name": "Auth Gate — Admin + Size Check",
+  "bits": ["b3:<replace-with-P_IsAdmin-cid>", "b3:<replace-with-P_SizeCheck-cid>"],
+  "composition": "Sequential",
+  "aggregator": "All",
+  "_kat": {
+    "description": "Sequential/All circuit: both bits must allow. Short-circuits on first DENY. References silicon.bit CIDs.",
+    "expected_parse": "ok",
+    "expected_tr_profile": "silicon_definition_v1",
+    "note": "Replace b3:... placeholders with actual CIDs returned from posting the silicon.bit chips."
+  }
+}
