@@ -2,22 +2,22 @@
   "@type": "ubl/silicon.chip",
   "@ver": "1.0",
   "@world": "a/lab/t/dev",
-  "id": "CHIP_PaymentGate",
-  "name": "Payment Gate v1",
-  "circuits": ["b3:<replace-with-C_AuthGate-cid>"],
-  "hal": {
-    "profile": "HAL/v0/cpu",
-    "targets": ["rb_vm/v1"],
-    "deterministic": true,
-    "timebase_ns": 1,
-    "energy_unit": "J",
-    "cost_unit": "USD"
-  },
-  "version": "1.0",
   "_kat": {
     "description": "Full TDLN-chip definition. One circuit. HAL declares rb_vm/v1 as target. ~50KB text encodes the semantic equivalent of millions of silicon gates.",
     "expected_parse": "ok",
     "expected_tr_profile": "silicon_definition_v1",
     "note": "Replace b3:... with actual circuit CID. This chip CID is then referenced by silicon.compile."
-  }
+  },
+  "circuits": ["b3:<replace-with-C_AuthGate-cid>"],
+  "hal": {
+    "cost_unit": "USD",
+    "deterministic": true,
+    "energy_unit": "J",
+    "profile": "HAL/v0/cpu",
+    "targets": ["rb_vm/v1"],
+    "timebase_ns": 1
+  },
+  "id": "CHIP_PaymentGate",
+  "name": "Payment Gate v1",
+  "version": "1.0"
 }

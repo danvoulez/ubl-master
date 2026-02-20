@@ -36,20 +36,20 @@ pub enum Opcode {
     NumCompare = 0x21,        // pop b,a (num) -> push int/1 as num
 
     // ── Phase 2: string comparison + bool-stack composition ─────────────────
-    JsonGetKeyBytes = 0x22,   // payload: utf-8 key; pop Json -> push Bytes (string value)
-    JsonHasKey = 0x23,        // payload: utf-8 key; pop Json -> push Bool (key exists)
-    EqBytes = 0x24,           // pop b,a (Bytes) -> push Bool(a == b)
-    PushBodySize = 0x25,      // push I64(vm.body_size)
-    PushBool = 0x26,          // payload: 1 byte (0=false, 1=true); push Bool
-    BoolNot = 0x27,           // pop Bool -> push !Bool
-    BoolOr = 0x28,            // pop b,a (Bool) -> push Bool(a || b)
-    BoolAnd = 0x29,           // pop b,a (Bool) -> push Bool(a && b)
-    BoolToI64 = 0x2A,         // pop Bool -> push I64(1 or 0)
+    JsonGetKeyBytes = 0x22, // payload: utf-8 key; pop Json -> push Bytes (string value)
+    JsonHasKey = 0x23,      // payload: utf-8 key; pop Json -> push Bool (key exists)
+    EqBytes = 0x24,         // pop b,a (Bytes) -> push Bool(a == b)
+    PushBodySize = 0x25,    // push I64(vm.body_size)
+    PushBool = 0x26,        // payload: 1 byte (0=false, 1=true); push Bool
+    BoolNot = 0x27,         // pop Bool -> push !Bool
+    BoolOr = 0x28,          // pop b,a (Bool) -> push Bool(a || b)
+    BoolAnd = 0x29,         // pop b,a (Bool) -> push Bool(a && b)
+    BoolToI64 = 0x2A,       // pop Bool -> push I64(1 or 0)
 
     // ── Phase 3: arithmetic + temporal ──────────────────────────────────────
-    DivI64 = 0x2B,            // pop b,a (I64) -> push I64(a / b), saturating (div-by-zero → 0)
-    PushTimestamp = 0x2C,     // push I64(unix_secs_now) — wall-clock seconds since epoch
-    CmpTimestamp = 0x2D,      // payload: 1-byte cmp-op (same as CmpI64); pop I64 ts, push Bool
+    DivI64 = 0x2B, // pop b,a (I64) -> push I64(a / b), saturating (div-by-zero → 0)
+    PushTimestamp = 0x2C, // push I64(unix_secs_now) — wall-clock seconds since epoch
+    CmpTimestamp = 0x2D, // payload: 1-byte cmp-op (same as CmpI64); pop I64 ts, push Bool
 }
 
 impl TryFrom<u8> for Opcode {

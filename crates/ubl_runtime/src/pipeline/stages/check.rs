@@ -124,14 +124,12 @@ impl UblPipeline {
                         PipelineError::InvalidChip(format!("@silicon_gate compile: {}", e))
                     })?;
 
-                let instructions = tlv::decode_stream(&bytecode).map_err(|e| {
-                    PipelineError::Internal(format!("@silicon_gate decode: {}", e))
-                })?;
+                let instructions = tlv::decode_stream(&bytecode)
+                    .map_err(|e| PipelineError::Internal(format!("@silicon_gate decode: {}", e)))?;
 
                 // NRF-encode the incoming chip body as the VM's input #0.
-                let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(request.body()).map_err(|e| {
-                    PipelineError::Internal(format!("@silicon_gate nrf: {}", e))
-                })?;
+                let chip_nrf = ubl_ai_nrf1::to_nrf1_bytes(request.body())
+                    .map_err(|e| PipelineError::Internal(format!("@silicon_gate nrf: {}", e)))?;
 
                 let mut cas = PipelineCas::new();
                 let input_cid = cas.put(&chip_nrf);

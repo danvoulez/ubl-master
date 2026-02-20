@@ -2,16 +2,19 @@
   "@type": "ubl/silicon.bit",
   "@ver": "1.0",
   "@world": "a/lab/t/dev",
-  "id": "P_AlwaysAllow",
-  "name": "Always Allow",
-  "condition": {"op": "always", "value": true},
-  "on_true": "allow",
-  "on_false": "deny",
-  "requires_context": [],
   "_kat": {
     "description": "Simplest possible silicon bit — always allows. Semantic transistor in the ON state.",
+    "expected_cid_prefix": "b3:",
     "expected_parse": "ok",
-    "expected_tr_profile": "silicon_definition_v1",
-    "expected_cid_prefix": "b3:"
-  }
+    "expected_tr_profile": "silicon_definition_v1"
+  },
+  "condition": {
+    "op": "always",
+    "value": true
+  },
+  "id": "P_AlwaysAllow",
+  "name": "Always Allow",
+  "on_false": "deny",
+  "on_true": "allow",
+  "requires_context": []
 }

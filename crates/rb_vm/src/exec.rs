@@ -449,12 +449,9 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         Value::Json(v) => v,
                         _ => return Err(ExecError::TypeMismatch(Opcode::JsonGetKeyBytes)),
                     };
-                    let s = v
-                        .get(key)
-                        .and_then(|val| val.as_str())
-                        .ok_or_else(|| {
-                            ExecError::Deny(format!("json_key_missing_or_not_string: {}", key))
-                        })?;
+                    let s = v.get(key).and_then(|val| val.as_str()).ok_or_else(|| {
+                        ExecError::Deny(format!("json_key_missing_or_not_string: {}", key))
+                    })?;
                     self.push(Value::Bytes(s.as_bytes().to_vec()));
                 }
 
@@ -466,10 +463,7 @@ impl<'a, C: CasProvider, S: SignProvider, K: CanonProvider> Vm<'a, C, S, K> {
                         Value::Json(v) => v,
                         _ => return Err(ExecError::TypeMismatch(Opcode::JsonHasKey)),
                     };
-                    let exists = v
-                        .get(key)
-                        .map(|val| !val.is_null())
-                        .unwrap_or(false);
+                    let exists = v.get(key).map(|val| !val.is_null()).unwrap_or(false);
                     self.push(Value::Bool(exists));
                 }
 

@@ -3747,12 +3747,7 @@ async fn handle_mcp_rpc_request(
     if rpc.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
         return (
             StatusCode::BAD_REQUEST,
-            mcp_error_value(
-                id,
-                -32600,
-                "Invalid Request: missing jsonrpc 2.0",
-                None,
-            ),
+            mcp_error_value(id, -32600, "Invalid Request: missing jsonrpc 2.0", None),
         );
     }
 
@@ -3770,10 +3765,7 @@ async fn handle_mcp_rpc_request(
 
         "tools/call" => {
             if let Some(auth) = ws_auth {
-                if let Some(retry_after) = state
-                    .mcp_token_rate_limiter
-                    .check(&auth.token_id)
-                    .await
+                if let Some(retry_after) = state.mcp_token_rate_limiter.check(&auth.token_id).await
                 {
                     return (
                         StatusCode::OK,
@@ -3824,7 +3816,10 @@ fn parse_bearer_token(headers: &HeaderMap) -> Option<String> {
     Some(token.trim().to_string())
 }
 
-async fn validate_mcp_ws_bearer(state: &AppState, headers: &HeaderMap) -> Result<McpWsAuth, Response> {
+async fn validate_mcp_ws_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<McpWsAuth, Response> {
     let Some(token_id) = parse_bearer_token(headers) else {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -3858,9 +3853,11 @@ async fn validate_mcp_ws_bearer(state: &AppState, headers: &HeaderMap) -> Result
             .into_response()
     })?;
 
-    let Some(token_chip) = token_result.chips.into_iter().find(|chip| {
-        chip.chip_data.get("@id").and_then(|v| v.as_str()) == Some(token_id.as_str())
-    }) else {
+    let Some(token_chip) = token_result
+        .chips
+        .into_iter()
+        .find(|chip| chip.chip_data.get("@id").and_then(|v| v.as_str()) == Some(token_id.as_str()))
+    else {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({
@@ -3872,17 +3869,18 @@ async fn validate_mcp_ws_bearer(state: &AppState, headers: &HeaderMap) -> Result
             .into_response());
     };
 
-    let session = ubl_runtime::SessionToken::from_chip_body(&token_chip.chip_data).map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "@type":"ubl/error",
-                "code":"UNAUTHORIZED",
-                "message": format!("invalid token chip: {}", e)
-            })),
-        )
-            .into_response()
-    })?;
+    let session =
+        ubl_runtime::SessionToken::from_chip_body(&token_chip.chip_data).map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "@type":"ubl/error",
+                    "code":"UNAUTHORIZED",
+                    "message": format!("invalid token chip: {}", e)
+                })),
+            )
+                .into_response()
+        })?;
 
     let expires_at = chrono::DateTime::parse_from_rfc3339(&session.expires_at)
         .map(|t| t.with_timezone(&chrono::Utc))

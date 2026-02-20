@@ -153,8 +153,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Url { receipt_cid, host } => cmd_url(&receipt_cid, &host)?,
         Commands::Disasm { input, hex } => cmd_disasm(&input, hex)?,
         Commands::Silicon { command } => match command {
-            SiliconCommands::Compile { bundle, from_store, store_path, hex_only } => {
-                cmd_silicon_compile(bundle.as_deref(), from_store.as_deref(), &store_path, hex_only).await?
+            SiliconCommands::Compile {
+                bundle,
+                from_store,
+                store_path,
+                hex_only,
+            } => {
+                cmd_silicon_compile(
+                    bundle.as_deref(),
+                    from_store.as_deref(),
+                    &store_path,
+                    hex_only,
+                )
+                .await?
             }
             SiliconCommands::Disasm { input, file } => cmd_silicon_disasm(&input, file)?,
         },
@@ -494,8 +505,8 @@ async fn cmd_silicon_compile(
     use std::sync::Arc;
     use ubl_chipstore::{ChipStore, ExecutionMetadata, InMemoryBackend, SledBackend};
     use ubl_runtime::silicon_chip::{
-        compile_chip_to_rb_vm, parse_silicon, resolve_chip_graph, SiliconRequest,
-        TYPE_SILICON_BIT, TYPE_SILICON_CHIP, TYPE_SILICON_CIRCUIT,
+        compile_chip_to_rb_vm, parse_silicon, resolve_chip_graph, SiliconRequest, TYPE_SILICON_BIT,
+        TYPE_SILICON_CHIP, TYPE_SILICON_CIRCUIT,
     };
     use ubl_types::Did as TypedDid;
 
@@ -556,8 +567,7 @@ async fn cmd_silicon_compile(
     }
 
     // ── bundle path: self-contained JSON ─────────────────────────
-    let bundle_path = bundle_path
-        .ok_or("provide a bundle file path or --from-store <chip_cid>")?;
+    let bundle_path = bundle_path.ok_or("provide a bundle file path or --from-store <chip_cid>")?;
 
     // ── parse bundle ────────────────────────────────────────────
     let bundle_str = std::fs::read_to_string(bundle_path)?;
@@ -604,11 +614,17 @@ async fn cmd_silicon_compile(
             .clone();
         let mut chip_data = body;
         if let Some(obj) = chip_data.as_object_mut() {
-            obj.insert("@type".to_string(), Value::String(TYPE_SILICON_BIT.to_string()));
+            obj.insert(
+                "@type".to_string(),
+                Value::String(TYPE_SILICON_BIT.to_string()),
+            );
             obj.entry("@world".to_string())
                 .or_insert(Value::String("a/ublx/t/cli".to_string()));
         }
-        let receipt_cid = format!("b3:receipt-bit-{}", &bundle_cid[3..].chars().take(8).collect::<String>());
+        let receipt_cid = format!(
+            "b3:receipt-bit-{}",
+            &bundle_cid[3..].chars().take(8).collect::<String>()
+        );
         let stored_cid = store
             .store_executed_chip(chip_data, receipt_cid, meta.clone())
             .await?;
@@ -628,7 +644,10 @@ async fn cmd_silicon_compile(
             .clone();
         let mut chip_data = body;
         if let Some(obj) = chip_data.as_object_mut() {
-            obj.insert("@type".to_string(), Value::String(TYPE_SILICON_CIRCUIT.to_string()));
+            obj.insert(
+                "@type".to_string(),
+                Value::String(TYPE_SILICON_CIRCUIT.to_string()),
+            );
             obj.entry("@world".to_string())
                 .or_insert(Value::String("a/ublx/t/cli".to_string()));
             // Rewrite bits[] using cid_map (bundle CID → stored CID)
@@ -643,7 +662,10 @@ async fn cmd_silicon_compile(
                 obj.insert("bits".to_string(), Value::Array(rewritten));
             }
         }
-        let receipt_cid = format!("b3:receipt-ckt-{}", &bundle_cid[3..].chars().take(8).collect::<String>());
+        let receipt_cid = format!(
+            "b3:receipt-ckt-{}",
+            &bundle_cid[3..].chars().take(8).collect::<String>()
+        );
         let stored_cid = store
             .store_executed_chip(chip_data, receipt_cid, meta.clone())
             .await?;
@@ -653,7 +675,10 @@ async fn cmd_silicon_compile(
     // ── 3. Store chip (rewrite circuits[] with stored CIDs) ──────
     let mut chip_data = chip_body.clone();
     if let Some(obj) = chip_data.as_object_mut() {
-        obj.insert("@type".to_string(), Value::String(TYPE_SILICON_CHIP.to_string()));
+        obj.insert(
+            "@type".to_string(),
+            Value::String(TYPE_SILICON_CHIP.to_string()),
+        );
         obj.entry("@world".to_string())
             .or_insert(Value::String("a/ublx/t/cli".to_string()));
         if let Some(circs_val) = obj.get("circuits").and_then(|v| v.as_array()).cloned() {
@@ -668,7 +693,11 @@ async fn cmd_silicon_compile(
         }
     }
     let chip_store_cid = store
-        .store_executed_chip(chip_data.clone(), "b3:receipt-chip".to_string(), meta.clone())
+        .store_executed_chip(
+            chip_data.clone(),
+            "b3:receipt-chip".to_string(),
+            meta.clone(),
+        )
         .await?;
 
     // ── chip body CID = BLAKE3 content address of the raw body ───
@@ -737,7 +766,8 @@ fn cmd_silicon_disasm(input: &str, is_file: bool) -> Result<(), Box<dyn std::err
         hex::decode(&clean)?
     };
 
-    println!("=== Silicon Chip Disassembly ({} bytes, {} instructions) ===\n",
+    println!(
+        "=== Silicon Chip Disassembly ({} bytes, {} instructions) ===\n",
         bytecode.len(),
         count_tlv_instrs(&bytecode),
     );

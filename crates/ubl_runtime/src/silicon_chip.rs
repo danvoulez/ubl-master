@@ -84,25 +84,48 @@ impl From<ubl_chipstore::ChipStoreError> for SiliconError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ConditionSpec {
-    Always { value: bool },
-    ContextHas { key: String },
-    ContextEquals { key: String, value: Value },
-    BodySizeLte { limit: usize },
-    TypeEquals { chip_type: String },
-    And { conditions: Vec<ConditionSpec> },
-    Or { conditions: Vec<ConditionSpec> },
-    Not { condition: Box<ConditionSpec> },
+    Always {
+        value: bool,
+    },
+    ContextHas {
+        key: String,
+    },
+    ContextEquals {
+        key: String,
+        value: Value,
+    },
+    BodySizeLte {
+        limit: usize,
+    },
+    TypeEquals {
+        chip_type: String,
+    },
+    And {
+        conditions: Vec<ConditionSpec>,
+    },
+    Or {
+        conditions: Vec<ConditionSpec>,
+    },
+    Not {
+        condition: Box<ConditionSpec>,
+    },
     /// Numeric field ≤ threshold.  The field is extracted from the chip body as
     /// an i64 JSON integer, then compared to `amount` with CmpI64(LE).
     /// Compile target: `PushInput(0) CasGet JsonNormalize JsonGetKey(field)
     ///                   ConstI64(amount) CmpI64(LE)`
-    AmountLte { field: String, amount: i64 },
+    AmountLte {
+        field: String,
+        amount: i64,
+    },
     /// Chip body carries a Unix-seconds timestamp in `field`.  The condition
     /// passes if `now - field_value <= window_secs` (i.e. the timestamp is
     /// within `window_secs` seconds of "now").
     /// Compile target: `PushTimestamp PushInput(0) CasGet JsonNormalize
     ///                   JsonGetKey(field) SubI64 ConstI64(window) CmpI64(LE)`
-    TimestampWithinSecs { field: String, window_secs: i64 },
+    TimestampWithinSecs {
+        field: String,
+        window_secs: i64,
+    },
 }
 
 impl ConditionSpec {
@@ -179,12 +202,16 @@ impl ConditionSpec {
             if let Some(conditions) = obj.get("And").and_then(Value::as_array) {
                 let parsed: Result<Vec<_>, _> =
                     conditions.iter().map(ConditionSpec::from_value).collect();
-                return Ok(ConditionSpec::And { conditions: parsed? });
+                return Ok(ConditionSpec::And {
+                    conditions: parsed?,
+                });
             }
             if let Some(conditions) = obj.get("Or").and_then(Value::as_array) {
                 let parsed: Result<Vec<_>, _> =
                     conditions.iter().map(ConditionSpec::from_value).collect();
-                return Ok(ConditionSpec::Or { conditions: parsed? });
+                return Ok(ConditionSpec::Or {
+                    conditions: parsed?,
+                });
             }
             if let Some(inner) = obj.get("Not") {
                 return Ok(ConditionSpec::Not {
@@ -243,22 +270,30 @@ impl ConditionSpec {
                 Ok(ConditionSpec::TypeEquals { chip_type })
             }
             "and" => {
-                let conditions = v
-                    .get("conditions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| SiliconError::MissingField("condition.conditions".to_string()))?;
+                let conditions =
+                    v.get("conditions")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            SiliconError::MissingField("condition.conditions".to_string())
+                        })?;
                 let parsed: Result<Vec<_>, _> =
                     conditions.iter().map(ConditionSpec::from_value).collect();
-                Ok(ConditionSpec::And { conditions: parsed? })
+                Ok(ConditionSpec::And {
+                    conditions: parsed?,
+                })
             }
             "or" => {
-                let conditions = v
-                    .get("conditions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| SiliconError::MissingField("condition.conditions".to_string()))?;
+                let conditions =
+                    v.get("conditions")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            SiliconError::MissingField("condition.conditions".to_string())
+                        })?;
                 let parsed: Result<Vec<_>, _> =
                     conditions.iter().map(ConditionSpec::from_value).collect();
-                Ok(ConditionSpec::Or { conditions: parsed? })
+                Ok(ConditionSpec::Or {
+                    conditions: parsed?,
+                })
             }
             "not" => {
                 let inner = v
@@ -286,12 +321,12 @@ impl ConditionSpec {
                     .and_then(Value::as_str)
                     .ok_or_else(|| SiliconError::MissingField("condition.field".to_string()))?
                     .to_string();
-                let window_secs = v
-                    .get("window_secs")
-                    .and_then(Value::as_i64)
-                    .ok_or_else(|| {
-                        SiliconError::MissingField("condition.window_secs".to_string())
-                    })?;
+                let window_secs =
+                    v.get("window_secs")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            SiliconError::MissingField("condition.window_secs".to_string())
+                        })?;
                 Ok(ConditionSpec::TimestampWithinSecs { field, window_secs })
             }
             other => Err(SiliconError::InvalidField(format!(
@@ -428,10 +463,7 @@ impl HalProfile {
             .get("energy_unit")
             .and_then(Value::as_str)
             .map(String::from);
-        let cost_unit = v
-            .get("cost_unit")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let cost_unit = v.get("cost_unit").and_then(Value::as_str).map(String::from);
         Ok(HalProfile {
             profile,
             targets,
@@ -801,64 +833,66 @@ fn resolve_chip_graph_inner<'a>(
     chip: &'a SiliconChipBody,
     store: &'a ChipStore,
     visiting: &'a mut std::collections::HashSet<String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ResolvedCircuit>, SiliconError>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<ResolvedCircuit>, SiliconError>> + Send + 'a>,
+> {
     Box::pin(async move {
-    let mut resolved_circuits = Vec::new();
-    for circuit_cid in &chip.circuits {
-        let circuit_stored = store
-            .get_chip(circuit_cid)
-            .await
-            .map_err(SiliconError::from)?
-            .ok_or_else(|| SiliconError::CircuitNotFound(circuit_cid.clone()))?;
-        let circuit_body = parse_circuit(&circuit_stored.chip_data)?;
-
-        let mut nodes = Vec::new();
-        for entry_cid in &circuit_body.bits {
-            let entry_stored = store
-                .get_chip(entry_cid)
+        let mut resolved_circuits = Vec::new();
+        for circuit_cid in &chip.circuits {
+            let circuit_stored = store
+                .get_chip(circuit_cid)
                 .await
                 .map_err(SiliconError::from)?
-                .ok_or_else(|| SiliconError::BitNotFound(entry_cid.clone()))?;
+                .ok_or_else(|| SiliconError::CircuitNotFound(circuit_cid.clone()))?;
+            let circuit_body = parse_circuit(&circuit_stored.chip_data)?;
 
-            match entry_stored.chip_type.as_str() {
-                TYPE_SILICON_BIT => {
-                    let bit_body = parse_bit(&entry_stored.chip_data)?;
-                    nodes.push(ResolvedNode::Bit(ResolvedBit {
-                        cid: entry_cid.clone(),
-                        body: bit_body,
-                    }));
-                }
-                TYPE_SILICON_CHIP => {
-                    // Recursive chip reference — resolve its graph, inlining it.
-                    if !visiting.insert(entry_cid.clone()) {
-                        return Err(SiliconError::CyclicChipGraph(entry_cid.clone()));
+            let mut nodes = Vec::new();
+            for entry_cid in &circuit_body.bits {
+                let entry_stored = store
+                    .get_chip(entry_cid)
+                    .await
+                    .map_err(SiliconError::from)?
+                    .ok_or_else(|| SiliconError::BitNotFound(entry_cid.clone()))?;
+
+                match entry_stored.chip_type.as_str() {
+                    TYPE_SILICON_BIT => {
+                        let bit_body = parse_bit(&entry_stored.chip_data)?;
+                        nodes.push(ResolvedNode::Bit(ResolvedBit {
+                            cid: entry_cid.clone(),
+                            body: bit_body,
+                        }));
                     }
-                    let sub_chip_body =
-                        match parse_silicon(TYPE_SILICON_CHIP, &entry_stored.chip_data)? {
-                            SiliconRequest::Chip(c) => c,
-                            _ => return Err(SiliconError::ChipTypeMismatch(entry_cid.clone())),
-                        };
-                    let sub_circuits =
-                        resolve_chip_graph_inner(&sub_chip_body, store, visiting).await?;
-                    visiting.remove(entry_cid);
-                    nodes.push(ResolvedNode::SubChip(sub_circuits));
-                }
-                other => {
-                    return Err(SiliconError::InvalidField(format!(
-                        "circuit bits[{}] has unsupported type '{}'; expected bit or chip",
-                        entry_cid, other
-                    )));
+                    TYPE_SILICON_CHIP => {
+                        // Recursive chip reference — resolve its graph, inlining it.
+                        if !visiting.insert(entry_cid.clone()) {
+                            return Err(SiliconError::CyclicChipGraph(entry_cid.clone()));
+                        }
+                        let sub_chip_body =
+                            match parse_silicon(TYPE_SILICON_CHIP, &entry_stored.chip_data)? {
+                                SiliconRequest::Chip(c) => c,
+                                _ => return Err(SiliconError::ChipTypeMismatch(entry_cid.clone())),
+                            };
+                        let sub_circuits =
+                            resolve_chip_graph_inner(&sub_chip_body, store, visiting).await?;
+                        visiting.remove(entry_cid);
+                        nodes.push(ResolvedNode::SubChip(sub_circuits));
+                    }
+                    other => {
+                        return Err(SiliconError::InvalidField(format!(
+                            "circuit bits[{}] has unsupported type '{}'; expected bit or chip",
+                            entry_cid, other
+                        )));
+                    }
                 }
             }
-        }
 
-        resolved_circuits.push(ResolvedCircuit {
-            cid: circuit_cid.clone(),
-            body: circuit_body,
-            nodes,
-        });
-    }
-    Ok(resolved_circuits)
+            resolved_circuits.push(ResolvedCircuit {
+                cid: circuit_cid.clone(),
+                body: circuit_body,
+                nodes,
+            });
+        }
+        Ok(resolved_circuits)
     }) // end Box::pin
 }
 
@@ -912,7 +946,12 @@ fn compile_circuits_inner(
         // Flatten nodes to bits: SubChip nodes are compiled inline (their
         // conditions are emitted into the current stream; the parent circuit's
         // aggregation wraps them like any other bit).
-        let bits = collect_bits(&resolved_circuit.nodes, code, composition.clone(), aggregation.clone())?;
+        let bits = collect_bits(
+            &resolved_circuit.nodes,
+            code,
+            composition.clone(),
+            aggregation.clone(),
+        )?;
 
         // `collect_bits` for SubChip nodes with non-All/non-Sequential modes
         // already emits a single Bool onto the stack representing the sub-chip.
@@ -1019,7 +1058,13 @@ fn collect_bits<'a>(
     if nodes.iter().all(|n| matches!(n, ResolvedNode::Bit(_))) {
         let bits = nodes
             .iter()
-            .filter_map(|n| if let ResolvedNode::Bit(b) = n { Some(b) } else { None })
+            .filter_map(|n| {
+                if let ResolvedNode::Bit(b) = n {
+                    Some(b)
+                } else {
+                    None
+                }
+            })
             .collect();
         return Ok(Some(bits));
     }
@@ -1390,7 +1435,10 @@ mod tests {
         assert_eq!(bit.id, "P_Always");
         assert!(matches!(bit.on_true, Decision::Allow));
         assert!(matches!(bit.on_false, Decision::Deny));
-        assert!(matches!(bit.condition, ConditionSpec::Always { value: true }));
+        assert!(matches!(
+            bit.condition,
+            ConditionSpec::Always { value: true }
+        ));
     }
 
     #[test]
@@ -1418,7 +1466,10 @@ mod tests {
             "requires_context": []
         });
         let bit = parse_bit(&body).unwrap();
-        assert!(matches!(bit.condition, ConditionSpec::Always { value: true }));
+        assert!(matches!(
+            bit.condition,
+            ConditionSpec::Always { value: true }
+        ));
     }
 
     #[test]
@@ -1747,7 +1798,11 @@ mod tests {
             "aggregator": "All"
         });
         let inner_circuit_cid = store
-            .store_executed_chip(inner_circuit_data, "b3:fake_inner_circuit".to_string(), meta())
+            .store_executed_chip(
+                inner_circuit_data,
+                "b3:fake_inner_circuit".to_string(),
+                meta(),
+            )
             .await
             .unwrap();
 
@@ -1792,7 +1847,11 @@ mod tests {
             "aggregator": "All"
         });
         let outer_circuit_cid = store
-            .store_executed_chip(outer_circuit_data, "b3:fake_outer_circuit".to_string(), meta())
+            .store_executed_chip(
+                outer_circuit_data,
+                "b3:fake_outer_circuit".to_string(),
+                meta(),
+            )
             .await
             .unwrap();
 
@@ -2140,9 +2199,15 @@ mod tests {
 
         // Bytecode must contain both AmountLte opcodes (0x13=JsonGetKey, 0x08=CmpI64)
         // and TimestampWithinSecs opcodes (0x2C=PushTimestamp, 0x06=SubI64).
-        assert!(bytecode.windows(1).any(|w| w[0] == 0x2C), "PushTimestamp missing");
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x2C),
+            "PushTimestamp missing"
+        );
         assert!(bytecode.windows(1).any(|w| w[0] == 0x06), "SubI64 missing");
-        assert!(bytecode.windows(1).any(|w| w[0] == 0x13), "JsonGetKey missing");
+        assert!(
+            bytecode.windows(1).any(|w| w[0] == 0x13),
+            "JsonGetKey missing"
+        );
         assert!(bytecode.windows(1).any(|w| w[0] == 0x08), "CmpI64 missing");
         assert!(bytecode.windows(1).any(|w| w[0] == 0x10), "EmitRc missing");
 
@@ -2162,7 +2227,11 @@ mod tests {
         bc.push(Opcode::DivI64 as u8);
         bc.extend_from_slice(&0u16.to_be_bytes()); // payload len = 0
         let out = disassemble(&bc).unwrap();
-        assert!(out.contains("DivI64"), "disasm should show DivI64, got: {}", out);
+        assert!(
+            out.contains("DivI64"),
+            "disasm should show DivI64, got: {}",
+            out
+        );
     }
 
     #[test]
@@ -2187,7 +2256,11 @@ mod tests {
         bc.extend_from_slice(&1u16.to_be_bytes()); // payload len = 1
         bc.push(5u8); // GE
         let out = disassemble(&bc).unwrap();
-        assert!(out.contains("CmpTimestamp"), "expected CmpTimestamp in: {}", out);
+        assert!(
+            out.contains("CmpTimestamp"),
+            "expected CmpTimestamp in: {}",
+            out
+        );
         assert!(out.contains("GE"), "expected GE in: {}", out);
     }
 }

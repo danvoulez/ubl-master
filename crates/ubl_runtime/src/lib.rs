@@ -28,8 +28,8 @@ pub mod policy_lock;
 pub mod rate_limit;
 pub mod reasoning_bit;
 pub mod rich_url;
-pub mod silicon_chip;
 pub mod runtime_cert;
+pub mod silicon_chip;
 pub mod transition_registry;
 pub mod wasm_adapter;
 

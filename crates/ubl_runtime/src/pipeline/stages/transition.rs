@@ -1203,7 +1203,9 @@ impl UblPipeline {
         let chip_stored = store
             .get_chip(&compile.chip_cid)
             .await
-            .map_err(|e| PipelineError::StorageError(format!("silicon.compile chip lookup: {}", e)))?
+            .map_err(|e| {
+                PipelineError::StorageError(format!("silicon.compile chip lookup: {}", e))
+            })?
             .ok_or_else(|| {
                 PipelineError::InvalidChip(format!(
                     "silicon.compile chip_cid not found: {}",
@@ -1211,9 +1213,11 @@ impl UblPipeline {
                 ))
             })?;
 
-        let chip_body =
-            crate::silicon_chip::parse_silicon(crate::silicon_chip::TYPE_SILICON_CHIP, &chip_stored.chip_data)
-                .map_err(|e| PipelineError::InvalidChip(format!("silicon.compile chip parse: {}", e)))?;
+        let chip_body = crate::silicon_chip::parse_silicon(
+            crate::silicon_chip::TYPE_SILICON_CHIP,
+            &chip_stored.chip_data,
+        )
+        .map_err(|e| PipelineError::InvalidChip(format!("silicon.compile chip parse: {}", e)))?;
         let chip_body = match chip_body {
             SiliconRequest::Chip(c) => c,
             _ => {
@@ -1224,9 +1228,9 @@ impl UblPipeline {
         };
 
         // Resolve full circuit graph (chip → circuits → bits).
-        let circuits = resolve_chip_graph(&chip_body, store)
-            .await
-            .map_err(|e| PipelineError::Internal(format!("silicon.compile graph resolve: {}", e)))?;
+        let circuits = resolve_chip_graph(&chip_body, store).await.map_err(|e| {
+            PipelineError::Internal(format!("silicon.compile graph resolve: {}", e))
+        })?;
 
         let circuit_count = circuits.len();
         let bit_count: usize = circuits.iter().map(|c| c.nodes.len()).sum();
@@ -1237,10 +1241,7 @@ impl UblPipeline {
         let bytecode_len = bytecode.len();
 
         // Store bytecode artifact in ChipStore.
-        let bytecode_b3 = format!(
-            "b3:{}",
-            hex::encode(blake3::hash(&bytecode).as_bytes())
-        );
+        let bytecode_b3 = format!("b3:{}", hex::encode(blake3::hash(&bytecode).as_bytes()));
         let bytecode_artifact = serde_json::json!({
             "@type": "ubl/silicon.bytecode.v1",
             "@world": request.world,
