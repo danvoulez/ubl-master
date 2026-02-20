@@ -1,18 +1,43 @@
 {% if available %}
-<h2>KPIs (5m window)</h2>
-<p>Generated at {{ generated_at }}</p>
+<h2>KPIs</h2>
+<p class="muted">Gerado em {{ generated_at }}</p>
 <div>Total Events: <strong>{{ total_events }}</strong></div>
 <div>ALLOW: <strong>{{ allow_count }}</strong> | DENY: <strong>{{ deny_count }}</strong></div>
 <div>Outbox Pending: <strong>{{ outbox_pending }}</strong></div>
+
 <h3>P95 Latency by Stage (ms)</h3>
-<table>
-  <thead><tr><th>Stage</th><th>P95 ms</th></tr></thead>
+<table style="border-collapse: collapse; width: 100%; margin-top: 0.5rem;">
+  <thead>
+    <tr>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Stage</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">P95 ms</th>
+    </tr>
+  </thead>
   <tbody>
-  {% for row in p95_rows %}
-  <tr><td>{{ row.stage }}</td><td>{{ row.p95_ms }}</td></tr>
+  {% for row in visible_p95_rows %}
+    <tr>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.stage }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.p95_ms }}</td>
+    </tr>
   {% endfor %}
   </tbody>
 </table>
+
+{% if hidden_p95_rows.len() > 0 %}
+<details style="margin-top:0.65rem;">
+  <summary>Mostrar mais {{ hidden_p95_rows.len() }} estagios ▼</summary>
+  <table style="border-collapse: collapse; width: 100%; margin-top: 0.45rem;">
+    <tbody>
+    {% for row in hidden_p95_rows %}
+      <tr>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.stage }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.p95_ms }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
 {% else %}
 <h2>KPIs Unavailable</h2>
 <p>{{ message }}</p>

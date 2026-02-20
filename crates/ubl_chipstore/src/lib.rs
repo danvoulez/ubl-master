@@ -94,6 +94,9 @@ pub trait ChipStoreBackend: Send + Sync {
 
     /// Rebuild secondary indexes from stored chips.
     async fn rebuild_indexes(&self) -> Result<(), ChipStoreError>;
+
+    /// Full scan of all stored chips from primary storage.
+    async fn scan_all(&self) -> Result<Vec<StoredChip>, ChipStoreError>;
 }
 
 /// The main ChipStore interface
@@ -109,6 +112,15 @@ impl ChipStore {
             backend: backend.clone(),
             indexer: Arc::new(indexing::ChipIndexer::new(backend)),
         }
+    }
+
+    /// Create a ChipStore and rebuild in-memory indexes from persisted chips.
+    pub async fn new_with_rebuild(
+        backend: Arc<dyn ChipStoreBackend>,
+    ) -> Result<Self, ChipStoreError> {
+        let indexer = Arc::new(indexing::ChipIndexer::new(backend.clone()));
+        indexer.rebuild_indexes().await?;
+        Ok(Self { backend, indexer })
     }
 
     /// Store a chip after execution
@@ -196,7 +208,8 @@ impl ChipStore {
 
     /// Rebuild backend indexes from primary storage.
     pub async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
-        self.backend.rebuild_indexes().await
+        self.backend.rebuild_indexes().await?;
+        self.indexer.rebuild_indexes().await
     }
 
     /// Get customer by email (example index lookup)

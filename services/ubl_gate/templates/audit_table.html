@@ -1,26 +1,45 @@
-{% if rows.len() == 0 %}
+{% if visible_rows.len() == 0 && hidden_rows.len() == 0 %}
 <p>No {{ kind }} artifacts found.</p>
 {% else %}
 <table style="border-collapse: collapse; width: 100%">
   <thead>
     <tr>
-      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">CID</th>
-      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Type</th>
-      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">World</th>
-      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Created</th>
-      <th style="text-align:left; border-bottom:1px solid #ddd; padding:4px;">Summary</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">CID</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Type</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">World</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Created</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Summary</th>
     </tr>
   </thead>
   <tbody>
-  {% for row in rows %}
+  {% for row in visible_rows %}
     <tr>
-      <td style="padding:4px;"><a href="/v1/chips/{{ row.cid }}">{{ row.cid }}</a></td>
-      <td style="padding:4px;">{{ row.chip_type }}</td>
-      <td style="padding:4px;">{{ row.world }}</td>
-      <td style="padding:4px;">{{ row.created_at }}</td>
-      <td style="padding:4px;">{{ row.summary }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/v1/chips/{{ row.cid }}">{{ row.cid }}</a></td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.chip_type }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.world }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.created_at }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.summary }}</td>
     </tr>
   {% endfor %}
   </tbody>
 </table>
+
+{% if hidden_rows.len() > 0 %}
+<details style="margin-top:0.65rem;">
+  <summary>Mostrar mais {{ hidden_rows.len() }} artefatos ▼</summary>
+  <table style="border-collapse: collapse; width: 100%; margin-top: 0.45rem;">
+    <tbody>
+    {% for row in hidden_rows %}
+      <tr>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/v1/chips/{{ row.cid }}">{{ row.cid }}</a></td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.chip_type }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.world }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.created_at }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.summary }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
 {% endif %}

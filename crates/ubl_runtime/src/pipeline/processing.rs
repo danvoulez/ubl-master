@@ -199,8 +199,10 @@ impl UblPipeline {
         if matches!(check.decision, Decision::Deny) {
             receipt.deny(&check.reason);
 
-            let wf_receipt = self.create_deny_receipt(&wa_receipt, &check).await?;
             let deny_ms = pipeline_start.elapsed().as_millis() as i64;
+            let wf_receipt = self
+                .create_deny_receipt(&wa_receipt, &check, deny_ms)
+                .await?;
 
             receipt
                 .append_stage(StageExecution {
@@ -326,8 +328,15 @@ impl UblPipeline {
 
         // Stage 4: WF (Write-Finished)
         let wf_start = std::time::Instant::now();
+        let total_ms_before_wf = pipeline_start.elapsed().as_millis() as i64;
         let wf_receipt = self
-            .stage_write_finished(&parsed_request, &wa_receipt, &tr_receipt, &check)
+            .stage_write_finished(
+                &parsed_request,
+                &wa_receipt,
+                &tr_receipt,
+                &check,
+                total_ms_before_wf,
+            )
             .await?;
         let wf_ms = wf_start.elapsed().as_millis() as i64;
         debug!(chip_type = %parsed_request.chip_type, duration_ms = wf_ms, "stage wf completed");

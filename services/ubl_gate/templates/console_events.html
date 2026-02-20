@@ -1,29 +1,49 @@
 {% if available %}
-<h2>Recent Events</h2>
-<table>
+<h2>Recent Events (Live)</h2>
+<table style="border-collapse: collapse; width: 100%;">
   <thead>
     <tr>
-      <th>When</th>
-      <th>Stage</th>
-      <th>Decision</th>
-      <th>Type</th>
-      <th>Code</th>
-      <th>Receipt</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">When</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Stage</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Decision</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Type</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Code</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Receipt</th>
     </tr>
   </thead>
   <tbody>
-  {% for row in rows %}
+  {% for row in visible_rows %}
     <tr>
-      <td>{{ row.when }}</td>
-      <td>{{ row.stage }}</td>
-      <td>{{ row.decision }}</td>
-      <td>{{ row.chip_type }}</td>
-      <td>{{ row.code }}</td>
-      <td><a href="/console/receipt/{{ row.receipt_cid }}">{{ row.receipt_cid }}</a></td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.when }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.stage }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.decision }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.chip_type }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.code }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/console/receipt/{{ row.receipt_cid }}">{{ row.receipt_cid }}</a></td>
     </tr>
   {% endfor %}
   </tbody>
 </table>
+
+{% if hidden_rows.len() > 0 %}
+<details style="margin-top:0.65rem;">
+  <summary>Mostrar mais {{ hidden_rows.len() }} eventos ▼</summary>
+  <table style="border-collapse: collapse; width: 100%; margin-top: 0.45rem;">
+    <tbody>
+    {% for row in hidden_rows %}
+      <tr>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.when }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.stage }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.decision }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.chip_type }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.code }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/console/receipt/{{ row.receipt_cid }}">{{ row.receipt_cid }}</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
 {% else %}
 <h2>Events Unavailable</h2>
 <p>{{ message }}</p>

@@ -1,0 +1,49 @@
+<h2>Mock Engine - Ultimas 24h ({{ profile }})</h2>
+<p style="margin:0 0 0.65rem; color:#9db1cc;">Gerado em {{ generated_at }}. Perfil muda comportamento de carga, deny, latencia e fila outbox.</p>
+<table style="border-collapse: collapse; width: 100%;">
+  <thead>
+    <tr>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Hour</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Events</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Allow %</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Deny %</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">P95 ms</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Outbox</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Error %</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in visible_rows %}
+    <tr>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.hour_label }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.events }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.allow_pct }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.deny_pct }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.p95_ms }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.outbox_pending }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.error_pct }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if hidden_rows.len() > 0 %}
+<details style="margin-top:0.65rem;">
+  <summary>Mostrar mais {{ hidden_rows.len() }} horas ▼</summary>
+  <table style="border-collapse: collapse; width: 100%; margin-top: 0.45rem;">
+    <tbody>
+    {% for row in hidden_rows %}
+      <tr>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.hour_label }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.events }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.allow_pct }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.deny_pct }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.p95_ms }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.outbox_pending }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.error_pct }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}

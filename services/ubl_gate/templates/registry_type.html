@@ -6,16 +6,44 @@
   <title>UBL Registry Type</title>
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <style>
-    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; }
-    .box { border: 1px solid #ddd; border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
-    pre { overflow: auto; white-space: pre-wrap; word-break: break-word; }
-    a { color: #0b57d0; text-decoration: none; }
+    :root {
+      --bg: #0c1420;
+      --surface: #152237;
+      --text: #e7effb;
+      --muted: #9db1cc;
+      --line: #314664;
+      --brand: #53b3ff;
+      --warn: #ff9a3c;
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; padding:1.2rem; background:#0c1420; color:var(--text); font-family:"JetBrains Mono","SFMono-Regular",Menlo,monospace; }
+    a { color: var(--brand); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap; margin-bottom:1rem; }
+    .tabs { display:inline-flex; padding:0.2rem; border:1px solid var(--line); border-radius:999px; background:#0f1b2c; gap:0.2rem; }
+    .tab { padding:0.35rem 0.85rem; border-radius:999px; color:var(--muted); }
+    .box { border:1px solid var(--line); border-radius:10px; padding:0.9rem; margin-top:1rem; background:var(--surface); overflow-x:auto; }
+    .llm-box { border:2px solid var(--warn); background:linear-gradient(135deg,#2a1f16,#1f2530 45%,#1a2d48); }
+    pre { overflow: auto; white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
-  <h1>Registry Type: {{ chip_type }}</h1>
-  <p><a href="/registry">Back to Registry</a></p>
+  <div class="top">
+    <div>
+      <h1 style="margin:0; font-size:1.2rem;">Registry Type: {{ chip_type }}</h1>
+      <div style="margin-top:0.3rem;"><a href="/registry">Back to Registry</a></div>
+    </div>
+    <nav class="tabs" aria-label="Modo">
+      <a class="tab" href="/console?tab=live">Live</a>
+      <a class="tab" href="/console?tab=stats">Estatisticas</a>
+    </nav>
+  </div>
+
+  <div id="llm-registry-type"
+       class="box llm-box"
+       hx-get="/ui/_llm?page=registry_type&type={{ chip_type }}"
+       hx-trigger="load delay:2s, every 60s"
+       hx-swap="innerHTML">Analisando com LLM... (loading)</div>
 
   <div class="box">
     <div>Latest Version: <strong>{{ latest_version }}</strong></div>
@@ -35,65 +63,63 @@
 
   <div class="box">
     <h2>Versions</h2>
-    <table>
+    <table style="border-collapse: collapse; width: 100%;">
       <thead>
         <tr>
-          <th>Version</th>
-          <th>Required Cap</th>
-          <th>KAT Count</th>
-          <th>Register CID</th>
-          <th>Updated At</th>
+          <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Version</th>
+          <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Required Cap</th>
+          <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">KAT Count</th>
+          <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Register CID</th>
+          <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Updated At</th>
         </tr>
       </thead>
       <tbody>
       {% for row in versions %}
         <tr>
-          <td>{{ row.version }}</td>
-          <td>{{ row.required_cap }}</td>
-          <td>{{ row.kats_count }}</td>
-          <td>{{ row.register_cid }}</td>
-          <td>{{ row.updated_at }}</td>
+          <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.version }}</td>
+          <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.required_cap }}</td>
+          <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.kats_count }}</td>
+          <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.register_cid }}</td>
+          <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.updated_at }}</td>
         </tr>
         {% if row.kats_count > 0 %}
         <tr>
-          <td colspan="5">
-            <div>
-              <strong>KATs</strong>
-              <table>
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Label</th>
-                    <th>Expected Decision</th>
-                    <th>Expected Error</th>
-                    <th>Input Preview</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                {% for kat in row.kats %}
-                  <tr>
-                    <td>{{ kat.index }}</td>
-                    <td>{{ kat.label }}</td>
-                    <td>{{ kat.expected_decision }}</td>
-                    <td>{{ kat.expected_error }}</td>
-                    <td><code>{{ kat.input_json_preview }}</code></td>
-                    <td>
-                      <form
-                        hx-post="/registry/_kat_test"
-                        hx-target="#kat-result"
-                        hx-swap="innerHTML">
-                        <input type="hidden" name="chip_type" value="{{ chip_type }}">
-                        <input type="hidden" name="version" value="{{ row.version }}">
-                        <input type="hidden" name="kat_index" value="{{ kat.index }}">
-                        <button type="submit">Testar KAT</button>
-                      </form>
-                    </td>
-                  </tr>
-                {% endfor %}
-                </tbody>
-              </table>
-            </div>
+          <td colspan="5" style="padding:8px; border-bottom:1px solid #2c3f5c;">
+            <strong>KATs</strong>
+            <table style="border-collapse: collapse; width: 100%; margin-top: 0.35rem;">
+              <thead>
+                <tr>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">#</th>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Label</th>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Expected Decision</th>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Expected Error</th>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Input Preview</th>
+                  <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+              {% for kat in row.kats %}
+                <tr>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ kat.index }}</td>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ kat.label }}</td>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ kat.expected_decision }}</td>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ kat.expected_error }}</td>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><code>{{ kat.input_json_preview }}</code></td>
+                  <td style="padding:5px; border-bottom:1px solid #2c3f5c;">
+                    <form
+                      hx-post="/registry/_kat_test"
+                      hx-target="#kat-result"
+                      hx-swap="innerHTML">
+                      <input type="hidden" name="chip_type" value="{{ chip_type }}">
+                      <input type="hidden" name="version" value="{{ row.version }}">
+                      <input type="hidden" name="kat_index" value="{{ kat.index }}">
+                      <button type="submit">Testar KAT</button>
+                    </form>
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
           </td>
         </tr>
         {% endif %}

@@ -6,43 +6,141 @@
   <title>UBL Console</title>
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <style>
-    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; }
-    .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
-    .box { border: 1px solid #ddd; border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
-    input { padding: 0.35rem 0.5rem; min-width: 18rem; }
-    a { color: #0b57d0; text-decoration: none; }
+    :root {
+      --bg: #0c1420;
+      --surface: #152237;
+      --surface-soft: #1a2d48;
+      --text: #e7effb;
+      --muted: #9db1cc;
+      --line: #314664;
+      --brand: #53b3ff;
+      --warn: #ff9a3c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 1.2rem;
+      background: radial-gradient(circle at 12% 8%, #1d2f4b 0%, var(--bg) 50%);
+      color: var(--text);
+      font-family: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+    }
+    h1 { margin: 0; font-size: 1.35rem; }
+    h2 { margin: 0 0 0.7rem; font-size: 1rem; }
+    a { color: var(--brand); text-decoration: none; }
     a:hover { text-decoration: underline; }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+    .tabs {
+      display: inline-flex;
+      padding: 0.2rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #0f1b2c;
+      gap: 0.2rem;
+    }
+    .tab {
+      padding: 0.35rem 0.85rem;
+      border-radius: 999px;
+      color: var(--muted);
+    }
+    .tab.active {
+      background: var(--surface-soft);
+      color: var(--text);
+      border: 1px solid #4f6b92;
+    }
+    .row { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; }
+    .box {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.9rem;
+      margin-top: 1rem;
+      background: var(--surface);
+      overflow-x: auto;
+    }
+    .llm-box {
+      border: 2px solid var(--warn);
+      background: linear-gradient(135deg, #2a1f16, #1f2530 45%, #1a2d48);
+    }
+    .muted { color: var(--muted); }
+    input, select, button {
+      font-family: inherit;
+      font-size: 0.9rem;
+      padding: 0.4rem 0.55rem;
+      border-radius: 8px;
+      border: 1px solid #47648c;
+      background: #0f1f35;
+      color: var(--text);
+    }
+    button { cursor: pointer; }
+    .links { display: flex; gap: 0.75rem; flex-wrap: wrap; }
   </style>
 </head>
 <body>
-  <h1>UBL Console</h1>
-  <div class="row">
-    <form id="console-filters" class="row">
-      <label for="world">world</label>
-      <input id="world" name="world" value="{{ world }}">
-      <button
-        type="button"
-        hx-get="/console/_kpis"
-        hx-include="#console-filters"
-        hx-target="#kpis"
-        hx-swap="innerHTML">Refresh</button>
-    </form>
-    <a href="/registry">Registry</a>
-    <a href="/metrics">Metrics</a>
+  <div class="top">
+    <div class="row">
+      <h1>UBL Console</h1>
+      <nav class="tabs" aria-label="Modo">
+        <a class="tab {% if !is_stats %}active{% endif %}" href="/console?tab=live&world={{ world }}&profile={{ profile }}">Live</a>
+        <a class="tab {% if is_stats %}active{% endif %}" href="/console?tab=stats&world={{ world }}&profile={{ profile }}">Estatisticas</a>
+      </nav>
+    </div>
+    <div class="links">
+      <a href="/registry">Registry</a>
+      <a href="/audit/reports">Audit</a>
+      <a href="/metrics">Metrics</a>
+    </div>
+  </div>
+
+  <form id="console-filters" class="row" method="get" action="/console">
+    <input type="hidden" name="tab" value="{{ tab }}">
+    <label for="world">world</label>
+    <input id="world" name="world" value="{{ world }}">
+    <label for="profile">mock profile</label>
+    <select id="profile" name="profile">
+      <option value="normal" {% if profile == "normal" %}selected{% endif %}>normal</option>
+      <option value="spiky" {% if profile == "spiky" %}selected{% endif %}>spiky</option>
+      <option value="degraded" {% if profile == "degraded" %}selected{% endif %}>degraded</option>
+      <option value="chaos" {% if profile == "chaos" %}selected{% endif %}>chaos</option>
+    </select>
+    <button type="submit">Aplicar filtros</button>
+  </form>
+
+  <div id="llm-console"
+       class="box llm-box"
+       hx-get="/ui/_llm?page=console&tab={{ tab }}"
+       hx-include="#console-filters"
+       hx-trigger="load delay:2s, every 30s"
+       hx-swap="innerHTML">
+    <div class="muted">Analisando com LLM... (loading)</div>
   </div>
 
   <div id="kpis"
        class="box"
        hx-get="/console/_kpis"
        hx-include="#console-filters"
-       hx-trigger="load, every 5s"
+       hx-trigger="load, every 8s"
        hx-swap="innerHTML">Loading KPIs...</div>
 
+  {% if is_stats %}
+  <div id="mock24h"
+       class="box"
+       hx-get="/console/_mock24h"
+       hx-include="#console-filters"
+       hx-trigger="load, every 12s"
+       hx-swap="innerHTML">Loading 24h mock...</div>
+  {% else %}
   <div id="events"
        class="box"
        hx-get="/console/_events"
        hx-include="#console-filters"
        hx-trigger="load, every 5s"
        hx-swap="innerHTML">Loading events...</div>
+  {% endif %}
 </body>
 </html>

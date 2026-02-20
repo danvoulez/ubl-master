@@ -22,8 +22,9 @@ This file lists runtime flags used by the current implementation.
 
 | Variable | Default | Scope | Purpose |
 |---|---|---|---|
-| `UBL_STAGE_SECRET` | process-local derived value | receipt | Required stage-chain secret (set explicitly in staging/prod). |
+| `UBL_STAGE_SECRET` | process-local derived fallback via domain-separated BLAKE3 | receipt | Required stage-chain secret. In staging/prod, set explicitly (fallback emits critical warning when env is non-dev). |
 | `UBL_STAGE_SECRET_PREV` | unset | receipt | Previous secret for key rotation grace verification. |
+| `UBL_ENV` | `dev` | runtime | Environment marker (`dev/local/test/prod`). Used to emit startup warning when `UBL_STAGE_SECRET` fallback is used outside dev. |
 | `UBL_RUNTIME_ENV_LABELS` | empty | receipt runtime info | CSV `k=v` labels injected into receipt `rt.env`. |
 | `UBL_RUNTIME_ENV_*` | empty | receipt runtime info | Prefix-based env labels for receipt `rt.env`. |
 | `UBL_RUNTIME_CERTS` | empty | receipt runtime info | CSV `k=v` refs injected into receipt `rt.certs`. |
@@ -45,6 +46,7 @@ This file lists runtime flags used by the current implementation.
 | `UBL_IDEMPOTENCY_DSN` | fallback to `UBL_STORE_DSN` | runtime | Optional explicit idempotency DSN. |
 | `UBL_OUTBOX_DSN` | fallback to `UBL_STORE_DSN` | runtime | Optional explicit outbox DSN. |
 | `UBL_OUTBOX_WORKERS` | `1` | gate | Number of outbox worker loops in gate process. |
+| `UBL_OUTBOX_ENDPOINT` | unset | gate | Optional webhook endpoint for durable outbox delivery (`emit_receipt`). If unset, events are dropped with warning logs. |
 
 ## Transition Registry
 
@@ -68,6 +70,7 @@ This file lists runtime flags used by the current implementation.
 UBL_STORE_BACKEND=sqlite
 UBL_STORE_DSN=file:./data/ubl.db?mode=rwc&_journal_mode=WAL
 UBL_OUTBOX_WORKERS=2
+UBL_OUTBOX_ENDPOINT=https://example.internal/webhooks/ubl-receipts
 UBL_CRYPTO_MODE=compat_v1
 UBL_RICHURL_VERIFY_MODE=shadow
 UBL_STAGE_SECRET=hex:<32-byte-hex>

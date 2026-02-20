@@ -272,6 +272,10 @@ impl ChipStoreBackend for FsBackend {
         // FS backend does full scans; no persisted secondary indexes to rebuild.
         Ok(())
     }
+
+    async fn scan_all(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.iter_all_chips()
+    }
 }
 
 /// S3-compatible backend (local emulation for now).
@@ -347,6 +351,10 @@ impl ChipStoreBackend for S3Backend {
 
     async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
         self.fs.rebuild_indexes().await
+    }
+
+    async fn scan_all(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.fs.scan_all().await
     }
 }
 
@@ -486,6 +494,11 @@ impl ChipStoreBackend for InMemoryBackend {
             self.index_chip(chip).await;
         }
         Ok(())
+    }
+
+    async fn scan_all(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        let chips = self.chips.read().await;
+        Ok(chips.values().cloned().collect())
     }
 }
 
@@ -664,6 +677,17 @@ impl SledBackend {
         Ok(Some(chip))
     }
 
+    fn scan_all_chips(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        let mut chips = Vec::new();
+        for item in self.db.iter() {
+            let (_cid, value) = item.map_err(|e| ChipStoreError::Backend(e.to_string()))?;
+            let chip: StoredChip = serde_json::from_slice(&value)
+                .map_err(|e| ChipStoreError::Serialization(e.to_string()))?;
+            chips.push(chip);
+        }
+        Ok(chips)
+    }
+
     fn candidate_cids_from_indexes(
         &self,
         query: &ChipQuery,
@@ -809,6 +833,10 @@ impl ChipStoreBackend for SledBackend {
 
     async fn rebuild_indexes(&self) -> Result<(), ChipStoreError> {
         SledBackend::rebuild_indexes(self)
+    }
+
+    async fn scan_all(&self) -> Result<Vec<StoredChip>, ChipStoreError> {
+        self.scan_all_chips()
     }
 }
 

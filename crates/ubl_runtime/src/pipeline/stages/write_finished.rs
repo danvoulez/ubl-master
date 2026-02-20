@@ -8,6 +8,7 @@ impl UblPipeline {
         wa_receipt: &PipelineReceipt,
         tr_receipt: &PipelineReceipt,
         check: &CheckResult,
+        pipeline_duration_ms: i64,
     ) -> Result<PipelineReceipt, PipelineError> {
         // Compute the final chip CID
         let chip_nrf1 = ubl_ai_nrf1::to_nrf1_bytes(request.body())
@@ -30,7 +31,7 @@ impl UblPipeline {
             wa_cid: wa_receipt.body_cid.as_str().to_string(),
             tr_cid: Some(tr_receipt.body_cid.as_str().to_string()),
             artifacts,
-            duration_ms: 50, // Overwritten by caller with real timing
+            duration_ms: pipeline_duration_ms,
             policy_trace: check.trace.clone(),
             short_circuited: check.short_circuited,
         };
@@ -55,13 +56,14 @@ impl UblPipeline {
         &self,
         wa_receipt: &PipelineReceipt,
         check: &CheckResult,
+        pipeline_duration_ms: i64,
     ) -> Result<PipelineReceipt, PipelineError> {
         let wf_body = WfReceiptBody {
             decision: Decision::Deny,
             wa_cid: wa_receipt.body_cid.as_str().to_string(),
             tr_cid: None, // No transition executed
             artifacts: HashMap::new(),
-            duration_ms: 10,
+            duration_ms: pipeline_duration_ms,
             policy_trace: check.trace.clone(),
             short_circuited: true,
         };

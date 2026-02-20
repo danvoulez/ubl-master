@@ -1,6 +1,7 @@
 //! Durable outbox dispatcher with retry/backoff.
 
 use crate::durable_store::{DurableError, DurableStore, OutboxEvent};
+use std::future::Future;
 
 #[derive(Clone)]
 pub struct OutboxDispatcher {
@@ -44,6 +45,39 @@ impl OutboxDispatcher {
                         (self.base_backoff_secs.saturating_mul(factor)).min(self.max_backoff_secs);
                     let next = chrono::Utc::now().timestamp().saturating_add(backoff);
                     self.store.nack_outbox(event.id, next)?;
+                }
+            }
+            processed += 1;
+        }
+
+        Ok(processed)
+    }
+
+    /// Async variant of `run_once` for network delivery handlers.
+    pub async fn run_once_async<F, Fut>(
+        &self,
+        limit: usize,
+        mut handler: F,
+    ) -> Result<usize, DurableError>
+    where
+        F: FnMut(OutboxEvent) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        let events = self.store.claim_outbox(limit)?;
+        let mut processed = 0usize;
+
+        for event in events {
+            let event_id = event.id;
+            let attempts = event.attempts;
+            match handler(event).await {
+                Ok(_) => self.store.ack_outbox(event_id)?,
+                Err(_) => {
+                    let tries = attempts.saturating_add(1) as u32;
+                    let factor = 2i64.saturating_pow(tries.min(16));
+                    let backoff =
+                        (self.base_backoff_secs.saturating_mul(factor)).min(self.max_backoff_secs);
+                    let next = chrono::Utc::now().timestamp().saturating_add(backoff);
+                    self.store.nack_outbox(event_id, next)?;
                 }
             }
             processed += 1;
@@ -109,5 +143,19 @@ mod tests {
             .expect("dispatcher run");
         assert_eq!(processed, 1);
         assert_eq!(store.outbox_pending().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_async_handler_acks_success() {
+        let store = DurableStore::new(temp_dsn("dispatcher_async_ack.db")).unwrap();
+        seed_store_with_one_event(&store, "async-ack-1");
+        let dispatcher = OutboxDispatcher::new(store.clone());
+
+        let processed = dispatcher
+            .run_once_async(8, |_event| async { Ok(()) })
+            .await
+            .expect("dispatcher async run");
+        assert_eq!(processed, 1);
+        assert_eq!(store.outbox_pending().unwrap(), 0);
     }
 }

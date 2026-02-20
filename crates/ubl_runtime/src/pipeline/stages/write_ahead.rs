@@ -9,6 +9,8 @@ impl UblPipeline {
         // Generate nonce and check for replay
         let nonce = Self::generate_nonce();
         {
+            // Session-level replay defense only; durable idempotency remains the
+            // cross-restart protection boundary.
             let mut seen = self.seen_nonces.write().await;
             if !seen.insert(nonce.clone()) {
                 return Err(PipelineError::ReplayDetected("duplicate nonce".to_string()));

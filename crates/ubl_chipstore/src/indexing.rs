@@ -8,7 +8,7 @@ use ubl_types::Cid as TypedCid;
 
 /// Index for efficient chip lookups
 pub struct ChipIndexer {
-    _backend: Arc<dyn ChipStoreBackend>,
+    backend: Arc<dyn ChipStoreBackend>,
     // In-memory indexes for fast lookups
     type_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>, // chip_type -> CIDs
     tag_index: Arc<RwLock<HashMap<String, HashSet<TypedCid>>>>,  // tag -> CIDs
@@ -18,11 +18,19 @@ pub struct ChipIndexer {
 impl ChipIndexer {
     pub fn new(backend: Arc<dyn ChipStoreBackend>) -> Self {
         Self {
-            _backend: backend,
+            backend,
             type_index: Arc::new(RwLock::new(HashMap::new())),
             tag_index: Arc::new(RwLock::new(HashMap::new())),
             executor_index: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub async fn new_with_rebuild(
+        backend: Arc<dyn ChipStoreBackend>,
+    ) -> Result<Self, ChipStoreError> {
+        let indexer = Self::new(backend);
+        indexer.rebuild_indexes().await?;
+        Ok(indexer)
     }
 
     /// Index a newly stored chip
@@ -191,10 +199,104 @@ impl ChipIndexer {
             executor_index.clear();
         }
 
-        // TODO: Implement full scan and rebuild
-        // This would require a way to iterate over all chips in the backend
-        // For now, indexes are built incrementally as chips are added
+        let chips = self.backend.scan_all().await?;
+        for chip in &chips {
+            self.index_chip(chip).await?;
+        }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ExecutionMetadata, InMemoryBackend};
+    use serde_json::json;
+    use ubl_types::Did as TypedDid;
+
+    fn make_chip(cid: &str, receipt_cid: &str, chip_type: &str, tag: &str) -> StoredChip {
+        StoredChip {
+            cid: TypedCid::new_unchecked(cid),
+            chip_type: chip_type.to_string(),
+            chip_data: json!({
+                "@type": chip_type,
+                "@id": "test-chip",
+                "@ver": "1.0",
+                "@world": "a/test/t/dev"
+            }),
+            receipt_cid: TypedCid::new_unchecked(receipt_cid),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            execution_metadata: ExecutionMetadata {
+                runtime_version: "test-runtime".to_string(),
+                execution_time_ms: 1,
+                fuel_consumed: 1,
+                policies_applied: vec!["p0".to_string()],
+                executor_did: TypedDid::new_unchecked("did:key:zIndexer"),
+                reproducible: true,
+            },
+            tags: vec![tag.to_string()],
+            related_chips: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_scans_backend_data() {
+        let backend = Arc::new(InMemoryBackend::new());
+        backend
+            .put_chip(&make_chip(
+                "b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "b3:1111111111111111111111111111111111111111111111111111111111111111",
+                "ubl/advisory",
+                "passport_cid:b3:passport-a",
+            ))
+            .await
+            .expect("store chip a");
+        backend
+            .put_chip(&make_chip(
+                "b3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "b3:2222222222222222222222222222222222222222222222222222222222222222",
+                "ubl/advisory",
+                "passport_cid:b3:passport-b",
+            ))
+            .await
+            .expect("store chip b");
+
+        let indexer = ChipIndexer::new(backend);
+        assert!(indexer
+            .get_cids_by_type("ubl/advisory")
+            .await
+            .expect("empty before rebuild")
+            .is_empty());
+
+        indexer.rebuild_indexes().await.expect("rebuild");
+        let cids = indexer
+            .get_cids_by_type("ubl/advisory")
+            .await
+            .expect("lookup by type");
+        assert_eq!(cids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn new_with_rebuild_populates_indexes() {
+        let backend = Arc::new(InMemoryBackend::new());
+        backend
+            .put_chip(&make_chip(
+                "b3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "b3:3333333333333333333333333333333333333333333333333333333333333333",
+                "ubl/report",
+                "status:ok",
+            ))
+            .await
+            .expect("store chip");
+
+        let indexer = ChipIndexer::new_with_rebuild(backend)
+            .await
+            .expect("new+rebuild");
+        let cids = indexer
+            .get_cids_by_tag("status:ok")
+            .await
+            .expect("lookup by tag");
+        assert_eq!(cids.len(), 1);
     }
 }

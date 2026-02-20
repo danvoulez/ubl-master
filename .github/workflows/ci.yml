@@ -141,6 +141,33 @@ jobs:
           cargo semver-checks check-release --baseline-rev origin/main
         continue-on-error: true
 
+  rollout_check:
+    name: "🚦 Rollout Check (${{ matrix.os }})"
+    needs: tr
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Gate Binary
+        run: cargo build -p ubl_gate
+
+      - name: Rollout P0→P1 Preflight
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            RUNTIME_HASH="$(sha256sum target/debug/ubl_gate | cut -d' ' -f1)"
+          else
+            RUNTIME_HASH="$(shasum -a 256 target/debug/ubl_gate | awk '{print $1}')"
+          fi
+          export RUNTIME_HASH
+          make rollout-check
+
   simkit_stx:
     name: "🧪 SIMKIT-STX"
     needs: tr
@@ -233,7 +260,7 @@ jobs:
 
   wf:
     name: "✅ WF"
-    needs: [knock, wa, tr, execute, simkit_stx]
+    needs: [knock, wa, tr, execute, rollout_check, simkit_stx]
     if: always()
     runs-on: ubuntu-latest
     steps:

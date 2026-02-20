@@ -1,5 +1,6 @@
 // NRF-1.1 canonical encoding and CID
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -183,6 +184,25 @@ fn decode_varint32<R: Read>(r: &mut R) -> Result<u32> {
 }
 
 pub fn json_to_nrf(value: &Value) -> Result<NrfValue> {
+    json_to_nrf_with_path(value, "body")
+}
+
+fn path_for_key(path: &str, key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '@')
+    {
+        format!("{}.{}", path, key)
+    } else {
+        format!("{}[{:?}]", path, key)
+    }
+}
+
+fn path_for_index(path: &str, idx: usize) -> String {
+    format!("{}[{}]", path, idx)
+}
+
+fn json_to_nrf_with_path(value: &Value, path: &str) -> Result<NrfValue> {
     match value {
         Value::Null => Ok(NrfValue::Null),
         Value::Bool(b) => Ok(NrfValue::Bool(*b)),
@@ -190,52 +210,196 @@ pub fn json_to_nrf(value: &Value) -> Result<NrfValue> {
             if n.is_i64() {
                 Ok(NrfValue::Int(n.as_i64().unwrap()))
             } else {
-                bail!("Number must be i64");
+                bail!("ρ violation at {}: Number must be i64", path);
             }
         }
         Value::String(s) => {
             if s.chars().any(|c| c == '\u{feff}') {
-                bail!("BOMPresent");
+                bail!("ρ violation at {}: BOMPresent", path);
             }
             if s.chars().any(|c| ('\u{0000}'..='\u{001f}').contains(&c)) {
-                bail!("ControlCharPresent");
+                bail!("ρ violation at {}: ControlCharPresent", path);
             }
             if s.nfc().collect::<String>() != *s {
-                bail!("NotNFC");
+                bail!("ρ violation at {}: NotNFC", path);
             }
             Ok(NrfValue::String(s.clone()))
         }
         Value::Array(arr) => {
             let mut items = Vec::with_capacity(arr.len());
-            for v in arr {
-                items.push(json_to_nrf(v)?);
+            for (idx, v) in arr.iter().enumerate() {
+                items.push(json_to_nrf_with_path(v, &path_for_index(path, idx))?);
             }
             Ok(NrfValue::Array(items))
         }
         Value::Object(map) => {
             let mut bt = BTreeMap::new();
             for (k, v) in map {
+                let key_path = path_for_key(path, k);
                 if k.chars().any(|c| c == '\u{feff}') {
-                    bail!("BOMPresent in key");
+                    bail!("ρ violation at {}: BOMPresent in key", key_path);
                 }
                 if k.chars().any(|c| ('\u{0000}'..='\u{001f}').contains(&c)) {
-                    bail!("ControlCharPresent in key");
+                    bail!("ρ violation at {}: ControlCharPresent in key", key_path);
                 }
                 if k.nfc().collect::<String>() != *k {
-                    bail!("NotNFC in key");
+                    bail!("ρ violation at {}: NotNFC in key", key_path);
                 }
                 // ρ rule: null values stripped from maps (absence ≠ null)
                 if v.is_null() {
                     continue;
                 }
-                let nrf_val = json_to_nrf(v)?;
+                let nrf_val = json_to_nrf_with_path(v, &key_path)?;
                 if bt.insert(k.clone(), nrf_val).is_some() {
-                    bail!("DuplicateKey({k})");
+                    bail!("ρ violation at {}: DuplicateKey({})", path, k);
                 }
             }
             Ok(NrfValue::Map(bt))
         }
     }
+}
+
+fn contains_control_char(s: &str) -> bool {
+    s.chars().any(|c| ('\u{0000}'..='\u{001f}').contains(&c))
+}
+
+fn normalize_string_scalar(s: &str) -> Result<String> {
+    let without_bom: String = s.chars().filter(|c| *c != '\u{feff}').collect();
+    if contains_control_char(&without_bom) {
+        bail!("ControlCharPresent");
+    }
+    Ok(without_bom.nfc().collect::<String>())
+}
+
+fn normalize_key_scalar(k: &str) -> Result<String> {
+    let normalized = normalize_string_scalar(k)?;
+    if normalized.is_empty() {
+        bail!("EmptyKeyAfterNormalization");
+    }
+    Ok(normalized)
+}
+
+fn is_timestamp_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.ends_with("_at")
+        || key.ends_with("_time")
+        || key.ends_with("created")
+        || key.ends_with("expires")
+        || key.ends_with("issued")
+}
+
+fn is_set_like_key(key: &str) -> bool {
+    matches!(
+        key,
+        "chip_types" | "policy_refs" | "evidence_cids" | "audience"
+    )
+}
+
+fn normalize_value_for_input(value: &Value, parent_key: Option<&str>, path: &str) -> Result<Value> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Bool(b) => Ok(Value::Bool(*b)),
+        Value::Number(n) => Ok(Value::Number(n.clone())),
+        Value::String(s) => {
+            let mut normalized = normalize_string_scalar(s)
+                .map_err(|e| anyhow::anyhow!("ρ violation at {}: {}", path, e))?;
+            if parent_key.is_some_and(is_timestamp_key) {
+                if let Ok(ts) = normalize_timestamp(&normalized) {
+                    normalized = ts;
+                }
+            }
+            Ok(Value::String(normalized))
+        }
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (idx, item) in arr.iter().enumerate() {
+                out.push(normalize_value_for_input(
+                    item,
+                    None,
+                    &path_for_index(path, idx),
+                )?);
+            }
+            if parent_key.is_some_and(is_set_like_key) {
+                return Ok(Value::Array(normalize_as_set_with_path(&out, path)?));
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                let key_path = path_for_key(path, k);
+                let normalized_key = normalize_key_scalar(k)
+                    .map_err(|e| anyhow::anyhow!("ρ violation at {}: {}", key_path, e))?;
+                let normalized_value =
+                    normalize_value_for_input(v, Some(&normalized_key), &key_path)?;
+                // ρ rule: null values stripped from maps.
+                if normalized_value.is_null() {
+                    continue;
+                }
+                if out
+                    .insert(normalized_key.clone(), normalized_value)
+                    .is_some()
+                {
+                    bail!("ρ violation at {}: DuplicateKey({})", path, normalized_key);
+                }
+            }
+            Ok(Value::Object(out))
+        }
+    }
+}
+
+/// Normalize external input to ρ-compatible canonical form before encoding.
+///
+/// Rules:
+/// - NFD -> NFC (keys and string values)
+/// - Strip BOM (U+FEFF) from keys/values
+/// - Reject control chars U+0000..U+001F
+/// - Strip null values from maps
+/// - Normalize RFC3339 timestamp strings on common timestamp fields
+/// - Normalize set-like arrays (`chip_types`, `policy_refs`, `evidence_cids`, `audience`)
+pub fn normalize_for_input(value: &Value) -> Result<Value> {
+    normalize_value_for_input(value, None, "body")
+}
+
+/// Normalize RFC3339 timestamp formatting.
+///
+/// Examples:
+/// - `2024-01-15T10:30:00.000Z` -> `2024-01-15T10:30:00Z`
+/// - `2024-01-15T10:30:00.100Z` -> `2024-01-15T10:30:00.1Z`
+pub fn normalize_timestamp(s: &str) -> Result<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s).context("InvalidRFC3339Timestamp")?;
+    let utc = dt.with_timezone(&Utc);
+    let base = utc.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let nanos = utc.timestamp_subsec_nanos();
+    if nanos == 0 {
+        return Ok(format!("{}Z", base));
+    }
+    let mut frac = format!("{:09}", nanos);
+    while frac.ends_with('0') {
+        frac.pop();
+    }
+    Ok(format!("{}.{}Z", base, frac))
+}
+
+/// Normalize an array as a mathematical set:
+/// sort by NRF bytes and deduplicate equal canonical bytes.
+pub fn normalize_as_set(items: &[serde_json::Value]) -> Result<Vec<serde_json::Value>> {
+    normalize_as_set_with_path(items, "body_set")
+}
+
+fn normalize_as_set_with_path(
+    items: &[serde_json::Value],
+    path: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut pairs: Vec<(Vec<u8>, serde_json::Value)> = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let nrf = json_to_nrf_with_path(item, &path_for_index(path, idx))?;
+        let bytes = encode_to_vec(&nrf)?;
+        pairs.push((bytes, item.clone()));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+    Ok(pairs.into_iter().map(|(_, value)| value).collect())
 }
 
 /// Compute BLAKE3 hash of NRF-1 bytes, return as `b3:` + lowercase hex (64 chars).
@@ -543,6 +707,69 @@ mod tests {
         } else {
             panic!("expected Array");
         }
+    }
+
+    #[test]
+    fn normalize_for_input_converts_nfd_to_nfc() {
+        let input = json!({"name":"Cafe\u{0301}"});
+        let out = normalize_for_input(&input).unwrap();
+        assert_eq!(out["name"], Value::String("Café".to_string()));
+    }
+
+    #[test]
+    fn normalize_for_input_strips_bom_in_key_and_value() {
+        let input = json!({"\u{feff}name":"\u{feff}alice"});
+        let out = normalize_for_input(&input).unwrap();
+        assert_eq!(out.get("name"), Some(&Value::String("alice".to_string())));
+    }
+
+    #[test]
+    fn normalize_for_input_rejects_control_chars() {
+        let input = json!({"name":"hello\u{001f}world"});
+        let err = normalize_for_input(&input).unwrap_err().to_string();
+        assert!(err.contains("ControlChar"));
+    }
+
+    #[test]
+    fn normalize_for_input_error_includes_json_path() {
+        let input = json!({"user":{"name":"hello\u{001f}world"}});
+        let err = normalize_for_input(&input).unwrap_err().to_string();
+        assert!(err.contains("body.user.name"));
+    }
+
+    #[test]
+    fn normalize_timestamp_strips_trailing_fraction_zeros() {
+        let ts = normalize_timestamp("2024-01-15T10:30:00.100Z").unwrap();
+        assert_eq!(ts, "2024-01-15T10:30:00.1Z");
+
+        let ts2 = normalize_timestamp("2024-01-15T10:30:00.000Z").unwrap();
+        assert_eq!(ts2, "2024-01-15T10:30:00Z");
+    }
+
+    #[test]
+    fn normalize_as_set_sorts_and_dedups() {
+        let input = vec![json!("b"), json!("a"), json!("a")];
+        let out = normalize_as_set(&input).unwrap();
+        assert_eq!(out, vec![json!("a"), json!("b")]);
+    }
+
+    #[test]
+    fn normalize_for_input_applies_timestamp_and_set_rules() {
+        let input = json!({
+            "created_at": "2024-01-15T10:30:00.000Z",
+            "evidence_cids": ["b3:z", "b3:a", "b3:a"]
+        });
+        let out = normalize_for_input(&input).unwrap();
+        assert_eq!(out["created_at"], "2024-01-15T10:30:00Z");
+        assert_eq!(out["evidence_cids"], json!(["b3:a", "b3:z"]));
+    }
+
+    #[test]
+    fn json_to_nrf_error_includes_json_path() {
+        let input = json!({"user":{"name":"Cafe\u{0301}"}});
+        let err = json_to_nrf(&input).unwrap_err().to_string();
+        assert!(err.contains("body.user.name"));
+        assert!(err.contains("NotNFC"));
     }
 
     // ── Decode: rejection of invalid bytes ───────────────────────

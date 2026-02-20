@@ -57,6 +57,8 @@ pub enum KnockError {
     MalformedNum(String),
     #[error("KNOCK-010: numeric literals are disabled (set as @num atoms) at {0}")]
     NumericLiteralNotAllowed(String),
+    #[error("KNOCK-011: input normalization failed: {0}")]
+    InputNormalization(String),
 }
 
 /// Validate raw bytes before JSON parsing.
@@ -115,6 +117,8 @@ pub fn knock(bytes: &[u8]) -> Result<Value, KnockError> {
     // Parse JSON (also validates UTF-8 at serde level)
     let mut value: Value = serde_json::from_slice(bytes).map_err(|_| KnockError::InvalidUtf8)?;
 
+    value = ubl_ai_nrf1::normalize_for_input(&value).map_err(map_normalization_error)?;
+
     if matches!(F64ImportMode::from_env(), F64ImportMode::Bnd) {
         normalize_f64_to_bnd(&mut value)?;
     }
@@ -125,6 +129,16 @@ pub fn knock(bytes: &[u8]) -> Result<Value, KnockError> {
     check_duplicate_keys(bytes)?;
 
     Ok(value)
+}
+
+fn map_normalization_error(err: anyhow::Error) -> KnockError {
+    let msg = err.to_string();
+    if let Some(start) = msg.find("DuplicateKey(") {
+        let tail = &msg[start + "DuplicateKey(".len()..];
+        let raw = tail.split(')').next().unwrap_or(tail);
+        return KnockError::DuplicateKey(raw.to_string());
+    }
+    KnockError::InputNormalization(msg)
 }
 
 fn check_depth(value: &Value, depth: usize) -> Result<(), KnockError> {
@@ -740,5 +754,38 @@ mod tests {
         }))
         .unwrap();
         assert!(knock(&bytes).is_ok());
+    }
+
+    #[test]
+    fn knock_normalizes_timestamp_and_set_like_arrays() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "created_at": "2024-01-15T10:30:00.000Z",
+            "evidence_cids": ["b3:z", "b3:a", "b3:a"]
+        }))
+        .unwrap();
+        let parsed = knock(&bytes).unwrap();
+        assert_eq!(parsed["created_at"], "2024-01-15T10:30:00Z");
+        assert_eq!(parsed["evidence_cids"], json!(["b3:a", "b3:z"]));
+    }
+
+    #[test]
+    fn knock_rejects_keys_that_collide_after_normalization() {
+        let raw = br#"{"@type":"ubl/test","@world":"a/x/t/y","Cafe\u0301":"a","Caf\u00e9":"b"}"#;
+        let err = knock(raw).unwrap_err();
+        assert!(matches!(err, KnockError::DuplicateKey(_)));
+    }
+
+    #[test]
+    fn knock_reports_rho_path_on_normalization_error() {
+        let bytes = serde_json::to_vec(&json!({
+            "@type": "ubl/test",
+            "@world": "a/x/t/y",
+            "profile": {"name": "bad\u{001f}value"}
+        }))
+        .unwrap();
+        let err = knock(&bytes).unwrap_err().to_string();
+        assert!(err.contains("body.profile.name"));
     }
 }

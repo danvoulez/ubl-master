@@ -23,8 +23,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ubl_chipstore::{ChipStore, SledBackend};
 use ubl_eventstore::{EventQuery, EventStore};
+use ubl_receipt::UnifiedReceipt;
 use ubl_runtime::advisory::{Advisory, AdvisoryEngine, AdvisoryHook};
-use ubl_runtime::durable_store::DurableStore;
+use ubl_runtime::durable_store::{DurableStore, OutboxEvent};
 use ubl_runtime::error_response::{ErrorCode, UblError};
 use ubl_runtime::event_bus::{EventBus, ReceiptEvent};
 use ubl_runtime::manifest::GateManifest;
@@ -42,9 +43,60 @@ struct AppState {
     chip_store: Arc<ChipStore>,
     manifest: Arc<GateManifest>,
     advisory_engine: Arc<AdvisoryEngine>,
+    http_client: reqwest::Client,
     canon_rate_limiter: Option<Arc<CanonRateLimiter>>,
     durable_store: Option<Arc<DurableStore>>,
     event_store: Option<Arc<EventStore>>,
+}
+
+fn outbox_endpoint_from_env() -> Option<String> {
+    std::env::var("UBL_OUTBOX_ENDPOINT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+async fn deliver_emit_receipt_event(
+    client: &reqwest::Client,
+    endpoint: Option<&str>,
+    event: OutboxEvent,
+) -> Result<(), String> {
+    let Some(endpoint) = endpoint else {
+        warn!(
+            event_id = event.id,
+            "outbox: no endpoint configured, emit_receipt dropped"
+        );
+        return Ok(());
+    };
+
+    let payload = json!({
+        "event_id": event.id,
+        "event_type": event.event_type,
+        "attempt": event.attempts.saturating_add(1),
+        "payload": event.payload_json,
+    });
+
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("outbox http send failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
+        let body_snippet: String = body.chars().take(240).collect();
+        return Err(format!(
+            "outbox endpoint returned {} body={}",
+            status, body_snippet
+        ));
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -55,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize shared components
     let _event_bus = Arc::new(EventBus::new());
     let backend = Arc::new(SledBackend::new("./data/chips")?);
-    let chip_store = Arc::new(ChipStore::new(backend));
+    let chip_store = Arc::new(ChipStore::new_with_rebuild(backend).await?);
 
     let storage = InMemoryPolicyStorage::new();
     let mut pipeline = UblPipeline::with_chip_store(Box::new(storage), chip_store.clone());
@@ -89,22 +141,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1)
                 .max(1);
+            let outbox_endpoint = outbox_endpoint_from_env();
+            if let Some(ref endpoint) = outbox_endpoint {
+                info!(workers, endpoint = %endpoint, "outbox dispatcher started");
+            } else {
+                warn!(
+                    workers,
+                    "UBL_OUTBOX_ENDPOINT not set; emit_receipt outbox events will be dropped"
+                );
+            }
+            let outbox_http_client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?;
             metrics::set_outbox_pending(store.outbox_pending().unwrap_or(0));
 
             for worker_id in 0..workers {
                 let dispatcher = OutboxDispatcher::new((*store).clone()).with_backoff(2, 300);
                 let store_for_metrics = store.clone();
+                let outbox_endpoint_for_worker = outbox_endpoint.clone();
+                let outbox_http_client_for_worker = outbox_http_client.clone();
                 tokio::spawn(async move {
                     loop {
-                        let processed =
-                            dispatcher.run_once(64, |event| match event.event_type.as_str() {
-                                // Placeholder delivery path; real publisher can be wired here.
-                                "emit_receipt" => Ok(()),
-                                _ => {
+                        let processed = dispatcher
+                            .run_once_async(64, |event| {
+                                let outbox_endpoint = outbox_endpoint_for_worker.clone();
+                                let outbox_http_client = outbox_http_client_for_worker.clone();
+                                async move {
+                                    if event.event_type == "emit_receipt" {
+                                        return deliver_emit_receipt_event(
+                                            &outbox_http_client,
+                                            outbox_endpoint.as_deref(),
+                                            event,
+                                        )
+                                        .await;
+                                    }
                                     metrics::inc_outbox_retry();
                                     Err(format!("unknown outbox event type: {}", event.event_type))
                                 }
-                            });
+                            })
+                            .await;
 
                         match processed {
                             Ok(processed_count) => {
@@ -124,7 +199,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-            info!(workers, "outbox dispatcher started");
             Some(store)
         }
         Ok(None) => None,
@@ -183,6 +257,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chip_store,
         manifest,
         advisory_engine,
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
         canon_rate_limiter: load_canon_rate_limiter(),
         durable_store,
         event_store,
@@ -238,6 +315,43 @@ fn too_many_requests_error(message: String, details: Value) -> UblError {
         link: "https://docs.ubl.agency/errors#TOO_MANY_REQUESTS".to_string(),
         details: Some(details),
     }
+}
+
+fn tamper_detected_error(message: String, details: Value) -> UblError {
+    UblError {
+        error_type: "ubl/error".to_string(),
+        id: format!("err-tamper-{}", chrono::Utc::now().timestamp_micros()),
+        ver: "1.0".to_string(),
+        world: "a/system/t/errors".to_string(),
+        code: ErrorCode::TamperDetected,
+        message,
+        link: "https://docs.ubl.agency/errors#TAMPER_DETECTED".to_string(),
+        details: Some(details),
+    }
+}
+
+fn verify_receipt_auth_chain(receipt_cid: &str, receipt_json: &Value) -> Result<(), UblError> {
+    let receipt = UnifiedReceipt::from_json(receipt_json).map_err(|e| {
+        tamper_detected_error(
+            format!("receipt {} parse failed: {}", receipt_cid, e),
+            json!({
+                "receipt_cid": receipt_cid,
+                "reason": "receipt_parse_failed"
+            }),
+        )
+    })?;
+
+    if !receipt.verify_auth_chain() {
+        return Err(tamper_detected_error(
+            format!("receipt {} auth chain broken", receipt_cid),
+            json!({
+                "receipt_cid": receipt_cid,
+                "reason": "auth_chain_broken"
+            }),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn submit_chip_bytes(state: &AppState, body: &[u8]) -> (StatusCode, HeaderMap, Value) {
@@ -490,6 +604,24 @@ struct AdvisorQuery {
     window: Option<String>,
     interval_ms: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct Mock24hQuery {
+    world: Option<String>,
+    profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct LlmPanelQuery {
+    page: Option<String>,
+    tab: Option<String>,
+    world: Option<String>,
+    kind: Option<String>,
+    profile: Option<String>,
+    cid: Option<String>,
+    #[serde(rename = "type")]
+    chip_type: Option<String>,
 }
 
 async fn search_events(
@@ -844,6 +976,9 @@ struct RegistryVersionView {
 #[template(path = "console.html")]
 struct ConsoleTemplate {
     world: String,
+    tab: String,
+    is_stats: bool,
+    profile: String,
 }
 
 #[derive(Template)]
@@ -856,7 +991,8 @@ struct ConsoleKpisTemplate {
     allow_count: u64,
     deny_count: u64,
     outbox_pending: String,
-    p95_rows: Vec<StageP95Row>,
+    visible_p95_rows: Vec<StageP95Row>,
+    hidden_p95_rows: Vec<StageP95Row>,
 }
 
 #[derive(Clone)]
@@ -870,7 +1006,8 @@ struct StageP95Row {
 struct ConsoleEventsTemplate {
     available: bool,
     message: String,
-    rows: Vec<ConsoleEventRow>,
+    visible_rows: Vec<ConsoleEventRow>,
+    hidden_rows: Vec<ConsoleEventRow>,
 }
 
 #[derive(Clone)]
@@ -892,7 +1029,8 @@ struct RegistryTemplate {
 #[derive(Template)]
 #[template(path = "registry_table.html")]
 struct RegistryTableTemplate {
-    rows: Vec<RegistryRow>,
+    visible_rows: Vec<RegistryRow>,
+    hidden_rows: Vec<RegistryRow>,
 }
 
 #[derive(Clone)]
@@ -975,7 +1113,8 @@ struct AuditTemplate {
 #[template(path = "audit_table.html")]
 struct AuditTableTemplate {
     kind: String,
-    rows: Vec<AuditRow>,
+    visible_rows: Vec<AuditRow>,
+    hidden_rows: Vec<AuditRow>,
 }
 
 #[derive(Clone)]
@@ -985,6 +1124,37 @@ struct AuditRow {
     world: String,
     created_at: String,
     summary: String,
+}
+
+#[derive(Template)]
+#[template(path = "console_mock24h.html")]
+struct ConsoleMock24hTemplate {
+    profile: String,
+    generated_at: String,
+    visible_rows: Vec<MockHourRow>,
+    hidden_rows: Vec<MockHourRow>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct MockHourRow {
+    hour_label: String,
+    events: u64,
+    allow_pct: String,
+    deny_pct: String,
+    p95_ms: String,
+    outbox_pending: u64,
+    error_pct: String,
+}
+
+#[derive(Template)]
+#[template(path = "llm_panel.html")]
+struct LlmPanelTemplate {
+    title: String,
+    severity: String,
+    source: String,
+    generated_at: String,
+    summary: String,
+    bullets: Vec<String>,
 }
 
 fn render_html<T: Template>(template: &T) -> Response {
@@ -1002,12 +1172,46 @@ fn render_html<T: Template>(template: &T) -> Response {
     }
 }
 
+fn split_rows<T: Clone>(rows: Vec<T>, keep: usize) -> (Vec<T>, Vec<T>) {
+    let split = rows.len().min(keep);
+    let (visible, hidden) = rows.split_at(split);
+    (visible.to_vec(), hidden.to_vec())
+}
+
+fn normalize_console_tab(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "stats" | "stat" | "estatisticas" => "stats".to_string(),
+        _ => "live".to_string(),
+    }
+}
+
+fn normalize_mock_profile(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "spiky" => "spiky".to_string(),
+        "degraded" => "degraded".to_string(),
+        "chaos" => "chaos".to_string(),
+        _ => "normal".to_string(),
+    }
+}
+
 async fn console_page(Query(query): Query<std::collections::BTreeMap<String, String>>) -> Response {
     let world = query
         .get("world")
         .cloned()
         .unwrap_or_else(|| "*".to_string());
-    render_html(&ConsoleTemplate { world })
+    let tab = query
+        .get("tab")
+        .map(|v| normalize_console_tab(v))
+        .unwrap_or_else(|| "live".to_string());
+    let profile =
+        normalize_mock_profile(query.get("profile").map(String::as_str).unwrap_or("normal"));
+    let is_stats = tab == "stats";
+    render_html(&ConsoleTemplate {
+        world,
+        tab,
+        is_stats,
+        profile,
+    })
 }
 
 async fn console_kpis_partial(
@@ -1027,7 +1231,8 @@ async fn console_kpis_partial(
             allow_count: 0,
             deny_count: 0,
             outbox_pending: "-".to_string(),
-            p95_rows: Vec::new(),
+            visible_p95_rows: Vec::new(),
+            hidden_p95_rows: Vec::new(),
         });
     };
     let snapshot =
@@ -1042,7 +1247,8 @@ async fn console_kpis_partial(
                     allow_count: 0,
                     deny_count: 0,
                     outbox_pending: "-".to_string(),
-                    p95_rows: Vec::new(),
+                    visible_p95_rows: Vec::new(),
+                    hidden_p95_rows: Vec::new(),
                 });
             }
         };
@@ -1101,6 +1307,7 @@ async fn console_kpis_partial(
         }
     }
     p95_rows.sort_by(|a, b| a.stage.cmp(&b.stage));
+    let (visible_p95_rows, hidden_p95_rows) = split_rows(p95_rows, 6);
 
     render_html(&ConsoleKpisTemplate {
         available: true,
@@ -1110,7 +1317,8 @@ async fn console_kpis_partial(
         allow_count,
         deny_count,
         outbox_pending,
-        p95_rows,
+        visible_p95_rows,
+        hidden_p95_rows,
     })
 }
 
@@ -1126,7 +1334,8 @@ async fn console_events_partial(
         return render_html(&ConsoleEventsTemplate {
             available: false,
             message: "EventStore unavailable".to_string(),
-            rows: Vec::new(),
+            visible_rows: Vec::new(),
+            hidden_rows: Vec::new(),
         });
     };
     let events = match store.query(&EventQuery {
@@ -1139,7 +1348,8 @@ async fn console_events_partial(
             return render_html(&ConsoleEventsTemplate {
                 available: false,
                 message: format!("Events query error: {}", e),
-                rows: Vec::new(),
+                visible_rows: Vec::new(),
+                hidden_rows: Vec::new(),
             });
         }
     };
@@ -1185,11 +1395,546 @@ async fn console_events_partial(
         })
         .collect();
 
+    let (visible_rows, hidden_rows) = split_rows(rows, 6);
+
     render_html(&ConsoleEventsTemplate {
         available: true,
         message: String::new(),
-        rows,
+        visible_rows,
+        hidden_rows,
     })
+}
+
+async fn console_mock24h_partial(
+    Query(query): Query<std::collections::BTreeMap<String, String>>,
+) -> Response {
+    let world = query
+        .get("world")
+        .cloned()
+        .unwrap_or_else(|| "*".to_string());
+    let profile =
+        normalize_mock_profile(query.get("profile").map(String::as_str).unwrap_or("normal"));
+    let rows = build_mock_24h_rows(&profile, &world);
+    let (visible_rows, hidden_rows) = split_rows(rows, 6);
+    render_html(&ConsoleMock24hTemplate {
+        profile,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        visible_rows,
+        hidden_rows,
+    })
+}
+
+async fn mock24h_api(Query(query): Query<Mock24hQuery>) -> (StatusCode, Json<Value>) {
+    let world = query.world.unwrap_or_else(|| "*".to_string());
+    let profile = normalize_mock_profile(query.profile.as_deref().unwrap_or("normal"));
+    let rows = build_mock_24h_rows(&profile, &world);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "@type": "ubl/mock.system24h",
+            "world": world,
+            "profile": profile,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "rows": rows,
+        })),
+    )
+}
+
+fn build_mock_24h_rows(profile: &str, world: &str) -> Vec<MockHourRow> {
+    let profile = normalize_mock_profile(profile);
+    let seed = stable_seed(&format!("{}|{}", profile, world));
+    let now = chrono::Utc::now();
+    let mut rows = Vec::with_capacity(24);
+
+    for hour_back in 0..24u64 {
+        let ts = now - chrono::Duration::hours(hour_back as i64);
+        let slot = 23 - hour_back;
+        let n1 = mix64(seed ^ slot.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let n2 = mix64(seed ^ slot.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let wave = ((slot as f64 / 24.0) * std::f64::consts::TAU).sin();
+
+        let base_events = match profile.as_str() {
+            "spiky" => 820i64,
+            "degraded" => 700i64,
+            "chaos" => 620i64,
+            _ => 900i64,
+        };
+        let mut events = base_events + (wave * 140.0) as i64 + ((n1 % 220) as i64 - 110);
+        let mut deny_pct = 1.6 + ((n2 % 60) as f64 / 20.0);
+        let mut p95_ms = 38.0 + ((n1 % 65) as f64);
+        let mut outbox_pending = (n2 % 18) as i64;
+        let mut error_pct = 0.20 + ((n1 % 30) as f64 / 120.0);
+
+        if profile == "spiky" && slot % 7 == 0 {
+            events += 820;
+            p95_ms += 130.0;
+            deny_pct += 3.4;
+            outbox_pending += 45;
+            error_pct += 1.2;
+        }
+        if profile == "degraded" {
+            events -= 130;
+            p95_ms += 95.0;
+            deny_pct += 4.8;
+            outbox_pending += 38;
+            error_pct += 1.4;
+        }
+        if profile == "chaos" {
+            let flip = (n2 % 3) as i64 - 1;
+            events += flip * 350;
+            p95_ms += ((n1 % 180) as f64) * 0.9;
+            deny_pct += ((n2 % 90) as f64) / 12.0;
+            outbox_pending += (n1 % 90) as i64;
+            error_pct += ((n2 % 70) as f64) / 20.0;
+        }
+
+        events = events.max(80);
+        outbox_pending = outbox_pending.max(0);
+        deny_pct = deny_pct.clamp(0.2, 48.0);
+        error_pct = error_pct.clamp(0.05, 22.0);
+        let allow_pct = (100.0 - deny_pct - (error_pct * 0.25)).clamp(40.0, 99.5);
+
+        rows.push(MockHourRow {
+            hour_label: ts.format("%m-%d %H:00").to_string(),
+            events: events as u64,
+            allow_pct: format!("{:.2}", allow_pct),
+            deny_pct: format!("{:.2}", deny_pct),
+            p95_ms: format!("{:.1}", p95_ms),
+            outbox_pending: outbox_pending as u64,
+            error_pct: format!("{:.2}", error_pct),
+        });
+    }
+
+    rows
+}
+
+fn stable_seed(input: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+async fn ui_llm_panel(
+    State(state): State<AppState>,
+    Query(query): Query<LlmPanelQuery>,
+) -> Response {
+    let page = query.page.unwrap_or_else(|| "console".to_string());
+    let tab = normalize_console_tab(query.tab.as_deref().unwrap_or("live"));
+    let world = query.world.unwrap_or_else(|| "*".to_string());
+    let profile = normalize_mock_profile(query.profile.as_deref().unwrap_or("normal"));
+    let kind = query.kind.unwrap_or_else(|| "reports".to_string());
+    let chip_type = query.chip_type.unwrap_or_default();
+    let cid = query.cid.unwrap_or_default();
+
+    let context = build_llm_context(
+        &state, &page, &tab, &world, &profile, &kind, &chip_type, &cid,
+    )
+    .await;
+
+    let (mut severity, mut summary, mut bullets) = heuristic_analysis(&page, &context);
+    let mut source = "heuristic local mock".to_string();
+
+    if env_bool("UBL_ENABLE_REAL_LLM", false) {
+        if let Ok(text) = call_real_llm(&state.http_client, &page, &context).await {
+            let (llm_summary, llm_bullets) = parse_llm_text(&text);
+            summary = llm_summary;
+            if !llm_bullets.is_empty() {
+                bullets = llm_bullets;
+            }
+            severity = "LLM opinion".to_string();
+            source = "real llm (openai responses api)".to_string();
+        }
+    }
+
+    let title = match page.as_str() {
+        "registry" => "Registry".to_string(),
+        "registry_type" => format!("Registry Type {}", chip_type),
+        "audit" => format!("Audit {}", kind),
+        "receipt" => format!("Receipt {}", cid),
+        _ => format!("Console {}", tab),
+    };
+
+    render_html(&LlmPanelTemplate {
+        title,
+        severity,
+        source,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        summary,
+        bullets,
+    })
+}
+
+async fn build_llm_context(
+    state: &AppState,
+    page: &str,
+    tab: &str,
+    world: &str,
+    profile: &str,
+    kind: &str,
+    chip_type: &str,
+    cid: &str,
+) -> Value {
+    let world_filter = if world.trim().is_empty() || world == "*" {
+        None
+    } else {
+        Some(world)
+    };
+
+    match page {
+        "registry" => match materialize_registry(state, world_filter).await {
+            Ok(registry) => {
+                let total = registry.types.len();
+                let deprecated = registry.types.values().filter(|v| v.deprecated).count();
+                let without_kats = registry.types.values().filter(|v| !v.has_kats).count();
+                json!({
+                    "page": "registry",
+                    "world": world,
+                    "types_total": total,
+                    "deprecated_total": deprecated,
+                    "without_kats_total": without_kats,
+                })
+            }
+            Err(e) => json!({
+                "page": "registry",
+                "world": world,
+                "error": e
+            }),
+        },
+        "registry_type" => match materialize_registry(state, None).await {
+            Ok(registry) => {
+                let view = registry.types.get(chip_type);
+                json!({
+                    "page": "registry_type",
+                    "chip_type": chip_type,
+                    "exists": view.is_some(),
+                    "deprecated": view.map(|v| v.deprecated).unwrap_or(false),
+                    "versions_total": view.map(|v| v.versions.len()).unwrap_or(0),
+                    "has_kats": view.map(|v| v.has_kats).unwrap_or(false),
+                })
+            }
+            Err(e) => json!({
+                "page": "registry_type",
+                "chip_type": chip_type,
+                "error": e
+            }),
+        },
+        "audit" => match query_audit_rows(state, kind, world_filter, 100).await {
+            Ok(rows) => {
+                let count = rows.len();
+                json!({
+                    "page": "audit",
+                    "kind": kind,
+                    "world": world,
+                    "rows": count,
+                    "latest_cid": rows.first().map(|r| r.cid.clone()).unwrap_or_else(|| "-".to_string())
+                })
+            }
+            Err(e) => json!({
+                "page": "audit",
+                "kind": kind,
+                "world": world,
+                "error": e
+            }),
+        },
+        "receipt" => {
+            let exists = if cid.is_empty() {
+                false
+            } else {
+                state
+                    .chip_store
+                    .get_chip(cid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+            };
+            json!({
+                "page": "receipt",
+                "cid": cid,
+                "exists": exists,
+            })
+        }
+        _ => {
+            let mock_rows = build_mock_24h_rows(profile, world);
+            let sample = mock_rows.iter().take(6).collect::<Vec<_>>();
+            let deny_avg = sample
+                .iter()
+                .filter_map(|r| r.deny_pct.parse::<f64>().ok())
+                .sum::<f64>()
+                / sample.len().max(1) as f64;
+            let p95_max = sample
+                .iter()
+                .filter_map(|r| r.p95_ms.parse::<f64>().ok())
+                .fold(0.0f64, f64::max);
+            let outbox_max = sample.iter().map(|r| r.outbox_pending).max().unwrap_or(0);
+            let events_sum: u64 = sample.iter().map(|r| r.events).sum();
+
+            let mut base = json!({
+                "page": "console",
+                "tab": tab,
+                "world": world,
+                "profile": profile,
+                "mock_rollup": {
+                    "sample_hours": sample.len(),
+                    "events_sum": events_sum,
+                    "deny_avg_pct": deny_avg,
+                    "p95_max_ms": p95_max,
+                    "outbox_max": outbox_max
+                }
+            });
+
+            if let Some(store) = state.event_store.as_ref() {
+                if let Ok(snapshot) = build_advisor_snapshot(
+                    state,
+                    store,
+                    world_filter,
+                    Duration::from_secs(300),
+                    5000,
+                ) {
+                    if let Some(obj) = base.as_object_mut() {
+                        obj.insert("live_snapshot".to_string(), snapshot);
+                    }
+                }
+            }
+            base
+        }
+    }
+}
+
+fn heuristic_analysis(page: &str, context: &Value) -> (String, String, Vec<String>) {
+    let mut severity = "green".to_string();
+    let summary: String;
+    let mut bullets = Vec::new();
+
+    match page {
+        "registry" => {
+            let total = context
+                .get("types_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let deprecated = context
+                .get("deprecated_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let no_kats = context
+                .get("without_kats_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            summary = format!(
+                "Registry possui {} tipos. {} deprecated e {} sem KAT.",
+                total, deprecated, no_kats
+            );
+            if no_kats > 0 {
+                severity = "yellow".to_string();
+                bullets.push("Priorizar KAT para tipos sem cobertura.".to_string());
+            }
+            if deprecated > 0 {
+                bullets.push("Revisar plano de sunset dos tipos deprecated.".to_string());
+            }
+        }
+        "registry_type" => {
+            let exists = context
+                .get("exists")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let versions = context
+                .get("versions_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let has_kats = context
+                .get("has_kats")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !exists {
+                severity = "yellow".to_string();
+                summary = "Tipo nao encontrado no registry materializado.".to_string();
+            } else {
+                summary = format!("Tipo ativo com {} versoes registradas.", versions);
+                if !has_kats {
+                    severity = "yellow".to_string();
+                    bullets.push("Adicionar KATs para validar regressao de politica.".to_string());
+                }
+            }
+        }
+        "audit" => {
+            let rows = context.get("rows").and_then(|v| v.as_u64()).unwrap_or(0);
+            let kind = context
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("reports");
+            summary = format!("Audit {} retornou {} artefatos.", kind, rows);
+            if rows == 0 {
+                severity = "yellow".to_string();
+                bullets.push("Sem artefatos recentes: revisar emissao de auditoria.".to_string());
+            }
+        }
+        "receipt" => {
+            let exists = context
+                .get("exists")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if exists {
+                summary = "Receipt localizado; trilha de trace e narrate disponivel.".to_string();
+            } else {
+                severity = "yellow".to_string();
+                summary = "Receipt nao localizado no store local.".to_string();
+            }
+        }
+        _ => {
+            let deny_avg = context
+                .get("mock_rollup")
+                .and_then(|v| v.get("deny_avg_pct"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let p95_max = context
+                .get("mock_rollup")
+                .and_then(|v| v.get("p95_max_ms"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let outbox_max = context
+                .get("mock_rollup")
+                .and_then(|v| v.get("outbox_max"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let events_sum = context
+                .get("mock_rollup")
+                .and_then(|v| v.get("events_sum"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let profile = context
+                .get("profile")
+                .and_then(|v| v.as_str())
+                .unwrap_or("normal");
+            let tab = context
+                .get("tab")
+                .and_then(|v| v.as_str())
+                .unwrap_or("live");
+
+            summary = format!(
+                "Console {} com perfil {}: {} eventos no recorte recente; deny medio {:.2}%, p95 max {:.1}ms.",
+                tab, profile, events_sum, deny_avg, p95_max
+            );
+
+            if deny_avg >= 7.0 || p95_max >= 240.0 || outbox_max >= 80 {
+                severity = "red".to_string();
+                bullets.push(
+                    "Sinal de degradacao: validar pipeline CHECK/TR e fila outbox.".to_string(),
+                );
+            } else if deny_avg >= 4.0 || p95_max >= 170.0 || outbox_max >= 35 {
+                severity = "yellow".to_string();
+                bullets.push(
+                    "Tendencia de risco moderado: aumentar observabilidade por stage.".to_string(),
+                );
+            }
+
+            if profile == "chaos" || profile == "degraded" {
+                bullets.push(
+                    "Perfil mock agressivo ativo; usar para testar auto-remediacao.".to_string(),
+                );
+            }
+        }
+    }
+
+    if bullets.is_empty() {
+        bullets.push("Continuar monitorando variacao de latencia e deny rate.".to_string());
+    }
+    (severity, summary, bullets)
+}
+
+async fn call_real_llm(
+    client: &reqwest::Client,
+    page: &str,
+    context: &Value,
+) -> Result<String, String> {
+    let api_key =
+        std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not configured".to_string())?;
+    let model = std::env::var("UBL_LLM_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string());
+    let payload = json!({
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": "Voce e um analista SRE. Responda em portugues: 1 resumo curto + ate 3 bullets acionaveis."
+            },
+            {
+                "role": "user",
+                "content": format!("Analise a pagina {} com este contexto JSON:\\n{}", page, context)
+            }
+        ],
+        "max_output_tokens": 220
+    });
+
+    let res = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body: Value = res.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("openai status {}: {}", status, body));
+    }
+
+    if let Some(text) = body.get("output_text").and_then(|v| v.as_str()) {
+        if !text.trim().is_empty() {
+            return Ok(text.trim().to_string());
+        }
+    }
+
+    if let Some(outputs) = body.get("output").and_then(|v| v.as_array()) {
+        for item in outputs {
+            if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        if !text.trim().is_empty() {
+                            return Ok(text.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("empty LLM output".to_string())
+}
+
+fn parse_llm_text(text: &str) -> (String, Vec<String>) {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return (
+            "LLM respondeu sem conteudo, mantendo analise local.".to_string(),
+            Vec::new(),
+        );
+    }
+
+    let summary = lines.remove(0).to_string();
+    let bullets = lines
+        .into_iter()
+        .take(3)
+        .map(|line| {
+            line.trim_start_matches('-')
+                .trim_start_matches('*')
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    (summary, bullets)
 }
 
 async fn console_receipt_page(Path(cid): Path<String>) -> Response {
@@ -1231,7 +1976,12 @@ async fn audit_table_partial(
                 .into_response();
         }
     };
-    render_html(&AuditTableTemplate { kind, rows })
+    let (visible_rows, hidden_rows) = split_rows(rows, 6);
+    render_html(&AuditTableTemplate {
+        kind,
+        visible_rows,
+        hidden_rows,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1451,7 +2201,11 @@ async fn registry_table_partial(
                 .unwrap_or_else(|| "-".to_string()),
         })
         .collect();
-    render_html(&RegistryTableTemplate { rows })
+    let (visible_rows, hidden_rows) = split_rows(rows, 6);
+    render_html(&RegistryTableTemplate {
+        visible_rows,
+        hidden_rows,
+    })
 }
 
 async fn registry_type_page(
@@ -2181,7 +2935,9 @@ fn build_router(state: AppState) -> Router {
         .route("/console", get(console_page))
         .route("/console/_kpis", get(console_kpis_partial))
         .route("/console/_events", get(console_events_partial))
+        .route("/console/_mock24h", get(console_mock24h_partial))
         .route("/console/receipt/:cid", get(console_receipt_page))
+        .route("/ui/_llm", get(ui_llm_panel))
         .route("/audit/_table", get(audit_table_partial))
         .route("/audit/:kind", get(audit_page))
         .route("/registry", get(registry_page))
@@ -2193,6 +2949,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/audit/compactions", get(list_audit_compactions))
         .route("/v1/events", get(stream_events))
         .route("/v1/events/search", get(search_events))
+        .route("/v1/mock/system24h", get(mock24h_api))
         .route("/v1/advisor/tap", get(advisor_tap))
         .route("/v1/advisor/snapshots", get(advisor_snapshots))
         .route("/v1/registry/types", get(registry_types))
@@ -2310,17 +3067,45 @@ async fn verify_chip(
 
     let cid_matches = encoding_ok && computed_cid == cid;
 
-    // Check receipt exists
     let receipt_cid = &chip.receipt_cid;
+    let mut auth_chain_verified: Option<bool> = None;
     let receipt_exists = if receipt_cid.as_str().is_empty() {
         false
     } else {
-        state
-            .chip_store
-            .get_chip_by_receipt_cid(receipt_cid.as_str())
-            .await
-            .map(|c| c.is_some())
-            .unwrap_or(false)
+        match state.durable_store.as_ref() {
+            Some(store) => match store.get_receipt(receipt_cid.as_str()) {
+                Ok(Some(receipt_json)) => {
+                    if let Err(ubl_err) =
+                        verify_receipt_auth_chain(receipt_cid.as_str(), &receipt_json)
+                    {
+                        return (
+                            StatusCode::from_u16(ubl_err.code.http_status())
+                                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY),
+                            Json(ubl_err.to_json()),
+                        );
+                    }
+                    auth_chain_verified = Some(true);
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "@type": "ubl/error",
+                            "code": "INTERNAL_ERROR",
+                            "message": format!("Receipt fetch failed: {}", e)
+                        })),
+                    );
+                }
+            },
+            None => state
+                .chip_store
+                .get_chip_by_receipt_cid(receipt_cid.as_str())
+                .await
+                .map(|c| c.is_some())
+                .unwrap_or(false),
+        }
     };
 
     (
@@ -2335,6 +3120,7 @@ async fn verify_chip(
             "chip_type": chip.chip_type,
             "receipt_cid": chip.receipt_cid,
             "receipt_exists": receipt_exists,
+            "auth_chain_verified": auth_chain_verified,
             "created_at": chip.created_at,
         })),
     )
@@ -2452,6 +3238,14 @@ async fn get_receipt(
 
     match store.get_receipt(&cid) {
         Ok(Some(receipt)) => {
+            if let Err(ubl_err) = verify_receipt_auth_chain(&cid, &receipt) {
+                return (
+                    StatusCode::from_u16(ubl_err.code.http_status())
+                        .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY),
+                    HeaderMap::new(),
+                    Json(ubl_err.to_json()),
+                );
+            }
             let mut h = HeaderMap::new();
             let etag = format!("\"{}\"", cid);
             h.insert(header::ETAG, etag.parse().unwrap());
@@ -2646,6 +3440,40 @@ async fn get_receipt_trace(
     State(state): State<AppState>,
     Path(cid): Path<String>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(store) = state.durable_store.as_ref() {
+        match store.get_receipt(&cid) {
+            Ok(Some(receipt_json)) => {
+                if let Err(ubl_err) = verify_receipt_auth_chain(&cid, &receipt_json) {
+                    return (
+                        StatusCode::from_u16(ubl_err.code.http_status())
+                            .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY),
+                        Json(ubl_err.to_json()),
+                    );
+                }
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "@type":"ubl/error",
+                        "code":"NOT_FOUND",
+                        "message": format!("Receipt {} not found", cid)
+                    })),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "@type":"ubl/error",
+                        "code":"INTERNAL_ERROR",
+                        "message": format!("Receipt fetch failed: {}", e)
+                    })),
+                );
+            }
+        }
+    }
+
     match state.chip_store.get_chip_by_receipt_cid(&cid).await {
         Ok(Some(chip)) => (
             StatusCode::OK,
@@ -2654,6 +3482,7 @@ async fn get_receipt_trace(
                 "receipt_cid": cid,
                 "chip_cid": chip.cid,
                 "chip_type": chip.chip_type,
+                "auth_chain_verified": state.durable_store.is_some(),
                 "execution_metadata": {
                     "runtime_version": chip.execution_metadata.runtime_version,
                     "execution_time_ms": chip.execution_metadata.execution_time_ms,
@@ -3176,8 +4005,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
     use ubl_chipstore::InMemoryBackend;
+    use ubl_receipt::{PipelineStage, StageExecution, UnifiedReceipt};
     use ubl_runtime::durable_store::{CommitInput, NewOutboxEvent};
     use ubl_runtime::event_bus::ReceiptEvent;
+
+    const TEST_STAGE_SECRET_HEX: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn test_state(canon_limiter: Option<Arc<CanonRateLimiter>>) -> AppState {
         let backend = Arc::new(InMemoryBackend::new());
@@ -3197,6 +4030,7 @@ mod tests {
             chip_store,
             manifest: Arc::new(GateManifest::default()),
             advisory_engine,
+            http_client: reqwest::Client::new(),
             canon_rate_limiter: canon_limiter,
             durable_store: None,
             event_store: None,
@@ -3250,6 +4084,45 @@ mod tests {
         }
         state.event_store = Some(Arc::new(store));
         state
+    }
+
+    fn make_unified_receipt_json(tampered: bool) -> (String, Value) {
+        std::env::set_var("UBL_STAGE_SECRET", format!("hex:{}", TEST_STAGE_SECRET_HEX));
+
+        let mut receipt = UnifiedReceipt::new(
+            "a/test/t/main",
+            "did:key:ztest",
+            "did:key:ztest#ed25519",
+            "0011223344556677",
+        );
+        receipt
+            .append_stage(StageExecution {
+                stage: PipelineStage::WriteAhead,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                input_cid: "b3:wa-input".to_string(),
+                output_cid: Some("b3:wa-output".to_string()),
+                fuel_used: None,
+                policy_trace: vec![],
+                vm_sig: None,
+                vm_sig_payload_cid: None,
+                auth_token: String::new(),
+                duration_ms: 1,
+            })
+            .unwrap();
+        let receipt_cid = receipt.receipt_cid.as_str().to_string();
+        let mut receipt_json = receipt.to_json().unwrap();
+        if tampered {
+            if let Some(stage) = receipt_json
+                .get_mut("stages")
+                .and_then(|v| v.as_array_mut())
+                .and_then(|arr| arr.first_mut())
+            {
+                stage["auth_token"] =
+                    Value::String("hmac:00000000000000000000000000000000".to_string());
+            }
+        }
+
+        (receipt_cid, receipt_json)
     }
 
     async fn seed_meta_chip(state: &AppState, body: Value, receipt_cid: &str) {
@@ -3376,17 +4249,8 @@ mod tests {
 
     #[tokio::test]
     async fn receipts_endpoint_returns_raw_persisted_receipt() {
-        let receipt_cid = "b3:receipt-gate-test";
-        let app = build_router(test_state_with_receipt_store(
-            receipt_cid,
-            json!({
-                "@type": "ubl/receipt",
-                "@id": receipt_cid,
-                "@ver": "1.0",
-                "@world": "a/test/t/main",
-                "decision": "Allow"
-            }),
-        ));
+        let (receipt_cid, receipt_json) = make_unified_receipt_json(false);
+        let app = build_router(test_state_with_receipt_store(&receipt_cid, receipt_json));
 
         let req = Request::builder()
             .method(Method::GET)
@@ -3398,8 +4262,93 @@ mod tests {
         let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["@type"], "ubl/receipt");
-        assert_eq!(v["@id"], receipt_cid);
-        assert_eq!(v["decision"], "Allow");
+        assert_eq!(v["receipt_cid"], receipt_cid);
+    }
+
+    #[tokio::test]
+    async fn chip_verify_returns_422_when_receipt_auth_chain_is_tampered() {
+        let (receipt_cid, tampered_receipt_json) = make_unified_receipt_json(true);
+        let state = test_state_with_receipt_store(&receipt_cid, tampered_receipt_json);
+
+        let metadata: ubl_chipstore::ExecutionMetadata = serde_json::from_value(json!({
+            "runtime_version": "test-runtime",
+            "execution_time_ms": 1,
+            "fuel_consumed": 0,
+            "policies_applied": [],
+            "executor_did": "did:key:ztest",
+            "reproducible": true
+        }))
+        .unwrap();
+        let chip_cid = state
+            .chip_store
+            .store_executed_chip(
+                json!({
+                    "@type": "ubl/document",
+                    "@id": "tamper-test",
+                    "@ver": "1.0",
+                    "@world": "a/test/t/main",
+                    "title": "tamper"
+                }),
+                receipt_cid.clone(),
+                metadata,
+            )
+            .await
+            .unwrap();
+
+        let app = build_router(state);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/chips/{}/verify", chip_cid))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "TAMPER_DETECTED");
+    }
+
+    #[tokio::test]
+    async fn receipt_trace_returns_422_when_auth_chain_is_tampered() {
+        let (receipt_cid, tampered_receipt_json) = make_unified_receipt_json(true);
+        let state = test_state_with_receipt_store(&receipt_cid, tampered_receipt_json);
+
+        let metadata: ubl_chipstore::ExecutionMetadata = serde_json::from_value(json!({
+            "runtime_version": "test-runtime",
+            "execution_time_ms": 1,
+            "fuel_consumed": 0,
+            "policies_applied": [],
+            "executor_did": "did:key:ztest",
+            "reproducible": true
+        }))
+        .unwrap();
+        state
+            .chip_store
+            .store_executed_chip(
+                json!({
+                    "@type": "ubl/document",
+                    "@id": "tamper-trace-test",
+                    "@ver": "1.0",
+                    "@world": "a/test/t/main",
+                    "title": "tamper trace"
+                }),
+                receipt_cid.clone(),
+                metadata,
+            )
+            .await
+            .unwrap();
+
+        let app = build_router(state);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/receipts/{}/trace", receipt_cid))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], "TAMPER_DETECTED");
     }
 
     #[tokio::test]

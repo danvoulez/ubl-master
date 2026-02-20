@@ -68,6 +68,8 @@ pub enum ErrorCode {
     IdempotencyConflict,
     #[serde(rename = "durable_commit_failed")]
     DurableCommitFailed,
+    #[serde(rename = "TAMPER_DETECTED")]
+    TamperDetected,
 
     #[serde(rename = "INTERNAL_ERROR")]
     InternalError,
@@ -117,6 +119,7 @@ impl ErrorCode {
             Self::RuntimeHashMismatch => 400,
             Self::IdempotencyConflict => 409,
             Self::DurableCommitFailed => 500,
+            Self::TamperDetected => 422,
             Self::InternalError => 500,
             Self::Unauthorized => 401,
             Self::NotFound => 404,
@@ -154,6 +157,7 @@ impl ErrorCode {
             Self::PolicyDenied => "Forbidden",
             Self::NotFound | Self::DependencyMissing => "NotFound",
             Self::ReplayDetected | Self::IdempotencyConflict => "Conflict",
+            Self::TamperDetected => "Conflict",
             Self::TooManyRequests => "TooManyRequests",
             Self::StorageError | Self::DurableCommitFailed | Self::InternalError => "Internal",
             Self::Unavailable => "Unavailable",
@@ -199,6 +203,7 @@ impl ErrorCode {
                 | Self::Unauthorized
                 | Self::NotFound
                 | Self::TooManyRequests
+                | Self::TamperDetected
                 | Self::Unavailable
         )
     }
@@ -549,6 +554,7 @@ mod tests {
         assert_eq!(ErrorCode::Unauthorized.http_status(), 401);
         assert_eq!(ErrorCode::NotFound.http_status(), 404);
         assert_eq!(ErrorCode::TooManyRequests.http_status(), 429);
+        assert_eq!(ErrorCode::TamperDetected.http_status(), 422);
         assert_eq!(ErrorCode::Unavailable.http_status(), 503);
     }
 
@@ -557,6 +563,7 @@ mod tests {
         assert!(!ErrorCode::Unauthorized.produces_receipt());
         assert!(!ErrorCode::NotFound.produces_receipt());
         assert!(!ErrorCode::TooManyRequests.produces_receipt());
+        assert!(!ErrorCode::TamperDetected.produces_receipt());
         assert!(!ErrorCode::Unavailable.produces_receipt());
     }
 
@@ -598,6 +605,7 @@ mod tests {
         assert_eq!(ErrorCode::DependencyMissing.category(), "NotFound");
         assert_eq!(ErrorCode::NotFound.category(), "NotFound");
         assert_eq!(ErrorCode::ReplayDetected.category(), "Conflict");
+        assert_eq!(ErrorCode::TamperDetected.category(), "Conflict");
         assert_eq!(ErrorCode::TooManyRequests.category(), "TooManyRequests");
         assert_eq!(ErrorCode::InternalError.category(), "Internal");
         assert_eq!(ErrorCode::StorageError.category(), "Internal");
@@ -628,6 +636,7 @@ mod tests {
         assert_eq!(ErrorCode::PolicyDenied.mcp_code(), -32003); // Forbidden
         assert_eq!(ErrorCode::NotFound.mcp_code(), -32004); // NotFound
         assert_eq!(ErrorCode::ReplayDetected.mcp_code(), -32005); // Conflict
+        assert_eq!(ErrorCode::TamperDetected.mcp_code(), -32005); // Conflict
         assert_eq!(ErrorCode::TooManyRequests.mcp_code(), -32006); // TooManyRequests
         assert_eq!(ErrorCode::InternalError.mcp_code(), -32603); // Internal
         assert_eq!(ErrorCode::Unavailable.mcp_code(), -32000); // Unavailable
@@ -641,6 +650,8 @@ mod tests {
         assert_eq!(json, "NOT_FOUND");
         let json = serde_json::to_value(ErrorCode::TooManyRequests).unwrap();
         assert_eq!(json, "TOO_MANY_REQUESTS");
+        let json = serde_json::to_value(ErrorCode::TamperDetected).unwrap();
+        assert_eq!(json, "TAMPER_DETECTED");
         let json = serde_json::to_value(ErrorCode::Unavailable).unwrap();
         assert_eq!(json, "UNAVAILABLE");
     }

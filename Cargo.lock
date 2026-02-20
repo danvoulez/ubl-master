@@ -3234,6 +3234,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "chrono",
  "hex",
  "hex-literal",
  "leb128",
@@ -3342,6 +3343,7 @@ dependencies = [
  "chrono",
  "once_cell",
  "prometheus",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

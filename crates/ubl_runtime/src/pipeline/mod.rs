@@ -37,6 +37,9 @@ pub struct UblPipeline {
     pub policy_loader: PolicyLoader,
     pub fuel_limit: u64,
     pub event_bus: Arc<EventBus>,
+    // NOTE: session-only replay guard. This set is in-memory and is reset on process restart.
+    // Cross-restart replay protection is enforced by durable idempotency on
+    // (@type,@ver,@world,@id) when SQLite durable store is enabled.
     seen_nonces: Arc<RwLock<HashSet<String>>>,
     chip_store: Option<Arc<ChipStore>>,
     advisory_engine: Option<Arc<AdvisoryEngine>>,
@@ -83,6 +86,22 @@ fn load_transition_registry() -> Arc<TransitionRegistry> {
             Arc::new(TransitionRegistry::default())
         }
     }
+}
+
+fn derive_stage_secret(signing_key: &SigningKey) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(&signing_key.to_bytes());
+    hasher.update(b"ubl.stage_secret.v1");
+    *hasher.finalize().as_bytes()
+}
+
+fn is_non_dev_env() -> bool {
+    let env_value = std::env::var("UBL_ENV")
+        .or_else(|_| std::env::var("APP_ENV"))
+        .or_else(|_| std::env::var("RUST_ENV"))
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+    !matches!(env_value.as_str(), "dev" | "local" | "test")
 }
 
 /// Request to process a chip
@@ -153,12 +172,15 @@ impl UblPipeline {
 
         // Stage auth secret bootstrap:
         // If UBL_STAGE_SECRET is not provided, derive a process-local default
-        // from the signing key seed so auth-chain generation is configured.
+        // using domain-separated BLAKE3 keyed mode (never raw signing key bytes).
         if std::env::var("UBL_STAGE_SECRET").is_err() {
-            std::env::set_var(
-                "UBL_STAGE_SECRET",
-                format!("hex:{}", hex::encode(key.to_bytes())),
-            );
+            let derived = derive_stage_secret(&key);
+            std::env::set_var("UBL_STAGE_SECRET", format!("hex:{}", hex::encode(derived)));
+            if is_non_dev_env() {
+                warn!(
+                    "UBL_STAGE_SECRET missing; derived fallback injected. Set UBL_STAGE_SECRET explicitly in non-dev environments."
+                );
+            }
         }
 
         key

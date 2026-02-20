@@ -1,25 +1,45 @@
 <h2>Registered Types</h2>
-<table>
+<table style="border-collapse: collapse; width: 100%;">
   <thead>
     <tr>
-      <th>Type</th>
-      <th>Latest</th>
-      <th>Deprecated</th>
-      <th>KATs</th>
-      <th>Required Cap</th>
-      <th>Last Updated</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Type</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Latest</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Deprecated</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">KATs</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Required Cap</th>
+      <th style="text-align:left; border-bottom:1px solid #425d84; padding:5px;">Last Updated</th>
     </tr>
   </thead>
   <tbody>
-  {% for row in rows %}
+  {% for row in visible_rows %}
     <tr>
-      <td><a href="/registry/{{ row.chip_type }}">{{ row.chip_type }}</a></td>
-      <td>{{ row.latest_version }}</td>
-      <td>{% if row.deprecated %}yes{% else %}no{% endif %}</td>
-      <td>{% if row.has_kats %}yes{% else %}no{% endif %}</td>
-      <td>{{ row.required_cap }}</td>
-      <td>{{ row.last_updated_at }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/registry/{{ row.chip_type }}">{{ row.chip_type }}</a></td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.latest_version }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{% if row.deprecated %}yes{% else %}no{% endif %}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{% if row.has_kats %}yes{% else %}no{% endif %}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.required_cap }}</td>
+      <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.last_updated_at }}</td>
     </tr>
   {% endfor %}
   </tbody>
 </table>
+
+{% if hidden_rows.len() > 0 %}
+<details style="margin-top:0.65rem;">
+  <summary>Mostrar mais {{ hidden_rows.len() }} tipos ▼</summary>
+  <table style="border-collapse: collapse; width: 100%; margin-top: 0.45rem;">
+    <tbody>
+    {% for row in hidden_rows %}
+      <tr>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;"><a href="/registry/{{ row.chip_type }}">{{ row.chip_type }}</a></td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.latest_version }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{% if row.deprecated %}yes{% else %}no{% endif %}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{% if row.has_kats %}yes{% else %}no{% endif %}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.required_cap }}</td>
+        <td style="padding:5px; border-bottom:1px solid #2c3f5c;">{{ row.last_updated_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}

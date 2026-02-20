@@ -10,4 +10,7 @@ pub use chip_format::{
     normalize_numbers_to_unc1, ChipFile, ChipMetadata, CompiledChip, F64ImportMode, PolicyRef,
 };
 pub use envelope::{EnvelopeError, UblEnvelope};
-pub use nrf::{compute_cid, to_nrf1_bytes, CompileError};
+pub use nrf::{
+    compute_cid, normalize_as_set, normalize_for_input, normalize_timestamp, to_nrf1_bytes,
+    CompileError,
+};

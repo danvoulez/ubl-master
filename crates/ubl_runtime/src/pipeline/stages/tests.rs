@@ -171,11 +171,12 @@ async fn stage_write_finished_links_wa_and_tr_receipts() {
     let tr = pipeline.stage_transition(&parsed, &check).await.unwrap();
 
     let wf = pipeline
-        .stage_write_finished(&parsed, &wa, &tr, &check)
+        .stage_write_finished(&parsed, &wa, &tr, &check, 123)
         .await
         .unwrap();
     assert_eq!(wf.receipt_type, "ubl/wf");
     assert_eq!(wf.body["wa_cid"], json!(wa.body_cid.as_str()));
     assert_eq!(wf.body["tr_cid"], json!(tr.body_cid.as_str()));
     assert_eq!(wf.body["decision"], json!("Allow"));
+    assert_eq!(wf.body["duration_ms"], json!(123));
 }

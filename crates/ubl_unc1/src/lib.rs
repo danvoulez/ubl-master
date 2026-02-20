@@ -491,15 +491,15 @@ fn adjacent_f64(f: f64) -> (f64, f64) {
 // ---------------------------------------------------------------------------
 
 pub fn add(a: &Num, b: &Num) -> Result<Num, String> {
-    binary_op(a, b, |ra, rb| ra + rb)
+    binary_op(a, b, IntervalOp::Add, |ra, rb| ra + rb)
 }
 
 pub fn sub(a: &Num, b: &Num) -> Result<Num, String> {
-    binary_op(a, b, |ra, rb| ra - rb)
+    binary_op(a, b, IntervalOp::Sub, |ra, rb| ra - rb)
 }
 
 pub fn mul(a: &Num, b: &Num) -> Result<Num, String> {
-    binary_op(a, b, |ra, rb| ra * rb)
+    binary_op(a, b, IntervalOp::Mul, |ra, rb| ra * rb)
 }
 
 pub fn div(a: &Num, b: &Num) -> Result<Num, String> {
@@ -508,10 +508,18 @@ pub fn div(a: &Num, b: &Num) -> Result<Num, String> {
     if rb.is_zero() {
         return Err("division_by_zero".into());
     }
-    binary_op(a, b, |ra, rb| ra / rb)
+    binary_op(a, b, IntervalOp::Div, |ra, rb| ra / rb)
 }
 
-fn binary_op<F>(a: &Num, b: &Num, op: F) -> Result<Num, String>
+#[derive(Clone, Copy, Debug)]
+enum IntervalOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+fn binary_op<F>(a: &Num, b: &Num, interval_op: IntervalOp, op: F) -> Result<Num, String>
 where
     F: Fn(BigRational, BigRational) -> BigRational,
 {
@@ -519,7 +527,7 @@ where
 
     // If either is BND, do interval arithmetic
     if a.rank() == 3 || b.rank() == 3 {
-        return bnd_binary_op(a, b, result_unit);
+        return bnd_binary_op(a, b, result_unit, interval_op);
     }
 
     let ra = promote_to_rat(&a.strip_unit())?;
@@ -550,16 +558,52 @@ where
     Ok(num.set_unit(result_unit))
 }
 
-fn bnd_binary_op(a: &Num, b: &Num, result_unit: Option<String>) -> Result<Num, String> {
+fn bnd_binary_op(
+    a: &Num,
+    b: &Num,
+    result_unit: Option<String>,
+    op: IntervalOp,
+) -> Result<Num, String> {
     // Extract [lo, hi] for each operand
     let (a_lo, a_hi) = bnd_bounds(a)?;
     let (b_lo, b_hi) = bnd_bounds(b)?;
 
-    // Interval addition: [a_lo + b_lo, a_hi + b_hi]
-    // (This is correct for add; for sub/mul/div we'd need more complex interval logic.
-    //  For now, we do conservative interval arithmetic for add.)
-    let lo = &a_lo + &b_lo;
-    let hi = &a_hi + &b_hi;
+    let (lo, hi) = match op {
+        IntervalOp::Add => (&a_lo + &b_lo, &a_hi + &b_hi),
+        IntervalOp::Sub => (&a_lo - &b_hi, &a_hi - &b_lo),
+        IntervalOp::Mul => {
+            let candidates = vec![&a_lo * &b_lo, &a_lo * &b_hi, &a_hi * &b_lo, &a_hi * &b_hi];
+            let lo = candidates
+                .iter()
+                .cloned()
+                .min()
+                .ok_or_else(|| "interval_mul_empty".to_string())?;
+            let hi = candidates
+                .iter()
+                .cloned()
+                .max()
+                .ok_or_else(|| "interval_mul_empty".to_string())?;
+            (lo, hi)
+        }
+        IntervalOp::Div => {
+            // Division by interval containing zero is undefined.
+            if b_lo <= BigRational::zero() && b_hi >= BigRational::zero() {
+                return Err("division_by_zero".into());
+            }
+            let candidates = vec![&a_lo / &b_lo, &a_lo / &b_hi, &a_hi / &b_lo, &a_hi / &b_hi];
+            let lo = candidates
+                .iter()
+                .cloned()
+                .min()
+                .ok_or_else(|| "interval_div_empty".to_string())?;
+            let hi = candidates
+                .iter()
+                .cloned()
+                .max()
+                .ok_or_else(|| "interval_div_empty".to_string())?;
+            (lo, hi)
+        }
+    };
 
     let lo_dec = round_rational_to_dec(&lo, 18, RoundingMode::Floor);
     let hi_dec = round_rational_to_dec(&hi, 18, RoundingMode::Ceil);
@@ -1304,6 +1348,127 @@ mod tests {
                 let five_tenths = BigRational::new(BigInt::from(5), BigInt::from(10));
                 assert!(lo_r <= three_tenths);
                 assert!(hi_r >= five_tenths);
+            }
+            _ => panic!("expected BND"),
+        }
+    }
+
+    #[test]
+    fn sub_bnd_bnd_kat() {
+        // [1,2] - [0.5,1] -> [0, 1.5]
+        let a = Num::Bnd {
+            lo: Box::new(Num::Dec {
+                m: "1".into(),
+                s: 0,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "2".into(),
+                s: 0,
+                u: None,
+            }),
+            u: None,
+        };
+        let b = Num::Bnd {
+            lo: Box::new(Num::Dec {
+                m: "5".into(),
+                s: 1,
+                u: None,
+            }),
+            hi: Box::new(Num::Dec {
+                m: "1".into(),
+                s: 0,
+                u: None,
+            }),
+            u: None,
+        };
+        let r = sub(&a, &b).unwrap();
+        match &r {
+            Num::Bnd { lo, hi, .. } => {
+                let lo_r = to_rational(lo).unwrap();
+                let hi_r = to_rational(hi).unwrap();
+                let expected_lo = BigRational::new(BigInt::from(0), BigInt::from(1));
+                let expected_hi = BigRational::new(BigInt::from(3), BigInt::from(2)); // 1.5
+                assert!(lo_r <= expected_lo);
+                assert!(hi_r >= expected_hi);
+            }
+            _ => panic!("expected BND"),
+        }
+    }
+
+    #[test]
+    fn mul_bnd_bnd_kat_positive() {
+        // [2,3] * [4,5] -> [8,15]
+        let a = Num::Bnd {
+            lo: Box::new(Num::Int {
+                v: "2".into(),
+                u: None,
+            }),
+            hi: Box::new(Num::Int {
+                v: "3".into(),
+                u: None,
+            }),
+            u: None,
+        };
+        let b = Num::Bnd {
+            lo: Box::new(Num::Int {
+                v: "4".into(),
+                u: None,
+            }),
+            hi: Box::new(Num::Int {
+                v: "5".into(),
+                u: None,
+            }),
+            u: None,
+        };
+        let r = mul(&a, &b).unwrap();
+        match &r {
+            Num::Bnd { lo, hi, .. } => {
+                let lo_r = to_rational(lo).unwrap();
+                let hi_r = to_rational(hi).unwrap();
+                let expected_lo = BigRational::new(BigInt::from(8), BigInt::from(1));
+                let expected_hi = BigRational::new(BigInt::from(15), BigInt::from(1));
+                assert!(lo_r <= expected_lo);
+                assert!(hi_r >= expected_hi);
+            }
+            _ => panic!("expected BND"),
+        }
+    }
+
+    #[test]
+    fn mul_bnd_bnd_kat_negative() {
+        // [-2,-1] * [3,4] -> [-8,-3]
+        let a = Num::Bnd {
+            lo: Box::new(Num::Int {
+                v: "-2".into(),
+                u: None,
+            }),
+            hi: Box::new(Num::Int {
+                v: "-1".into(),
+                u: None,
+            }),
+            u: None,
+        };
+        let b = Num::Bnd {
+            lo: Box::new(Num::Int {
+                v: "3".into(),
+                u: None,
+            }),
+            hi: Box::new(Num::Int {
+                v: "4".into(),
+                u: None,
+            }),
+            u: None,
+        };
+        let r = mul(&a, &b).unwrap();
+        match &r {
+            Num::Bnd { lo, hi, .. } => {
+                let lo_r = to_rational(lo).unwrap();
+                let hi_r = to_rational(hi).unwrap();
+                let expected_lo = BigRational::new(BigInt::from(-8), BigInt::from(1));
+                let expected_hi = BigRational::new(BigInt::from(-3), BigInt::from(1));
+                assert!(lo_r <= expected_lo);
+                assert!(hi_r >= expected_hi);
             }
             _ => panic!("expected BND"),
         }

@@ -1,0 +1,12 @@
+<h2>Analise LLM - {{ title }}</h2>
+<div><strong>Status:</strong> {{ severity }}</div>
+<div><strong>Fonte:</strong> {{ source }}</div>
+<div><strong>Gerado:</strong> {{ generated_at }}</div>
+<p style="margin-top:0.6rem;">{{ summary }}</p>
+{% if bullets.len() > 0 %}
+<ul>
+  {% for item in bullets %}
+  <li>{{ item }}</li>
+  {% endfor %}
+</ul>
+{% endif %}

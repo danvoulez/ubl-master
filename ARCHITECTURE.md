@@ -329,6 +329,8 @@ KNOCK → WA (ghost) → CHECK (policy) → TR (rb_vm) → WF (final receipt)
 
 Single `UnifiedReceipt` that evolves through stages. CID recomputed after each stage append. HMAC-BLAKE3 auth chain links stages. Its JSON form follows the Universal Envelope — the receipt is just another chip that an LLM can read without special-casing. 11 unit tests + 4 integration tests.
 
+Gate read paths (`GET /v1/receipts/:cid`, `GET /v1/receipts/:cid/trace`, `GET /v1/chips/:cid/verify`) verify the receipt auth-chain before returning success. Broken chains return `TAMPER_DETECTED` (HTTP 422).
+
 ```rust
 struct UnifiedReceipt {
     v: u32,                           // Schema version
@@ -389,7 +391,10 @@ let outcome = vm.run(&instructions)?;
 | Max JSON depth | 32 levels | DENY at KNOCK |
 | Max array length | 10,000 elements | DENY at KNOCK |
 | Duplicate keys | 0 allowed | DENY at KNOCK |
+| Input normalization (ρ) | NFD→NFC, BOM strip, map null-strip, timestamp/set normalization | Normalize at KNOCK; reject collisions/control chars |
 | Cost per byte | 1 fuel unit per 1KB | Added to TR fuel budget |
+
+ρ validation/normalization failures include a JSON path (for example `body.name` or `body.profile.email`) to make rejection causes actionable.
 
 ---
 
@@ -477,6 +482,8 @@ Rules:
 | DID method | `did:key:z...` Ed25519 with strict multicodec (`0xED01`) support + compat fallback |
 | Key ID format | `did:key:z...#ed25519` |
 | Key rotation | New `kid` published as `ubl/key.rotate` chip; old kid valid for verification of past receipts |
+
+`UBL_STAGE_SECRET` fallback is derived from signing key material using domain-separated BLAKE3 (`ubl.stage_secret.v1`), never by reusing raw Ed25519 private key bytes.
 | Signing curve | Ed25519 (RFC 8032) |
 
 ### 7.3 Anti-Replay (✅ Implemented — S2.3)
@@ -512,7 +519,7 @@ Format: `sig = Ed25519.sign(key, domain_string || BLAKE3(payload))`
 
 `ubl_chipstore` provides:
 - `ChipStoreBackend` trait with `InMemoryBackend` and `SledBackend`
-- `ChipIndexer` with in-memory indexes (type, tag, executor)
+- `ChipIndexer` with in-memory indexes (type, tag, executor) rebuilt via backend `scan_all()`
 - `ChipQueryBuilder` with sorting, pagination, filtering
 - `CommonQueries` for customers, payments, audit trails
 
