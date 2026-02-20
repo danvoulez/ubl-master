@@ -104,8 +104,17 @@ enum SiliconCommands {
     ///     "bits":    [ { "cid": "b3:...", "body": { <ubl/silicon.bit body> } }, ... ]
     ///   }
     Compile {
-        /// Path to silicon bundle JSON file
-        bundle: String,
+        /// Path to silicon bundle JSON file.
+        /// Mutually exclusive with --from-store.
+        #[arg(conflicts_with = "from_store")]
+        bundle: Option<String>,
+        /// Compile a chip already in the ChipStore by CID.
+        /// Opens the Sled store at --store-path (default: ./data/chips).
+        #[arg(long, value_name = "CHIP_CID")]
+        from_store: Option<String>,
+        /// Path to the Sled ChipStore directory (used with --from-store).
+        #[arg(long, default_value = "./data/chips")]
+        store_path: String,
         /// Print only the bytecode hex (machine-readable, no labels)
         #[arg(long)]
         hex_only: bool,
@@ -144,8 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Url { receipt_cid, host } => cmd_url(&receipt_cid, &host)?,
         Commands::Disasm { input, hex } => cmd_disasm(&input, hex)?,
         Commands::Silicon { command } => match command {
-            SiliconCommands::Compile { bundle, hex_only } => {
-                cmd_silicon_compile(&bundle, hex_only).await?
+            SiliconCommands::Compile { bundle, from_store, store_path, hex_only } => {
+                cmd_silicon_compile(bundle.as_deref(), from_store.as_deref(), &store_path, hex_only).await?
             }
             SiliconCommands::Disasm { input, file } => cmd_silicon_disasm(&input, file)?,
         },
@@ -476,17 +485,79 @@ fn cmd_disasm(input: &str, is_hex: bool) -> Result<(), Box<dyn std::error::Error
 //   5. Prints chip CID, bytecode CID, hex bytecode, and disassembly.
 
 async fn cmd_silicon_compile(
-    bundle_path: &str,
+    bundle_path: Option<&str>,
+    from_store: Option<&str>,
+    store_path: &str,
     hex_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use ubl_chipstore::{ChipStore, ExecutionMetadata, InMemoryBackend};
+    use ubl_chipstore::{ChipStore, ExecutionMetadata, InMemoryBackend, SledBackend};
     use ubl_runtime::silicon_chip::{
         compile_chip_to_rb_vm, parse_silicon, resolve_chip_graph, SiliconRequest,
         TYPE_SILICON_BIT, TYPE_SILICON_CHIP, TYPE_SILICON_CIRCUIT,
     };
     use ubl_types::Did as TypedDid;
+
+    // ── from-store path: open live Sled ChipStore, compile chip by CID ──
+    if let Some(chip_cid) = from_store {
+        let backend = Arc::new(SledBackend::new(store_path)?);
+        let store = ChipStore::new(backend);
+
+        let chip_data = store
+            .get_chip(chip_cid)
+            .await?
+            .ok_or_else(|| format!("chip '{}' not found in store at '{}'", chip_cid, store_path))?;
+
+        if chip_data.chip_type != TYPE_SILICON_CHIP {
+            return Err(format!(
+                "chip '{}' has type '{}', expected '{}'",
+                chip_cid, chip_data.chip_type, TYPE_SILICON_CHIP
+            )
+            .into());
+        }
+
+        let chip = match parse_silicon(TYPE_SILICON_CHIP, &chip_data.chip_data)? {
+            SiliconRequest::Chip(c) => c,
+            _ => return Err("chip body did not parse as ubl/silicon.chip".into()),
+        };
+
+        let circuits = resolve_chip_graph(&chip, &store).await?;
+        let bytecode = compile_chip_to_rb_vm(&circuits)?;
+
+        let bc_hash = blake3::hash(&bytecode);
+        let bc_cid = format!("b3:{}", hex::encode(bc_hash.as_bytes()));
+        let bc_hex = hex::encode(&bytecode);
+
+        if hex_only {
+            println!("{}", bc_hex);
+        } else {
+            println!("=== Silicon Compile (from store) ===");
+            println!();
+            println!("Chip CID:            {}", chip_cid);
+            println!("Store path:          {}", store_path);
+            println!("Bytecode CID:        {}", bc_cid);
+            println!(
+                "Bytecode size:       {} bytes ({} instructions)",
+                bytecode.len(),
+                count_tlv_instrs(&bytecode)
+            );
+            println!();
+            println!("=== Bytecode (hex) ===");
+            println!("{}", bc_hex);
+            println!();
+            println!("=== Disassembly ===");
+            match rb_vm::disassemble(&bytecode) {
+                Ok(listing) => print!("{}", listing),
+                Err(e) => eprintln!("Disassembly error: {}", e),
+            }
+        }
+        return Ok(());
+    }
+
+    // ── bundle path: self-contained JSON ─────────────────────────
+    let bundle_path = bundle_path
+        .ok_or("provide a bundle file path or --from-store <chip_cid>")?;
 
     // ── parse bundle ────────────────────────────────────────────
     let bundle_str = std::fs::read_to_string(bundle_path)?;
