@@ -15,6 +15,7 @@ members = [
   "crates/ubl_kms",
   "crates/ubl_types",
   "crates/ubl_book_types",
+  "crates/ubl_book_engine",
   "services/ubl_gate",
 ]
 resolver = "2"
