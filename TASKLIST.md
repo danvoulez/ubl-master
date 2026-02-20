@@ -1,7 +1,7 @@
 # UBL MASTER — Unified Task List
 
 **Status**: Single source of truth for all work — done, in progress, and planned
-**Date**: February 17, 2026
+**Date**: February 20, 2026
 **Spec**: [ARCHITECTURE.md](./ARCHITECTURE.md) — engineering source of truth
 **Docs Index**: [docs/INDEX.md](./docs/INDEX.md)
 
@@ -10,6 +10,8 @@
 ## Completed Work
 
 ### Foundation Sprints (S1–S4)
+
+_Note: test counts in this section are historical snapshots at sprint completion. Use the measured table below for current totals._
 
 - [x] **S1 — Canon + CID**: NRF-1.1 encoding, CID computation, Universal Envelope, `ublx` CLI, type code table (64 tests in `ubl_ai_nrf1`)
 - [x] **S2 — RB-VM + Policy**: Real TR stage execution via rb_vm, fuel ceiling (1M units), unified `Decision` enum, nonce/anti-replay (16-byte hex), policy lockfile (33 tests in `rb_vm`)
@@ -21,21 +23,25 @@
 - [x] **PS1 — AI Passport**: `ubl/ai.passport` chip type, advisory wiring, gate endpoints for advisories and passport verification
 - [x] **PS2 — Auth as Pipeline**: `auth.rs` with 8 onboarding chip types, body validation via `from_chip_body`, dependency chain enforcement at CHECK, drift endpoints removed (34 unit + 10 integration tests)
 - [x] **Onboarding**: Full lifecycle `ubl/app` → `ubl/user` → `ubl/tenant` → `ubl/membership` → `ubl/token` → `ubl/revoke` + `ubl/worldscope` + `ubl/role`. Dependency chain enforced. `DependencyMissing` (409) error code. 141 total tests in `ubl_runtime`.
-- [x] **ARCHITECTURE.md rev 2**: Added §0 Protocol Stack (8-layer table), updated §1 evolution table, rewrote §2 crate map, removed BLOCKERs from §5.2/§5.3, rewrote §16 as Build History & Roadmap with Protocol Horizons, updated §17 tech debt
+- [x] **ARCHITECTURE.md maintenance (rev 2→4)**: Added §0 Protocol Stack (8-layer table), updated §1 evolution table, rewrote §2 crate map, removed BLOCKERs from §5.2/§5.3, updated §16 to evidence-based current state, updated §17 tech debt
 - [x] **Policy documents**: `P0_GENESIS_POLICY.json`, `P1_POLICY_UPDATE.json`, `ROLLOUT_P0_TO_P1.md`
 
-### Test Counts (current — post wiring session)
+### Test Counts (measured on February 20, 2026)
+
+Method: `cargo test -p <crate> -- --list` (unit + integration test harness totals)
 
 | Crate | Tests |
 |---|---|
-| `rb_vm` | 60 (33 exec + 8 disasm + 19 canon) |
-| `ubl_receipt` | 18 |
+| `rb_vm` | 79 |
+| `ubl_receipt` | 22 |
+| `ubl_runtime` | 352 |
+| `ubl_ai_nrf1` | 108 |
+| `ubl_kms` | 16 |
+| `ubl_unc1` | 57 |
+| `ubl_chipstore` | 10 |
 | `ubl_types` | 24 |
-| `ubl_runtime` | 252 (was 250; +2 idempotent replay) |
-| `ubl_ai_nrf1` | 85 (69 unit + 16 rho_vectors) |
-| `ubl_kms` | 13 |
-| `ubl_unc1` | 33 |
-| **Total** | **485** |
+| `ubl_gate` | 21 |
+| **Total (measured set)** | **689** |
 
 ---
 
@@ -56,7 +62,7 @@
 | H1 | **Signing key from env** | Done via H14 (`ubl_kms`). `signing_key_from_env()` loads from `SIGNING_KEY_HEX`. Legacy `ubl_receipt` still hardcoded — migrate callers. |
 | H7 | **Signature domain separation** | Done via H14 (`ubl_kms`). `domain::RECEIPT`, `RB_VM`, `CAPSULE`, `CHIP`. Legacy `ubl_receipt` signing still lacks domain — migrate. |
 | H13 | **ρ test vectors** | 14 JSON edge-case files in `kats/rho_vectors/`. 16 integration tests in `crates/ubl_ai_nrf1/tests/rho_vectors.rs`. |
-| H14 | **`ubl_kms` crate** | `sign_canonical`, `verify_canonical`, `signing_key_from_env()`, domain separation, DID/KID derivation. 13 tests. |
+| H14 | **`ubl_kms` crate** | `sign_canonical`, `verify_canonical`, `signing_key_from_env()`, domain separation, DID/KID derivation. 16 tests. |
 | H15 | **Prometheus `/metrics`** | Counters + histogram on gate. `GET /metrics`. |
 | F8 | **Chip verification endpoint** | `GET /v1/chips/:cid/verify` — recomputes CID, checks receipt, returns `ubl/chip.verification`. |
 | F11 | **Makefile** | Targets: `build`, `test`, `fmt`, `fmt-check`, `lint`, `check`, `kat`, `gate`, `clean`. |
@@ -66,7 +72,7 @@
 | H2 | **Real DID resolution** | All 5 `"did:key:placeholder"` occurrences replaced. `UblPipeline` now derives `did:key:z...` and `kid` from Ed25519 signing key via `ubl_kms`. Key loaded from `SIGNING_KEY_HEX` env or auto-generated for dev. `PipelineSigner` uses real `ubl_kms::sign_bytes` with `RB_VM` domain separation. Zero placeholder DIDs remain. |
 | H3 | **`NaiveCanon` → full ρ** | `RhoCanon` in `rb_vm/src/canon.rs` implements full ρ rules: NFC normalization, BOM rejection, control char rejection, null stripping from maps, key sorting, recursive. Idempotent: ρ(ρ(v))=ρ(v). **UNC-1 §3/§6 aligned**: raw floats poisoned by ρ, rejected at KNOCK (KNOCK-008), mapped to `KNOCK_RAW_FLOAT` error code (400). `RhoCanon::validate()` for strict mode. `PipelineCanon` delegates to `RhoCanon`. 19 canon tests, 3 KNOCK float tests, 1 error_response test. |
 | H8 | **Rate limiting** | `rate_limit.rs` in `ubl_runtime`. Sliding-window per-key limiter. `GateRateLimiter` composite: per-DID (100/min), per-tenant (1000/min), per-IP (10/min). Check order: IP→tenant→DID. `prune()` for memory cleanup. 13 tests. |
-| H9 | **UNC-1 core ops** | Full `ubl_unc1` crate: `add/sub/mul/div` with INT→DEC→RAT→BND promotion, `to_dec` (6 rounding modes incl. banker’s), `to_rat` (continued fraction with denominator limit), `from_f64_bits` (IEEE-754 frontier → exact BND interval), `compare`, BND interval arithmetic, unit enforcement, serde roundtrips. 33 tests. |
+| H9 | **UNC-1 core ops** | Full `ubl_unc1` crate: `add/sub/mul/div` with INT→DEC→RAT→BND promotion, `to_dec` (6 rounding modes incl. banker’s), `to_rat` (continued fraction with denominator limit), `from_f64_bits` (IEEE-754 frontier → exact BND interval), `compare`, BND interval arithmetic, unit enforcement, serde roundtrips. 57 tests. |
 | H10 | **Policy lockfile** | `policy_lock.rs` in `ubl_runtime`. `PolicyLock` struct with YAML parse/serialize, `pin()`, `verify()` against loaded policies. Detects mismatches, missing, and extra policies. `LockVerification` with `Display`. 11 tests. |
 | PR-A P0.1 | **Rigid idempotency** | `idempotency.rs` — `IdempotencyStore` keyed by `(@type,@ver,@world,@id)`. Replay returns cached `receipt_cid`. Wired into `process_chip`. 10 tests. |
 | PR-A P0.2 | **Canon-aware rate limit** | `rate_limit.rs` — `CanonFingerprint` (BLAKE3 of NRF-1 bytes) + `CanonRateLimiter`. Cosmetic JSON variations hit same bucket. 7 new tests (20 total rate_limit). |
@@ -85,55 +91,16 @@
 
 ---
 
-## Execution Path — February 17, 2026 → "Achieved"
+## Operational Priorities (no speculative milestones)
 
-This section is additive and does not remove any existing items above. It is the operating plan from **today (February 17, 2026)** until the project reaches "Achieved."
+This document tracks implemented work and concrete backlog only. Dated windows, synthetic gates, and fixed-duration stability claims were removed to avoid inventing planning constraints not tied to code evidence.
 
-### Definition of "Achieved"
+Current priorities:
 
-"Achieved" means all five gates below are green and stable for one full release window (30 consecutive days):
-
-- [ ] **G1 — Security trust chain closed**: capability signatures are cryptographically verified, receipt stage secret is managed (not hardcoded), and receipt auth chain verification is correct and enforced.
-- [ ] **G2 — Determinism proven**: canonicalization is uniform across all CID/sign paths and reproducibility KATs pass on Linux + macOS in CI.
-- [ ] **G3 — Data path scales**: no critical API path depends on full-store scans; indexed lookups exist for high-traffic queries.
-- [ ] **G4 — Runtime operable**: structured tracing, dashboards, alerts, and incident/runbook coverage are in place.
-- [ ] **G5 — Real workload live**: one production workflow runs under SLO with measured reliability and auditability.
-
-### Timeline With Exit Criteria
-
-| Window | Milestone | Must Finish | Exit Proof |
-|---|---|---|---|
-| **Feb 17, 2026 → Mar 14, 2026** | **M1 — Trust Baseline** | Capability signature verification (hardening of PR-A P0.3), remove hardcoded stage secret (`STAGE_SECRET`), correct and enforce `verify_auth_chain()`, segment-safe capability audience matching, strict RFC-3339 expiration checks. | Security tests include forge/fail cases; no hardcoded secrets in runtime receipt auth path. |
-| **Mar 15, 2026 → Apr 18, 2026** | **M2 — Determinism Contract** | Canonicalize VM receipt emission path (remove non-canonical JSON hash/sign path), complete Parse-Don't-Validate expansion (H6) on critical chip types, add cross-platform determinism CI matrix and golden vectors. | Same chip vectors produce same chip CID across CI platforms; receipt semantics match PF-02 policy. |
-| **Apr 19, 2026 → May 23, 2026** | **M3 — Indexed Storage Plane** | Replace scan-based ChipStore query paths with indexes (`chip_type`, `receipt_cid`, revocation target, tags, executor DID), implement rebuild tooling, remove endpoint-level scan dependencies for receipt/verify paths. | Load test evidence (target dataset >= 100k chips) shows bounded lookup latency and no O(n) hot-path scans. |
-| **May 24, 2026 → Jun 27, 2026** | **M4 — Certified Runtime Operations** | Deliver PS3 (F1 Runtime certification), PS4 (F2 structured tracing), SLO dashboards and alerting, failure drills and recovery playbook. | On-call runbook validated in drill; runtime provenance present in receipts; p95/p99 latency and error metrics visible. |
-| **Jun 28, 2026 → Aug 15, 2026** | **M5 — First Production Slice** | Launch one end-to-end workflow (single domain), enforce policy rollout automation (H4), complete post-launch hardening fixes, publish acceptance report against G1–G5. | 30-day stability window with SLO met, incident log reviewed, and "Achieved" gates all checked. |
-
-### Net-New Work Items Added Today (Feb 17, 2026)
-
-| ID | Task | Priority | Status |
-|---|---|---|---|
-| N1 | **Cryptographic capability verification** | Critical | Done |
-| N2 | **Receipt stage secret management (env/KMS + rotation)** | Critical | Done |
-| N3 | **Fix + enforce receipt auth chain verification semantics** | Critical | Done |
-| N4 | **Canonicalize VM `EmitRc` payload hash/sign path** | High | Done |
-| N5 | **Segment-safe audience matching (`@cap.audience` vs `@world`)** | High | Done |
-| N6 | **Strict RFC-3339 token/cap expiration parsing and checks** | High | Done |
-| N7 | **Indexed receipt lookup path for gate endpoints** | High | Done |
-
-### Existing Backlog Alignment (No Task Loss)
-
-| Existing ID | Phase | Notes |
-|---|---|---|
-| H4 (P0→P1 rollout automation) | M5 | Required for controlled production transition. |
-| H6 (Parse, Don't Validate) | M2 | ✅ Completed: pipeline now parses/anchors once and stages consume typed request context. |
-| F1 (Runtime certification) | M4 | Core deliverable for "Certified Runtime." |
-| F2 (Structured tracing) | M4 | ✅ Completed; supports operability gate G4. |
-| F4 (Property testing) | M2 | Supports determinism/confidence proof. |
-| F5/F6/F7 (UNC-1 runtime/migration) | M2 → M4 | ✅ Completed with strict KNOCK path + migration flags rollout. |
-| F9 (Key rotation as chip) | M4 | Complements N2 secret lifecycle. |
-| F10 (CAS backends) | Post-M5 | ✅ Completed (`FsBackend` + `S3Backend` emulation path). |
-| F13 (PQ signature stubs) | Post-M5 | ✅ Completed (feature-gated `pq_mldsa3` stubs). |
+- Keep determinism evidence fresh (`kats/`, property tests, and CI reproducibility checks).
+- Keep trust-chain hardening explicit (capability verification, auth-chain verification, key lifecycle).
+- Continue parse-once typed boundaries in runtime paths where raw JSON handling still exists.
+- Keep observability and release readiness tied to measurable artifacts (`/metrics`, traces, runbooks, readiness checks).
 
 ---
 
@@ -174,7 +141,7 @@ New chip types: `ubl/payment`, `ubl/invoice`, `ubl/settlement`, `ubl/escrow`. Tr
 
 ### Media Protocol (VCX-Core)
 
-Video as content-addressed hash-graph of 64×64 tiles. Editing = manifest rewrite (zero recompression). Certified Runtime as deterministic video editor. LLMs curate by reading NRF-1 manifests, not decoding pixels. Full spec in `VCX-Core`. See also `ADDENDUM_CERTIFIED_RUNTIME.md`.
+Video as content-addressed hash-graph of 64×64 tiles. Editing = manifest rewrite (zero recompression). Certified Runtime as deterministic video editor. LLMs curate by reading NRF-1 manifests, not decoding pixels. Full spec in `docs/visao/VCX-Core.md`. See also `CERTIFIED_RUNTIME.md`.
 
 ### Document Protocol
 
@@ -209,27 +176,29 @@ JSON-RPC over WebSocket server exposing UBL tools to LLMs and external integrati
 
 | File | Purpose | Status |
 |---|---|---|
-| `ARCHITECTURE.md` | Engineering spec + protocol stack (source of truth) | ✅ Current (rev 3) |
+| `ARCHITECTURE.md` | Engineering spec + protocol stack (source of truth) | ✅ Current (rev 4) |
 | `TASKLIST.md` | This file — unified task tracking | ✅ Current |
 | `README.md` | Repo README and quick start | ✅ Updated |
+| `GOVERNANCE.md` | Project/process governance | ✅ New root canonical entry |
+| `SECURITY.md` | Signature/verification trust model | ✅ New root canonical entry |
 | `docs/INDEX.md` | Documentation entrypoint and ownership map | ✅ New canonical index |
 | `docs/STANDARDS.md` | Documentation standards and metadata policy | ✅ New |
 | `ROLLOUT_P0_TO_P1.md` | Bootstrap sequence P0→P1 | ✅ Valid + automated checks |
-| `ADDENDUM_CERTIFIED_RUNTIME.md` | Certified Runtime roles and RACI | ✅ Valid reference |
-| `docs/reference/API.md` | API and MCP endpoints | ✅ New |
-| `docs/reference/CONFIG.md` | Environment/config reference | ✅ New |
-| `docs/reference/ERRORS.md` | Canonical error taxonomy | ✅ New |
-| `docs/security/CRYPTO_TRUST_MODEL.md` | Signature/verification trust model | ✅ New |
+| `CERTIFIED_RUNTIME.md` | Certified Runtime roles and RACI | ✅ Valid reference |
+| `docs/visao/MANIFESTO_DA_REINVENCAO.md` | Vision, horizons, and consolidated roadmap | ✅ New canonical vision source |
+| `/openapi.json` + `crates/ubl_runtime/src/manifest.rs` | API and MCP contract source | ✅ Active source |
+| `docs/reference/README.md` | Runtime/gate reference source map | ✅ New |
+| `crates/ubl_runtime/src/error_response.rs` | Canonical error taxonomy source | ✅ Active source |
+| `docs/security/CRYPTO_TRUST_MODEL.md` | Compatibility pointer to `SECURITY.md` | ✅ Kept for link stability |
 | `docs/lifecycle/RELEASE_READINESS.md` | Release gate checklist and evidence | ✅ New |
 | `docs/changelog/CHANGELOG.md` | Documentation and release change log | ✅ New |
 | `docs/archive/2026-02/` | Archived superseded docs | ✅ Historical only |
-| `VCX-Core` | VCX-Core living spec — media protocol | ✅ Valid (deferred) |
+| `docs/visao/VCX-Core.md` | VCX-Core living spec — media protocol | ✅ Valid (deferred) |
 | `P0_GENESIS_POLICY.json` | Genesis policy | ✅ Valid |
 | `P1_POLICY_UPDATE.json` | First policy update | ✅ Valid |
-| `UNC-1.md` | UNC-1 Numeric Canon spec (INT/DEC/RAT/BND + units) | ✅ New |
-| `schemas/unc-1.schema.json` | JSON Schema for UNC-1 numeric atoms | ✅ New |
+| `docs/canon/UNC-1.md` | UNC-1 Numeric Canon spec (INT/DEC/RAT/BND + units) | ✅ New |
 | `kats/unc1/unc1_kats.v1.json` | Known Answer Tests for UNC-1 | ✅ New |
-| `docs/reference/NUMERICS.md` | UNC-1 reference guide | ✅ New |
+| `schemas/unc-1.schema.json` | UNC-1 machine-readable contract | ✅ Active source |
 | `docs/vm/OPCODES_NUM.md` | UNC-1 opcode spec for RB-VM | ✅ New |
 | `docs/migration/UNC1_MIGRATION.md` | UNC-1 migration phases and flags | ✅ New |
 

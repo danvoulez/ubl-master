@@ -45,6 +45,6 @@ Define how documentation is authored, reviewed, and maintained so the repo stays
 
 1. No broken relative links in active docs.
 2. No duplicate "source of truth" claims for same topic.
-3. New env var must appear in `docs/reference/CONFIG.md`.
-4. New public error code must appear in `docs/reference/ERRORS.md`.
-5. API endpoint changes must update `docs/reference/API.md`.
+3. New env var must be reflected in official Rust reference sources (`docs/reference/README.md` pointers + code).
+4. New public error code must be updated in `crates/ubl_runtime/src/error_response.rs` mappings.
+5. API endpoint changes must be reflected in runtime OpenAPI export (`/openapi.json` from `GateManifest`).

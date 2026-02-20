@@ -4,7 +4,7 @@ This is the entry point for all project documentation.
 
 **Status**: active
 **Owner**: Repo Maintainer
-**Last reviewed**: 2026-02-17
+**Last reviewed**: 2026-02-20
 
 ## Sources of Truth
 
@@ -12,14 +12,20 @@ This is the entry point for all project documentation.
 |---|---|---|---|
 | System design and invariants | `ARCHITECTURE.md` | Core Runtime | Active |
 | Execution plan and delivery status | `TASKLIST.md` | Core Runtime | Active |
+| LLM/human canonical entrypoint | `START-HERE.md` | Core Runtime | Active |
+| Project/process governance | `GOVERNANCE.md` | Repo Maintainer | Active |
+| Canon quickstart | `docs/canon/START-HERE-CANON.md` | Core Runtime | Active |
+| Canon exhaustive reference | `docs/canon/CANON-REFERENCE.md` | Core Runtime | Active |
+| Numeric canon | `docs/canon/UNC-1.md` + `schemas/unc-1.schema.json` + `kats/unc1/unc1_kats.v1.json` | Core Runtime | Active |
+| VM numeric opcode canon | `docs/vm/OPCODES_NUM.md` | Core Runtime | Active |
+| Runtime trust and role model | `CERTIFIED_RUNTIME.md` | Core Runtime | Active |
 | Bootstrap/rollout policy flow | `ROLLOUT_P0_TO_P1.md` | Ops + Security | Active |
-| Certified Runtime conceptual addendum | `ADDENDUM_CERTIFIED_RUNTIME.md` | Core Runtime | Active (complementary) |
-| Operational runbooks | `docs/ops/` | Ops | Active |
-| Numeric canon | `UNC-1.md` + `schemas/unc-1.schema.json` + `kats/unc1/unc1_kats.v1.json` | Core Runtime | Active |
-| API contract | `docs/reference/API.md` | Gate | Active |
-| Environment/config flags | `docs/reference/CONFIG.md` | Runtime + Gate | Active |
-| Error taxonomy | `docs/reference/ERRORS.md` | Runtime | Active |
-| Crypto trust model | `docs/security/CRYPTO_TRUST_MODEL.md` | Security | Active |
+| Vision and strategic horizons | `docs/visao/MANIFESTO_DA_REINVENCAO.md` | Core Runtime | Active |
+| Media protocol vision (VCX) | `docs/visao/VCX-Core.md` | Core Runtime | Active |
+| API contract | `/openapi.json` + `crates/ubl_runtime/src/manifest.rs` | Gate | Active |
+| Environment/config flags | `docs/reference/README.md` + runtime/gate env reads in code | Runtime + Gate | Active |
+| Error taxonomy | `crates/ubl_runtime/src/error_response.rs` | Runtime | Active |
+| Crypto trust model | `SECURITY.md` | Security | Active |
 | Release gates | `docs/lifecycle/RELEASE_READINESS.md` | Core Runtime + Ops | Active |
 | Change history | `docs/changelog/CHANGELOG.md` | Repo Maintainer | Active |
 
@@ -32,10 +38,13 @@ This is the entry point for all project documentation.
 ## High-Signal Reading Order
 
 1. `README.md`
-2. `ARCHITECTURE.md`
-3. `TASKLIST.md`
-4. `docs/reference/API.md`
-5. `docs/reference/CONFIG.md`
-6. `docs/security/CRYPTO_TRUST_MODEL.md`
-7. `docs/ops/INCIDENT_RUNBOOK.md`
-8. `docs/lifecycle/RELEASE_READINESS.md`
+2. `START-HERE.md`
+3. `ARCHITECTURE.md`
+4. `TASKLIST.md`
+5. `SECURITY.md`
+6. `GOVERNANCE.md`
+7. `docs/reference/README.md`
+8. `/openapi.json`
+9. `docs/ops/INCIDENT_RUNBOOK.md`
+10. `docs/lifecycle/RELEASE_READINESS.md`
+11. `docs/visao/MANIFESTO_DA_REINVENCAO.md`

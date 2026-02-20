@@ -2,7 +2,26 @@
 
 **Status**: active
 **Owner**: Repo Maintainer
-**Last reviewed**: 2026-02-17
+**Last reviewed**: 2026-02-20
+
+## 2026-02-20
+
+- Promoted root-level governance and security entry documents:
+  - `SECURITY.md` (canonical security/trust model)
+  - `GOVERNANCE.md` (project/process governance)
+- Removed manual markdown reference pages to avoid drift:
+  - `docs/reference/API.md`
+  - `docs/reference/CONFIG.md`
+  - `docs/reference/ERRORS.md`
+  - `docs/reference/NUMERICS.md`
+- Switched reference indexing to official code-exported sources:
+  - `/openapi.json` + `crates/ubl_runtime/src/manifest.rs`
+  - `crates/ubl_runtime/src/error_response.rs`
+  - `schemas/unc-1.schema.json`
+  - `docs/reference/README.md` (source map)
+- Kept compatibility pointers for previous location-based links:
+  - `docs/security/CRYPTO_TRUST_MODEL.md` -> `SECURITY.md`
+- Updated repository references (`README.md`, `docs/INDEX.md`, `TASKLIST.md`, `CERTIFIED_RUNTIME.md`).
 
 ## 2026-02-17
 
@@ -13,7 +32,7 @@
   - `docs/reference/API.md`
   - `docs/reference/CONFIG.md`
   - `docs/reference/ERRORS.md`
-  - `docs/security/CRYPTO_TRUST_MODEL.md`
+  - `SECURITY.md` (later promoted to root canonical location)
   - `docs/lifecycle/RELEASE_READINESS.md`
 - Archived superseded strategy/checklist/tasklist docs into `docs/archive/2026-02/`.
 - Updated canonical entry documents (`README.md`, `ARCHITECTURE.md`, `TASKLIST.md`).
