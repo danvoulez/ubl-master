@@ -1625,3 +1625,176 @@ mod tests {
         }
     }
 }
+
+// ── M2 — Extended Property Tests ─────────────────────────────────────────────
+// These complement the existing proptest! block above with additional algebraic
+// laws and cross-type invariants needed for the M2 determinism contract.
+
+#[cfg(test)]
+mod prop_extended {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    fn int(v: i64) -> Num { Num::Int { v: v.to_string(), u: None } }
+    fn dec(m: i64, s: u32) -> Num { Num::Dec { m: m.to_string(), s, u: None } }
+
+    proptest! {
+        // Associativity of add for integers: (a+b)+c == a+(b+c)
+        #[test]
+        fn add_is_associative_for_ints(
+            a in -1_000_000i64..1_000_000i64,
+            b in -1_000_000i64..1_000_000i64,
+            c in -1_000_000i64..1_000_000i64,
+        ) {
+            let na = int(a); let nb = int(b); let nc = int(c);
+            let ab_c = add(&add(&na, &nb).unwrap(), &nc).unwrap();
+            let a_bc = add(&na, &add(&nb, &nc).unwrap()).unwrap();
+            prop_assert_eq!(ab_c, a_bc, "add must be associative for integers");
+        }
+
+        // Mul by one is identity
+        #[test]
+        fn mul_by_one_is_identity(a in any::<i64>()) {
+            let one = int(1);
+            let result = mul(&int(a), &one).unwrap();
+            prop_assert_eq!(result, int(a), "a * 1 == a");
+        }
+
+        // Add zero is identity
+        #[test]
+        fn add_zero_is_identity(a in any::<i64>()) {
+            let zero = int(0);
+            let result = add(&int(a), &zero).unwrap();
+            prop_assert_eq!(result, int(a), "a + 0 == a");
+        }
+
+        // Subtraction: a - a == 0
+        #[test]
+        fn sub_self_is_zero(a in any::<i64>()) {
+            let n = int(a);
+            let result = sub(&n, &n).unwrap();
+            prop_assert_eq!(result, int(0), "a - a must be 0");
+        }
+
+        // Compare order: if a < b then compare(a,b) < 0, compare(b,a) > 0
+        #[test]
+        fn compare_order_consistent(a in -1_000_000i64..1_000_000i64, b in -1_000_000i64..1_000_000i64) {
+            prop_assume!(a != b);
+            let na = int(a); let nb = int(b);
+            let ab = compare(&na, &nb).unwrap();
+            let ba = compare(&nb, &na).unwrap();
+            let sign = |n: &Num| -> i64 {
+                if let Num::Int { v, .. } = n {
+                    let i: i64 = v.parse().unwrap();
+                    i.signum()
+                } else { panic!("expected int") }
+            };
+            prop_assert_eq!(sign(&ab), -sign(&ba),
+                "compare order must be antisymmetric and non-zero for a != b");
+        }
+
+        // to_dec idempotent for decimals: to_dec(to_dec(x, s, rm), s, rm) == to_dec(x, s, rm)
+        #[test]
+        fn to_dec_idempotent_for_dec(
+            m in -100_000i64..100_000i64,
+            s in 0u32..9u32,
+            rm in 0u8..6u8,
+        ) {
+            let mode = RoundingMode::from_u8(rm).unwrap();
+            let d = dec(m, s);
+            let once = to_dec(&d, s, mode).unwrap();
+            let twice = to_dec(&once, s, mode).unwrap();
+            prop_assert_eq!(once, twice, "to_dec must be idempotent at same scale");
+        }
+
+        // to_dec of int at scale 0 with HalfEven rounds properly
+        #[test]
+        fn to_dec_int_scale0_is_exact(a in any::<i64>()) {
+            let n = int(a);
+            let d = to_dec(&n, 0, RoundingMode::HalfEven).unwrap();
+            // At scale 0 the decimal mantissa equals the integer
+            match &d {
+                Num::Dec { m, s, .. } => {
+                    prop_assert_eq!(*s, 0u32, "scale must be 0");
+                    prop_assert_eq!(m.parse::<i64>().unwrap(), a,
+                        "mantissa must equal original integer at scale 0");
+                }
+                Num::Int { .. } => {} // already int form is acceptable
+                _ => prop_assert!(false, "must produce Dec or Int"),
+            }
+        }
+
+        // from_f64_bits: NaN and Inf must be rejected
+        #[test]
+        fn from_f64_bits_rejects_nan_inf(bits in any::<u64>()) {
+            let f = f64::from_bits(bits);
+            if f.is_nan() || f.is_infinite() {
+                let result = from_f64_bits(bits);
+                prop_assert!(result.is_err(),
+                    "NaN/Inf must be rejected by from_f64_bits, got {:?}", result);
+            }
+        }
+
+        // from_f64_bits: finite values produce BND with lo <= hi
+        #[test]
+        fn from_f64_bits_bnd_lo_le_hi(x in -1.0e15f64..1.0e15f64) {
+            let n = from_f64_bits(x.to_bits()).unwrap();
+            match n {
+                Num::Bnd { lo, hi, .. } => {
+                    let lo_r = to_rational(&lo).unwrap();
+                    let hi_r = to_rational(&hi).unwrap();
+                    prop_assert!(lo_r <= hi_r, "BND lo must be <= hi");
+                }
+                _ => prop_assert!(false, "from_f64_bits must return BND for finite f64"),
+            }
+        }
+
+        // Serde round-trip: Num → JSON → Num is lossless
+        #[test]
+        fn num_serde_roundtrip_int(v in any::<i64>()) {
+            let n = int(v);
+            let json = serde_json::to_value(&n).unwrap();
+            let back: Num = serde_json::from_value(json).unwrap();
+            prop_assert_eq!(n, back, "Int must survive serde round-trip");
+        }
+
+        #[test]
+        fn num_serde_roundtrip_dec(m in -1_000_000i64..1_000_000i64, s in 0u32..9u32) {
+            let n = dec(m, s);
+            let json = serde_json::to_value(&n).unwrap();
+            let back: Num = serde_json::from_value(json).unwrap();
+            prop_assert_eq!(n, back, "Dec must survive serde round-trip");
+        }
+
+        // Mul commutativity for integers
+        #[test]
+        fn mul_is_commutative_for_ints(
+            a in -100_000i64..100_000i64,
+            b in -100_000i64..100_000i64,
+        ) {
+            let ab = mul(&int(a), &int(b)).unwrap();
+            let ba = mul(&int(b), &int(a)).unwrap();
+            prop_assert_eq!(ab, ba, "mul must be commutative");
+        }
+
+        // Div by self == 1 (for non-zero integers)
+        #[test]
+        fn div_self_is_one(a in 1i64..100_000i64) {
+            let n = int(a);
+            let result = div(&n, &n).unwrap();
+            // result should be RAT 1/1 or INT 1
+            match &result {
+                Num::Rat { p, q, .. } => {
+                    prop_assert_eq!(p.parse::<i64>().unwrap(), 1i64);
+                    prop_assert_eq!(q.parse::<i64>().unwrap(), 1i64);
+                }
+                Num::Int { v, .. } => {
+                    prop_assert_eq!(v.parse::<i64>().unwrap(), 1i64);
+                }
+                _ => prop_assert!(false, "a/a must be 1, got {:?}", result),
+            }
+        }
+    }
+}

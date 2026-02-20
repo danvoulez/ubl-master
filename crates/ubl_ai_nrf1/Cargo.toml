@@ -20,3 +20,4 @@ ubl_unc1 = { path = "../ubl_unc1" }
 [dev-dependencies]
 hex-literal = "0.4"
 proptest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

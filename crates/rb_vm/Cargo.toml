@@ -19,3 +19,6 @@ ubl_unc1 = { path = "../ubl_unc1" }
 
 [features]
 default = []
+
+[dev-dependencies]
+proptest = "1.4"

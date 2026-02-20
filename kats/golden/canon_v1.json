@@ -1,0 +1,222 @@
+{
+  "_version": "1",
+  "_description": "UBL NRF-1 Canonical CID Golden Vectors — BLAKE3. If any CID changes, canon broke.",
+  "_platform_note": "CIDs must be identical on Linux, macOS, and Windows. Any divergence is a critical determinism failure.",
+  "vectors": {
+    "empty_object": {
+      "description": "empty_object",
+      "input": {},
+      "expected_cid": "b3:e821a22aa834a3f1917b63dacab0af280cafda3b7e41b088c499b04d968341e2"
+    },
+    "single_int": {
+      "description": "single_int",
+      "input": {
+        "n": 42
+      },
+      "expected_cid": "b3:d3e621827270f53e04d8ec4a81211332dbc36980ed20d635367e5a78aafabf80"
+    },
+    "single_string": {
+      "description": "single_string",
+      "input": {
+        "s": "hello"
+      },
+      "expected_cid": "b3:f04fd38b2b5f25800ee12e795d937e7721e6737431f695ca44d4d955301a1f52"
+    },
+    "bool_true": {
+      "description": "bool_true",
+      "input": {
+        "v": true
+      },
+      "expected_cid": "b3:98e4839fa0cc759bcc010997bc4223ee19e02b51406b8ec350aada8916e3ad79"
+    },
+    "bool_false": {
+      "description": "bool_false",
+      "input": {
+        "v": false
+      },
+      "expected_cid": "b3:13ab8d0f528205e61bec0b9fb4d4e526d67c87a1b34ac045a69bde25b2497c89"
+    },
+    "nfc_cafe": {
+      "description": "nfc_cafe",
+      "input": {
+        "x": "Café"
+      },
+      "expected_cid": "b3:e27ec833e88cb6d5e29af4382f604a8b663be0b5ca0680d8b1ee78c446f5b7b1"
+    },
+    "null_stripped": {
+      "description": "null_stripped",
+      "input": {
+        "a": null,
+        "b": 1
+      },
+      "expected_cid": "b3:dd83dc7c8da05525fe5bbb2f7ee8c88524a457ca44718a6e1b71db7a87ba8e1a"
+    },
+    "key_order_abc": {
+      "description": "key_order_abc",
+      "input": {
+        "c": 3,
+        "a": 1,
+        "b": 2
+      },
+      "expected_cid": "b3:a87786986c09cc1ca24d7bb214733d8ba289e911c49a1e644b5526a4a66245ee"
+    },
+    "nested": {
+      "description": "nested",
+      "input": {
+        "outer": {
+          "inner": 99
+        }
+      },
+      "expected_cid": "b3:6178604ed5a3bdb67474af768bce7558cb0c418e1565dce187a05b378fb56b9c"
+    },
+    "array_ints": {
+      "description": "array_ints",
+      "input": {
+        "arr": [
+          1,
+          2,
+          3
+        ]
+      },
+      "expected_cid": "b3:0c4b57e42736ddd0cd07156486d468cea64cd9f9d01e86053f22e8eb958f4b7a"
+    },
+    "array_with_null": {
+      "description": "array_with_null",
+      "input": {
+        "arr": [
+          null,
+          1,
+          null
+        ]
+      },
+      "expected_cid": "b3:f3190fedb2eef28da11d5837f18b8dbd718d47c0dded74afb8288a44c9b75d44"
+    },
+    "mixed_types": {
+      "description": "mixed_types",
+      "input": {
+        "i": -1,
+        "b": true,
+        "s": "ok",
+        "n": 0
+      },
+      "expected_cid": "b3:a6289e9b919d9399ff277ea63cf2352974aff3cf2ec0fec1b2bc6f56f85e72da"
+    },
+    "deep_nesting": {
+      "description": "deep_nesting",
+      "input": {
+        "l1": {
+          "l2": {
+            "l3": {
+              "l4": "leaf"
+            }
+          }
+        }
+      },
+      "expected_cid": "b3:c42881d890dafe20218eb84503fa36973b7700bdd03f5c25c966393e6a48ea81"
+    },
+    "unicode_emoji": {
+      "description": "unicode_emoji",
+      "input": {
+        "e": "🦀"
+      },
+      "expected_cid": "b3:9f33823922fd86e5d32147c1d9f1672961feb336f1564de1106658c279999ab4"
+    },
+    "unicode_cjk": {
+      "description": "unicode_cjk",
+      "input": {
+        "k": "日本語"
+      },
+      "expected_cid": "b3:de9d23259ca281b40f9aafb90808b9a20deca69deb094b20c853ea04c7941bf2"
+    },
+    "empty_string": {
+      "description": "empty_string",
+      "input": {
+        "s": ""
+      },
+      "expected_cid": "b3:16258f441c372fbdd84edd802ab96aea38e4ec50697e9917b15ea27a37a480c9"
+    },
+    "empty_array": {
+      "description": "empty_array",
+      "input": {
+        "a": []
+      },
+      "expected_cid": "b3:b2e46a30b2a7ee0f5ed08ea66c66781ae69199d67368c0b0e0b82d1ab879a3c5"
+    },
+    "large_int": {
+      "description": "large_int",
+      "input": {
+        "n": 9223372036854775807
+      },
+      "expected_cid": "b3:1bf00c7c4e3bdd7410780a7fbc1fef68341e272b682951a79f88bd2919ad671e"
+    },
+    "min_int": {
+      "description": "min_int",
+      "input": {
+        "n": -9223372036854775808
+      },
+      "expected_cid": "b3:f7918746293953d942107882b49b33b4cce440f274eabafc30e79940d97856fe"
+    },
+    "zero": {
+      "description": "zero",
+      "input": {
+        "n": 0
+      },
+      "expected_cid": "b3:0b233154a71d9fa13c3f151c6779e764bf230a5d40d802d0c01400b28cb84ede"
+    },
+    "multiple_nulls": {
+      "description": "multiple_nulls",
+      "input": {
+        "a": null,
+        "b": null,
+        "c": null
+      },
+      "expected_cid": "b3:e821a22aa834a3f1917b63dacab0af280cafda3b7e41b088c499b04d968341e2"
+    },
+    "nested_arrays": {
+      "description": "nested_arrays",
+      "input": {
+        "m": [
+          [
+            1,
+            2
+          ],
+          [
+            3,
+            4
+          ]
+        ]
+      },
+      "expected_cid": "b3:e26061a8c5f924d6c92972bbea493f763fde29c890826a2cadb833691085a5e2"
+    },
+    "canonical_chip": {
+      "description": "canonical_chip",
+      "input": {
+        "@type": "ubl/user",
+        "@id": "b3:aabbcc",
+        "@ver": "1.0",
+        "@world": "a/acme/t/prod",
+        "email": "alice@acme.com"
+      },
+      "expected_cid": "b3:860e73ab357e0e85347e079dad44162ab2201a72980d2ecfa47e632ce44221aa"
+    },
+    "canonical_receipt": {
+      "description": "canonical_receipt",
+      "input": {
+        "@type": "ubl/wf",
+        "@id": "b3:ddeeff",
+        "@ver": "1.0",
+        "@world": "a/acme/t/prod",
+        "decision": "allow"
+      },
+      "expected_cid": "b3:9c41324d7b189479af4ecf9560a9c1bdf405734f7989ceaa8078995f34a9900b"
+    },
+    "hello_world_stable": {
+      "description": "hello_world_stable",
+      "input": {
+        "hello": "world",
+        "n": 42
+      },
+      "expected_cid": "b3:fd38c071ca3e1ede2a135645677d5326bbf91fb9cfe56a36f2d54636b75e7cd2"
+    }
+  }
+}

@@ -4301,7 +4301,7 @@ async fn dispatch_tool_call(
                                 Json(mcp_error_value(
                                     id,
                                     ubl_err.code.mcp_code(),
-                                    ubl_err.message,
+                                    ubl_err.message.clone(),
                                     Some(ubl_err.to_json()),
                                 )),
                             );
